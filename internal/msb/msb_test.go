@@ -171,12 +171,79 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		"-e", "HOME=/home/agent",
 		"-e", "USER=agent",
 		"-e", "LOGNAME=agent",
+		"-e", "PATH=" + GuestDefaultPath,
 		"agbox-run-99",
 		"--",
 		"bash", "-c", "id",
 	}
 	if !slices.Equal(execArgs, wantExec) {
 		t.Errorf("BuildExecArgs = %v, want %v", execArgs, wantExec)
+	}
+}
+
+func TestCategoriesAndResolution(t *testing.T) {
+	cats, err := ResolveCategories([]string{"core,golang", "4", "embedded-rust", "chrome", "hugo", "caddy"})
+	if err != nil {
+		t.Fatalf("ResolveCategories: %v", err)
+	}
+	var gotNames []string
+	for _, c := range cats {
+		gotNames = append(gotNames, c.Name)
+	}
+	// embedded-rust automatically includes rust. Index 4 is esphome.
+	wantNames := []string{"core", "go", "rust", "esphome", "embedded-rust", "chrome", "hugo", "caddy"}
+	if !slices.Equal(gotNames, wantNames) {
+		t.Fatalf("ResolveCategories names = %v, want %v", gotNames, wantNames)
+	}
+
+	// Selecting caddy alone must automatically pull in go.
+	caddyOnly, err := ResolveCategories([]string{"caddy"})
+	if err != nil || len(caddyOnly) != 2 || caddyOnly[0].Name != "go" || caddyOnly[1].Name != "caddy" {
+		t.Fatalf("ResolveCategories(caddy) = %+v, %v", caddyOnly, err)
+	}
+
+	allCats, err := ResolveCategories([]string{"all"})
+	if err != nil || len(allCats) != len(Categories()) {
+		t.Fatalf("ResolveCategories(all) = %d cats, err=%v", len(allCats), err)
+	}
+
+	if _, err := ResolveCategories([]string{"nonexistent-cat"}); err == nil {
+		t.Fatal("expected error for unknown category")
+	}
+
+	merged := MergeCategoryNames("core,go", cats)
+	if merged != "core,go,rust,esphome,embedded-rust,chrome,hugo,caddy" {
+		t.Errorf("MergeCategoryNames = %q", merged)
+	}
+
+	table := FormatCategoriesTable()
+	for _, kw := range []string{"core", "go", "rust", "esphome", "embedded-rust", "chrome", "hugo", "caddy", "golangci-lint", "clippy", "xcaddy"} {
+		if !strings.Contains(table, kw) {
+			t.Errorf("FormatCategoriesTable missing %q", kw)
+		}
+	}
+
+	script := BuildCategoriesScript(cats)
+	for _, kw := range []string{
+		"pipx install --force mdformat",
+		"github.com/go-delve/delve/cmd/dlv@latest",
+		"golang.org/x/tools/gopls@latest",
+		"github.com/golangci/golangci-lint/cmd/golangci-lint@latest",
+		"https://sh.rustup.rs",
+		"rustup component add clippy rustfmt",
+		"pipx install --force esphome",
+		"cargo install espflash",
+		"chromium chromium-driver xvfb",
+		"hugo_extended_",
+		"github.com/caddyserver/xcaddy/cmd/xcaddy@latest",
+		"github.com/caddy-dns/cloudflare",
+		"github.com/greenpau/caddy-security",
+		"github.com/point-c/caddy/module@latest",
+		"github.com/tailscale/caddy-tailscale",
+	} {
+		if !strings.Contains(script, kw) {
+			t.Errorf("BuildCategoriesScript missing %q", kw)
+		}
 	}
 }
 

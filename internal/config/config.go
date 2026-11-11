@@ -130,13 +130,14 @@ func LoadEnv() (Env, error) {
 
 // State represents the persisted base-image configuration stored in DATA_DIR/config.
 type State struct {
-	Agent     string
-	Image     string
-	Snapshot  string
-	SnapCount int
-	CPUs      string
-	Memory    string
-	RootDisk  string
+	Agent      string
+	Image      string
+	Snapshot   string
+	SnapCount  int
+	CPUs       string
+	Memory     string
+	RootDisk   string
+	Categories string
 }
 
 // Parse reads a key=value config stream into a State struct.
@@ -169,6 +170,8 @@ func Parse(r io.Reader) (State, error) {
 			st.Memory = v
 		case "root_disk":
 			st.RootDisk = v
+		case "categories":
+			st.Categories = v
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -187,6 +190,7 @@ func Format(st State) string {
 	writeKV(&b, "cpus", st.CPUs)
 	writeKV(&b, "memory", st.Memory)
 	writeKV(&b, "root_disk", st.RootDisk)
+	writeKV(&b, "categories", st.Categories)
 	return b.String()
 }
 

@@ -33,20 +33,29 @@ var ErrHelp = errors.New("help requested")
 
 // CreateBaseOpts holds parsed arguments for `agbox create-base`.
 type CreateBaseOpts struct {
-	Agent string
-	Force bool
+	Agent      string
+	Force      bool
+	Categories []msb.Category
 }
 
 // ParseCreateBaseArgs parses CLI arguments for `create-base`.
 func ParseCreateBaseArgs(args []string) (CreateBaseOpts, error) {
 	var opts CreateBaseOpts
 	var pos []string
-	for _, a := range args {
+	var catSpecs []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch a {
 		case "-h", "--help":
 			return CreateBaseOpts{}, ErrHelp
 		case "--force":
 			opts.Force = true
+		case "--add", "--categories":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return CreateBaseOpts{}, fmt.Errorf("%s requires at least one category name (%s, or all)", a, msb.CategoryNamesList())
+			}
+			catSpecs = append(catSpecs, args[i+1])
+			i++
 		default:
 			if strings.HasPrefix(a, "-") {
 				return CreateBaseOpts{}, fmt.Errorf("unknown create-base option: %s", a)
@@ -55,30 +64,53 @@ func ParseCreateBaseArgs(args []string) (CreateBaseOpts, error) {
 		}
 	}
 	if len(pos) != 1 {
-		return CreateBaseOpts{}, errors.New("Usage: agbox create-base [--force] <opencode|antigravity|both>")
+		return CreateBaseOpts{}, errors.New("Usage: agbox create-base [--force] [--add <categories>] <opencode|antigravity|both>")
 	}
 	switch pos[0] {
 	case "opencode", "antigravity", "both":
 		opts.Agent = pos[0]
-		return opts, nil
 	default:
-		return CreateBaseOpts{}, errors.New("Usage: agbox create-base [--force] <opencode|antigravity|both>")
+		return CreateBaseOpts{}, errors.New("Usage: agbox create-base [--force] [--add <categories>] <opencode|antigravity|both>")
 	}
+	if len(catSpecs) > 0 {
+		cats, err := msb.ResolveCategories(catSpecs)
+		if err != nil {
+			return CreateBaseOpts{}, err
+		}
+		opts.Categories = cats
+	}
+	return opts, nil
 }
 
 // EditBaseOpts holds parsed arguments for `agbox edit-base`.
 type EditBaseOpts struct {
-	Cmd    string
-	NoSnap bool
+	Cmd        string
+	NoSnap     bool
+	Shell      bool
+	ListOnly   bool
+	Categories []msb.Category
 }
 
 // ParseEditBaseArgs parses CLI arguments for `edit-base`.
+// Users may select categories with `--add <cat1,cat2,...>` or as positional
+// arguments (`agbox edit-base core go rust esphome`).
 func ParseEditBaseArgs(args []string) (EditBaseOpts, error) {
 	opts := EditBaseOpts{}
+	var catSpecs []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-h", "--help":
 			return EditBaseOpts{}, ErrHelp
+		case "--list", "--list-categories":
+			opts.ListOnly = true
+		case "--shell":
+			opts.Shell = true
+		case "--add", "--categories":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return EditBaseOpts{}, fmt.Errorf("%s requires at least one category (%s, or all)", args[i], msb.CategoryNamesList())
+			}
+			catSpecs = append(catSpecs, args[i+1])
+			i++
 		case "--cmd":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return EditBaseOpts{}, errors.New("--cmd requires a non-empty shell command")
@@ -88,8 +120,18 @@ func ParseEditBaseArgs(args []string) (EditBaseOpts, error) {
 		case "--no-snap":
 			opts.NoSnap = true
 		default:
-			return EditBaseOpts{}, fmt.Errorf("unknown edit-base option: %s (use: --cmd \"shell\" | --no-snap)", args[i])
+			if strings.HasPrefix(args[i], "-") {
+				return EditBaseOpts{}, fmt.Errorf("unknown edit-base option: %s (use: --add <cats> | --list | --shell | --cmd \"shell\" | --no-snap)", args[i])
+			}
+			catSpecs = append(catSpecs, args[i])
 		}
+	}
+	if len(catSpecs) > 0 {
+		cats, err := msb.ResolveCategories(catSpecs)
+		if err != nil {
+			return EditBaseOpts{}, err
+		}
+		opts.Categories = cats
 	}
 	return opts, nil
 }
@@ -111,8 +153,8 @@ type RunOpts struct {
 }
 
 // ParseRunArgs parses CLI arguments for `run`.
-// pathExists is used when a token after paths is literally "opencode" or
-// "antigravity" to disambiguate an agent selector from a directory of that name.
+// Options must appear before shared paths. Use `--` to pass a path that begins
+// with `-`.
 func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(string) bool) (RunOpts, error) {
 	if defaultMask == "" {
 		defaultMask = config.MaskAuto
@@ -130,9 +172,19 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		switch arg {
-		case "-h", "--help":
+		if arg == "-h" || arg == "--help" {
 			return RunOpts{}, ErrHelp
+		}
+		if arg == "--" {
+			opts.Paths = append(opts.Paths, args[i+1:]...)
+			break
+		}
+		// Enforce that all option flags appear before any shared paths.
+		if len(opts.Paths) > 0 && strings.HasPrefix(arg, "-") {
+			return RunOpts{}, fmt.Errorf("options must come before paths (found %s after path %q)", arg, opts.Paths[len(opts.Paths)-1])
+		}
+
+		switch arg {
 		case "opencode", "antigravity":
 			if opts.Agent == "" && (len(opts.Paths) == 0 || !pathExists(arg)) {
 				opts.Agent = arg
@@ -183,7 +235,7 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			i++
 		case "--memory":
 			if i+1 >= len(args) || args[i+1] == "" {
-				return RunOpts{}, errors.New("--memory requires a size value (e.g. 2G or 2048M)")
+				return RunOpts{}, errors.New("--memory requires a size value (for example, 2G or 2048M)")
 			}
 			opts.Memory = args[i+1]
 			i++
@@ -191,9 +243,6 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			opts.MaskMode = config.MaskStrict
 		case "--no-mask":
 			opts.MaskMode = config.MaskOff
-		case "--":
-			opts.Paths = append(opts.Paths, args[i+1:]...)
-			i = len(args)
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return RunOpts{}, fmt.Errorf("unknown run option: %s ('agbox run --help')", arg)
@@ -655,6 +704,12 @@ su - %q -c "agy --version"`, config.GuestUser)
 		}
 	}
 
+	if len(opts.Categories) > 0 {
+		if err := a.installCategories(ctx, config.BaseSandbox, opts.Categories); err != nil {
+			return err
+		}
+	}
+
 	prevState, _ := config.LoadFile(a.Env.ConfigFile)
 	snapListRes, _ := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "ls"}})
 	count, snapSelector := config.NextSnapshotMember(
@@ -675,13 +730,14 @@ su - %q -c "agy --version"`, config.GuestUser)
 	}
 
 	newState := config.State{
-		Agent:     opts.Agent,
-		Image:     image,
-		Snapshot:  snapSelector,
-		SnapCount: count,
-		CPUs:      a.Env.CPUs,
-		Memory:    a.Env.Memory,
-		RootDisk:  a.Env.RootDisk,
+		Agent:      opts.Agent,
+		Image:      image,
+		Snapshot:   snapSelector,
+		SnapCount:  count,
+		CPUs:       a.Env.CPUs,
+		Memory:     a.Env.Memory,
+		RootDisk:   a.Env.RootDisk,
+		Categories: msb.MergeCategoryNames("", opts.Categories),
 	}
 	if err := config.SaveFile(a.Env.ConfigFile, newState); err != nil {
 		return fmt.Errorf("save config: %w", err)
@@ -689,7 +745,7 @@ su - %q -c "agy --version"`, config.GuestUser)
 
 	succeeded = true
 	a.logf("Base ready: %s (agent=%s, image=%s, guest_user=%s).", snapSelector, opts.Agent, image, config.GuestUser)
-	a.logf("Next: agbox run [options] [paths...]")
+	a.logf("Next: agbox run [options] [agent] [paths...]")
 	return nil
 }
 
@@ -700,13 +756,34 @@ func (a *App) provisionGuestUser(ctx context.Context, sandbox string) error {
 	return err
 }
 
-// EditBase starts `agbox-base`, runs either `--cmd` or an interactive root
-// shell for installing packages, re-verifies the `agent` user, stops the VM,
-// and creates a new versioned snapshot `agbox:v<N+1>` (unless `--no-snap`).
+func (a *App) installCategories(ctx context.Context, sandbox string, cats []msb.Category) error {
+	names := make([]string, len(cats))
+	for i, c := range cats {
+		names[i] = c.Name
+	}
+	a.logf("Installing categories (%s) in %s...", strings.Join(names, ", "), sandbox)
+	script := msb.BuildCategoriesScript(cats)
+	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args:   []string{"exec", sandbox, "--", "bash", "-c", script},
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
+	}); err != nil {
+		return fmt.Errorf("category installation failed (exit %d): %w", res.ExitCode, err)
+	}
+	return nil
+}
+
+// EditBase starts `agbox-base`, installs selected categories, runs `--cmd`, or
+// opens an interactive root shell. It then re-verifies the `agent` user, stops
+// the microVM, and saves a new snapshot `agbox:v<N+1>` (unless `--no-snap`).
 func (a *App) EditBase(ctx context.Context, args []string) error {
 	opts, err := ParseEditBaseArgs(args)
 	if err != nil {
 		return err
+	}
+	if opts.ListOnly {
+		fmt.Fprint(a.Stdout, msb.FormatCategoriesTable())
+		return nil
 	}
 	if err := a.requireSetup(); err != nil {
 		return err
@@ -725,8 +802,31 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 		return fmt.Errorf("no base sandbox %q. Run 'agbox create-base <agent>' first", config.BaseSandbox)
 	}
 
-	if opts.Cmd == "" && (a.IsTTY == nil || !a.IsTTY()) {
-		return errors.New("not a TTY and no --cmd given. Use: agbox edit-base --cmd \"apt-get install -y jq\"")
+	// If no categories, --cmd, or --shell were specified on the CLI, prompt on TTY.
+	if len(opts.Categories) == 0 && opts.Cmd == "" && !opts.Shell {
+		if a.IsTTY == nil || !a.IsTTY() {
+			return errors.New("not a TTY and no --add or --cmd given. Use: agbox edit-base --add core,go,rust,esphome or --cmd \"...\"")
+		}
+		fmt.Fprint(a.Stdout, msb.FormatCategoriesTable())
+		if st.Categories != "" {
+			fmt.Fprintf(a.Stdout, "Currently installed categories: %s\n", st.Categories)
+		}
+		fmt.Fprintln(a.Stdout, "\nEnter categories to install (numbers or names, 'all', or press Enter for an interactive shell):")
+		sc := bufio.NewScanner(a.Stdin)
+		if sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || strings.EqualFold(line, "s") || strings.EqualFold(line, "shell") {
+				opts.Shell = true
+			} else {
+				cats, cErr := msb.ResolveCategories([]string{line})
+				if cErr != nil {
+					return cErr
+				}
+				opts.Categories = cats
+			}
+		} else {
+			opts.Shell = true
+		}
 	}
 
 	if !baseInfo.Running {
@@ -734,6 +834,14 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 		if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"start", config.BaseSandbox}}); err != nil {
 			return fmt.Errorf("start base sandbox: %w", err)
 		}
+	}
+
+	if len(opts.Categories) > 0 {
+		if err := a.installCategories(ctx, config.BaseSandbox, opts.Categories); err != nil {
+			_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}})
+			return err
+		}
+		st.Categories = msb.MergeCategoryNames(st.Categories, opts.Categories)
 	}
 
 	if opts.Cmd != "" {
@@ -746,9 +854,11 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 			_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}})
 			return fmt.Errorf("provisioning command failed (exit %d): %w", res.ExitCode, err)
 		}
-	} else {
+	}
+
+	if opts.Shell {
 		fmt.Fprintln(a.Stdout, "Interactive shell in the base sandbox.")
-		fmt.Fprintf(a.Stdout, "Changes persist in %q AND (after the re-snapshot below) in future run VMs.\n", config.BaseSandbox)
+		fmt.Fprintf(a.Stdout, "Changes persist in %q AND (after the snapshot below) in future run microVMs.\n", config.BaseSandbox)
 		if res, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        []string{"exec", "-t", config.BaseSandbox, "--", "sh", "-c", "cd /workspace 2>/dev/null || cd /; bash; exit 0"},
 			Interactive: true,
@@ -764,6 +874,7 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 	_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}})
 
 	if opts.NoSnap {
+		_ = config.SaveFile(a.Env.ConfigFile, st)
 		a.logf("Edits live in %q but were NOT snapshotted (--no-snap).", config.BaseSandbox)
 		return nil
 	}
@@ -1301,16 +1412,18 @@ Modes:
   agbox setup
       Check host prerequisites (glibc, msb, /dev/kvm, smoke test).
 
-  agbox create-base [--force] <opencode|antigravity|both>
+  agbox create-base [--force] [--add <categories>] <opencode|antigravity|both>
       Create the base microVM and save snapshot agbox:vN.
 
-  agbox edit-base [--cmd "shell command"] [--no-snap]
-      Start the base microVM, apply updates, and save snapshot agbox:v<N+1>.
+  agbox edit-base [--add <categories>] [--list] [--shell] [--cmd "shell"] [--no-snap]
+      Start the base microVM, install developer categories (core, go, rust,
+      esphome, embedded-rust, chrome, hugo, caddy, or all) or run custom
+      updates, and save snapshot agbox:v<N+1>.
 
-  agbox run [opencode|antigravity] [paths...] [options]
+  agbox run [options] [opencode|antigravity] [paths...]
       Restore an ephemeral microVM from the base snapshot and mount paths.
       Delete the microVM and unmount FUSE shares on exit.
-      Options:
+      Options (must precede paths):
         --ro                 Mount shared paths read-only
         --mask-vcs           Require the FUSE filter for directory shares
         --no-mask            Disable the FUSE filter (.git is visible to guest)
@@ -1336,10 +1449,8 @@ Modes:
 
 // RunUsageText returns the help message for `agbox run --help`.
 func RunUsageText() string {
-	return `Usage: agbox run [agent] [path...] [options]
+	return `Usage: agbox run [options] [agent] [path...]
 
-  agent            opencode | antigravity (default: the base's agent)
-  path...          host dirs/files mounted at /workspace/<name>
   --ro             mount shared paths read-only
   --mask-vcs       require the FUSE filter for directory shares
   --no-mask        disable the FUSE filter (.git is visible to guest)
@@ -1350,6 +1461,8 @@ func RunUsageText() string {
   --no-net         disable guest network access
   --net SPEC       set network profile (public|none|private|host|all) or msb rule
   --cpus N / --memory S   override vCPU count or RAM size for this run
+  agent            opencode | antigravity (default: the base's agent)
+  path...          host dirs/files mounted at /workspace/<name>
 `
 }
 

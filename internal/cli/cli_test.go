@@ -23,9 +23,9 @@ import (
 )
 
 func TestParseCreateBaseArgs(t *testing.T) {
-	opts, err := ParseCreateBaseArgs([]string{"--force", "opencode"})
-	if err != nil || opts.Agent != "opencode" || !opts.Force {
-		t.Fatalf("ParseCreateBaseArgs(--force opencode) = %+v, %v", opts, err)
+	opts, err := ParseCreateBaseArgs([]string{"--force", "--add", "core,go,rust,esphome", "opencode"})
+	if err != nil || opts.Agent != "opencode" || !opts.Force || len(opts.Categories) != 4 {
+		t.Fatalf("ParseCreateBaseArgs(--force --add ... opencode) = %+v, %v", opts, err)
 	}
 	for _, agent := range []string{"antigravity", "both"} {
 		opts, err := ParseCreateBaseArgs([]string{agent})
@@ -40,6 +40,8 @@ func TestParseCreateBaseArgs(t *testing.T) {
 		{},
 		{"unknown"},
 		{"--unknown", "opencode"},
+		{"--add", "", "opencode"},
+		{"--add", "badcat", "opencode"},
 		{"opencode", "extra"},
 	} {
 		if _, err := ParseCreateBaseArgs(bad); err == nil {
@@ -49,9 +51,13 @@ func TestParseCreateBaseArgs(t *testing.T) {
 }
 
 func TestParseEditBaseArgs(t *testing.T) {
-	opts, err := ParseEditBaseArgs([]string{"--cmd", "apt-get install -y jq", "--no-snap"})
-	if err != nil || opts.Cmd != "apt-get install -y jq" || !opts.NoSnap {
+	opts, err := ParseEditBaseArgs([]string{"--add", "core,go", "rust", "esphome", "--cmd", "apt-get install -y jq", "--no-snap"})
+	if err != nil || opts.Cmd != "apt-get install -y jq" || !opts.NoSnap || len(opts.Categories) != 4 {
 		t.Fatalf("ParseEditBaseArgs = %+v, %v", opts, err)
+	}
+	listOpts, err := ParseEditBaseArgs([]string{"--list"})
+	if err != nil || !listOpts.ListOnly {
+		t.Fatalf("ParseEditBaseArgs(--list) = %+v, %v", listOpts, err)
 	}
 	if _, err := ParseEditBaseArgs([]string{"-h"}); !errors.Is(err, ErrHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
@@ -59,6 +65,8 @@ func TestParseEditBaseArgs(t *testing.T) {
 	for _, bad := range [][]string{
 		{"--cmd"},
 		{"--cmd", ""},
+		{"--add"},
+		{"--add", "unknown-category"},
 		{"--unknown"},
 	} {
 		if _, err := ParseEditBaseArgs(bad); err == nil {
@@ -70,10 +78,12 @@ func TestParseEditBaseArgs(t *testing.T) {
 func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 	exists := func(p string) bool { return p == "opencode" }
 
+	// Options appear before paths.
 	opts, err := ParseRunArgs([]string{
-		"antigravity", "./proj", "--ro", "--mask-vcs",
+		"--ro", "--mask-vcs",
 		"--cpus", "4", "--memory", "4G",
 		"--net", "public", "--net-rule", "allow@example.com:tcp:443",
+		"antigravity", "./proj",
 		"--", "-weird-file",
 	}, config.MaskAuto, exists)
 	if err != nil {
@@ -90,6 +100,11 @@ func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 	opts2, err := ParseRunArgs([]string{"./proj", "opencode"}, config.MaskAuto, exists)
 	if err != nil || opts2.Agent != "" || !slices.Equal(opts2.Paths, []string{"./proj", "opencode"}) {
 		t.Errorf("expected 'opencode' after path to be treated as path when it exists on disk: %+v, %v", opts2, err)
+	}
+
+	// Passing an option after a path must fail.
+	if _, err := ParseRunArgs([]string{"./proj", "--ro"}, config.MaskAuto, nil); err == nil || !strings.Contains(err.Error(), "options must come before paths") {
+		t.Errorf("expected error when option follows path, got %v", err)
 	}
 
 	// --port and --probe imply --serve.
@@ -220,10 +235,10 @@ func (f *fakeMSBRunner) Run(_ context.Context, req msb.CommandRequest) (msb.Comm
 
 type noopMountCtl struct{}
 
-func (noopMountCtl) ListMounts() ([]mounttab.Entry, error)   { return nil, nil }
-func (noopMountCtl) SignalPID(_ int, _ syscall.Signal) error { return nil }
-func (noopMountCtl) Unmount(_ string, _ bool) error          { return nil }
-func (noopMountCtl) Sleep(_ time.Duration)                   {}
+func (noopMountCtl) ListMounts() ([]mounttab.Entry, error)        { return nil, nil }
+func (noopMountCtl) SignalPID(_ int, _ syscall.Signal) error      { return nil }
+func (noopMountCtl) Unmount(_ string, _ bool) error               { return nil }
+func (noopMountCtl) Sleep(_ time.Duration)                        {}
 
 func newTestApp(t *testing.T) (*App, *fakeMSBRunner, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
@@ -305,13 +320,16 @@ func TestAppLifecycleModes(t *testing.T) {
 		t.Fatalf("saved state after CreateBase = %+v, %v", st, err)
 	}
 
-	// 3. EditBase (--cmd)
+	// 3. EditBase (--add core,go,rust,esphome and --list)
+	if rc := app.Dispatch(ctx, []string{"edit-base", "--list"}); rc != 0 {
+		t.Fatalf("EditBase --list failed with rc=%d", rc)
+	}
 	runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
-	if rc := app.Dispatch(ctx, []string{"edit-base", "--cmd", "apt-get install -y jq"}); rc != 0 {
-		t.Fatalf("EditBase failed with rc=%d", rc)
+	if rc := app.Dispatch(ctx, []string{"edit-base", "--add", "core,go,rust,esphome"}); rc != 0 {
+		t.Fatalf("EditBase --add failed with rc=%d", rc)
 	}
 	st, err = config.LoadFile(app.Env.ConfigFile)
-	if err != nil || st.Snapshot != "agbox:v2" || st.SnapCount != 2 {
+	if err != nil || st.Snapshot != "agbox:v2" || st.SnapCount != 2 || st.Categories != "core,go,rust,esphome" {
 		t.Fatalf("saved state after EditBase = %+v, %v", st, err)
 	}
 	runner.snapshots = "NAME CREATED\nagbox:v1 1m\nagbox:v2 1m\n"
@@ -448,9 +466,10 @@ func TestReapOrphanRunsAndTUIAndServeProbe(t *testing.T) {
 		t.Fatalf("Run --serve --probe failed with rc=%d", rc)
 	}
 
-	// Test EditBase interactive + --no-snap.
+	// Test EditBase interactive category selection (choosing '1,2' on Stdin) + --no-snap.
+	app.Stdin = strings.NewReader("1,2\n")
 	if rc := app.Dispatch(ctx, []string{"edit-base", "--no-snap"}); rc != 0 {
-		t.Fatalf("EditBase --no-snap failed with rc=%d", rc)
+		t.Fatalf("EditBase interactive selection --no-snap failed with rc=%d", rc)
 	}
 
 	// Test Remove interactive abort when user types 'n'.
@@ -473,3 +492,4 @@ func TestReapOrphanRunsAndTUIAndServeProbe(t *testing.T) {
 		t.Error("expected non-zero exit code for unknown mode")
 	}
 }
+

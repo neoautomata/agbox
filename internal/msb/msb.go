@@ -95,7 +95,7 @@ func TranslateNetSpec(spec string) ([]string, error) {
 }
 
 // ShellQuote wraps s in POSIX single quotes, escaping any embedded single quote
-// as `'\”`. The resulting token is safe against all shell expansion (`$`, “ ` “,
+// as `'\''`. The resulting token is safe against all shell expansion (`$`, `` ` ``,
 // `\`, globbing, and newlines).
 func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
@@ -284,6 +284,7 @@ func GuestEnvFlags() []string {
 		"HOME=" + GuestHome,
 		"USER=" + GuestUser,
 		"LOGNAME=" + GuestUser,
+		"PATH=" + GuestDefaultPath,
 	}
 }
 
