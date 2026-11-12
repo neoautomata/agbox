@@ -261,10 +261,10 @@ func (f *fakeMSBRunner) Run(_ context.Context, req msb.CommandRequest) (msb.Comm
 
 type noopMountCtl struct{}
 
-func (noopMountCtl) ListMounts() ([]mounttab.Entry, error)        { return nil, nil }
-func (noopMountCtl) SignalPID(_ int, _ syscall.Signal) error      { return nil }
-func (noopMountCtl) Unmount(_ string, _ bool) error               { return nil }
-func (noopMountCtl) Sleep(_ time.Duration)                        {}
+func (noopMountCtl) ListMounts() ([]mounttab.Entry, error)   { return nil, nil }
+func (noopMountCtl) SignalPID(_ int, _ syscall.Signal) error { return nil }
+func (noopMountCtl) Unmount(_ string, _ bool) error          { return nil }
+func (noopMountCtl) Sleep(_ time.Duration)                   {}
 
 func newTestApp(t *testing.T) (*App, *fakeMSBRunner, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
@@ -518,4 +518,3 @@ func TestReapOrphanRunsAndTUIAndServeProbe(t *testing.T) {
 		t.Error("expected non-zero exit code for unknown mode")
 	}
 }
-

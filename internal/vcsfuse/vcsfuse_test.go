@@ -344,4 +344,3 @@ func TestRunMainValidationAndStartSubprocess(t *testing.T) {
 		t.Error("expected error when filter subprocess exits before mounting")
 	}
 }
-

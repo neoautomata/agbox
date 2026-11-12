@@ -95,7 +95,7 @@ func TranslateNetSpec(spec string) ([]string, error) {
 }
 
 // ShellQuote wraps s in POSIX single quotes, escaping any embedded single quote
-// as `'\''`. The resulting token is safe against all shell expansion (`$`, `` ` ``,
+// as `'\”`. The resulting token is safe against all shell expansion (`$`, “ ` “,
 // `\`, globbing, and newlines).
 func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
@@ -248,6 +248,7 @@ type ExecCmdOpts struct {
 	Detached bool
 	TTY      bool
 	NoTTY    bool
+	Stream   bool
 	Env      []string // KEY=VAL pairs
 	Command  []string
 }
@@ -260,6 +261,8 @@ func BuildExecArgs(opts ExecCmdOpts) []string {
 	}
 	if opts.TTY {
 		args = append(args, "-t")
+	} else if opts.Stream {
+		args = append(args, "--stream")
 	} else if opts.NoTTY {
 		args = append(args, "--no-tty")
 	}

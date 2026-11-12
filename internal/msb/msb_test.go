@@ -179,6 +179,15 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 	if !slices.Equal(execArgs, wantExec) {
 		t.Errorf("BuildExecArgs = %v, want %v", execArgs, wantExec)
 	}
+
+	streamArgs := BuildExecArgs(ExecCmdOpts{
+		Sandbox: "agbox-run-99",
+		Stream:  true,
+		Command: []string{"id"},
+	})
+	if !slices.Contains(streamArgs, "--stream") {
+		t.Errorf("expected --stream in %v", streamArgs)
+	}
 }
 
 func TestCategoriesAndResolution(t *testing.T) {
@@ -238,8 +247,7 @@ func TestCategoriesAndResolution(t *testing.T) {
 		"github.com/caddyserver/xcaddy/cmd/xcaddy@latest",
 		"github.com/caddy-dns/cloudflare",
 		"github.com/greenpau/caddy-security",
-		"github.com/point-c/caddy/module@latest",
-		"github.com/tailscale/caddy-tailscale",
+		"github.com/mholt/caddy-l4",
 	} {
 		if !strings.Contains(script, kw) {
 			t.Errorf("BuildCategoriesScript missing %q", kw)

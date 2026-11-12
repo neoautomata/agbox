@@ -98,10 +98,10 @@ func Categories() []Category {
 		{
 			Name:    "caddy",
 			Aliases: []string{"xcaddy"},
-			Summary: "Custom Caddy build via xcaddy with cloudflare, caddy-security, point-c, and tailscale modules",
+			Summary: "Custom Caddy build via xcaddy with cloudflare, caddy-security, and caddy-l4 modules",
 			Details: []string{
 				"go install: github.com/caddyserver/xcaddy/cmd/xcaddy@latest",
-				"xcaddy modules: github.com/caddy-dns/cloudflare, github.com/greenpau/caddy-security, github.com/point-c/caddy/module@latest, github.com/tailscale/caddy-tailscale",
+				"xcaddy modules: github.com/caddy-dns/cloudflare, github.com/greenpau/caddy-security, github.com/mholt/caddy-l4",
 			},
 			BuildScript: scriptCategoryCaddy,
 		},
@@ -429,8 +429,7 @@ func scriptCategoryCaddy() string {
     --output /home/agent/go/bin/caddy \
     --with github.com/caddy-dns/cloudflare \
     --with github.com/greenpau/caddy-security \
-    --with github.com/point-c/caddy/module@latest \
-    --with github.com/tailscale/caddy-tailscale
+    --with github.com/mholt/caddy-l4
   go clean -cache -modcache
 '
 install -m 0755 /home/agent/go/bin/caddy /usr/local/bin/caddy

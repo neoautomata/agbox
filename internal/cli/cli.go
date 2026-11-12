@@ -669,7 +669,11 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: createArgs}); err != nil {
+	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args:   createArgs,
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
+	}); err != nil {
 		return fmt.Errorf("base sandbox creation failed: %w", err)
 	}
 
@@ -683,7 +687,9 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 	a.logf("Provisioning guest (apt baseline + non-root %q user with passwordless sudo)...", config.GuestUser)
 	aptCmd := "apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git ripgrep less procps sudo >/dev/null"
 	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", config.BaseSandbox, "--", "sh", "-c", aptCmd},
+		Args:   []string{"exec", "--stream", "--no-stdin", config.BaseSandbox, "--", "sh", "-c", aptCmd},
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
 	}); err != nil {
 		return fmt.Errorf("apt provisioning failed: %w", err)
 	}
@@ -695,10 +701,10 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 	if opts.Agent == "opencode" || opts.Agent == "both" {
 		a.logf("Installing OpenCode (npm opencode-ai@%s)...", a.Env.OpenCodeVersion)
 		ocScript := fmt.Sprintf(`set -euo pipefail
-npm install -g "opencode-ai@$1" >/dev/null 2>&1
+npm install -g --no-fund --no-audit "opencode-ai@$1"
 su - %q -c "opencode --version"`, config.GuestUser)
 		if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-			Args:   []string{"exec", config.BaseSandbox, "--", "bash", "-c", ocScript, "--", a.Env.OpenCodeVersion},
+			Args:   []string{"exec", "--stream", "--no-stdin", config.BaseSandbox, "--", "bash", "-c", ocScript, "--", a.Env.OpenCodeVersion},
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		}); err != nil {
@@ -716,7 +722,7 @@ if [ -x /home/agent/.local/bin/agy ]; then
 fi
 su - %s -c "agy --version"`, config.GuestUser, msb.ShellQuote(innerCmd), config.GuestUser)
 		if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-			Args:   []string{"exec", config.BaseSandbox, "--", "bash", "-c", agyScript},
+			Args:   []string{"exec", "--stream", "--no-stdin", config.BaseSandbox, "--", "bash", "-c", agyScript},
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		}); err != nil {
@@ -744,7 +750,9 @@ su - %s -c "agy --version"`, config.GuestUser, msb.ShellQuote(innerCmd), config.
 		return fmt.Errorf("stop base sandbox: %w", err)
 	}
 	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"snap", "create", member, "--sandbox", config.BaseSandbox, "--group", config.SnapGroup},
+		Args:   []string{"snap", "create", member, "--sandbox", config.BaseSandbox, "--group", config.SnapGroup},
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
 	}); err != nil {
 		return fmt.Errorf("snapshot failed: %w", err)
 	}
@@ -784,7 +792,7 @@ func (a *App) installCategories(ctx context.Context, sandbox string, cats []msb.
 	a.logf("Installing categories (%s) in %s...", strings.Join(names, ", "), sandbox)
 	script := msb.BuildCategoriesScript(cats)
 	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args:   []string{"exec", sandbox, "--", "bash", "-c", script},
+		Args:   []string{"exec", "--stream", "--no-stdin", sandbox, "--", "bash", "-c", script},
 		Stdout: a.Stdout,
 		Stderr: a.Stderr,
 	}); err != nil {
@@ -871,7 +879,7 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 	if opts.Cmd != "" {
 		a.logf("Running provisioning command in the base...")
 		if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-			Args:   []string{"exec", config.BaseSandbox, "--", "sh", "-c", opts.Cmd},
+			Args:   []string{"exec", "--stream", "--no-stdin", config.BaseSandbox, "--", "sh", "-c", opts.Cmd},
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		}); err != nil {
@@ -912,7 +920,9 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 	member := fmt.Sprintf("v%d", count)
 	a.logf("Snapshotting new base -> %s", snapSelector)
 	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"snap", "create", member, "--sandbox", config.BaseSandbox, "--group", config.SnapGroup},
+		Args:   []string{"snap", "create", member, "--sandbox", config.BaseSandbox, "--group", config.SnapGroup},
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
 	}); err != nil {
 		return fmt.Errorf("re-snapshot failed (base edits remain in %q): %w", config.BaseSandbox, err)
 	}
@@ -1186,6 +1196,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		a.logf("Running one-shot command in %s as %s (passwordless sudo available)...", runSandbox, config.GuestUser)
 		execArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: runSandbox,
+			Stream:  true,
 			User:    config.GuestUser,
 			Env:     guestEnv,
 			Command: []string{
@@ -1382,14 +1393,15 @@ func (a *App) Stop(ctx context.Context, args []string) error {
 }
 
 // Remove deletes all agbox sandboxes (`agbox-base`, `agbox-run-*`), snapshots
-// (`agbox:v*`), FUSE filter daemons/mounts, and `$DATA_DIR`.
+// (`agbox:v*`), unused cached OCI images, FUSE filter daemons/mounts, and
+// `$DATA_DIR`.
 func (a *App) Remove(ctx context.Context, args []string) error {
 	yes, err := ParseRemoveArgs(args)
 	if err != nil {
 		return err
 	}
 	if !yes {
-		fmt.Fprintf(a.Stdout, "This removes: agbox sandboxes (%s, %s-*), snapshots (%s), and %s.\n",
+		fmt.Fprintf(a.Stdout, "This removes: agbox sandboxes (%s, %s-*), snapshots (%s), unused cached images, and %s.\n",
 			config.BaseSandbox, config.RunPrefix, config.SnapGroup, a.Env.DataDir)
 		fmt.Fprintln(a.Stdout, "It does NOT touch the msb install, your other sandboxes/volumes, or any host files you shared.")
 		fmt.Fprintln(a.Stdout, "Type 'y' to confirm:")
@@ -1402,7 +1414,7 @@ func (a *App) Remove(ctx context.Context, args []string) error {
 	if err := a.ensureMSB(); err == nil && a.MSB != nil {
 		if lsRes, lErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}}); lErr == nil {
 			for _, sb := range msb.ParseSandboxList(lsRes.Stdout) {
-				if sb.Name == config.BaseSandbox || strings.HasPrefix(sb.Name, config.RunPrefix+"-") {
+				if isAgboxSandboxName(sb.Name) {
 					_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", sb.Name}})
 				}
 			}
@@ -1412,7 +1424,7 @@ func (a *App) Remove(ctx context.Context, args []string) error {
 		if snapRes, sErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "ls"}}); sErr == nil {
 			existing := msb.ParseSnapshotList(snapRes.Stdout)
 			removed := make(map[string]bool)
-			for m := 1; m <= st.SnapCount; m++ {
+			for m := st.SnapCount; m >= 1; m-- {
 				target := fmt.Sprintf("%s:v%d", config.SnapGroup, m)
 				if containsStr(existing, target) {
 					if res, rErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "rm", "--force", target}}); rErr != nil {
@@ -1425,13 +1437,30 @@ func (a *App) Remove(ctx context.Context, args []string) error {
 				if removed[name] {
 					continue
 				}
-				if name == config.SnapGroup || strings.HasPrefix(name, config.SnapGroup+":") {
+				if isAgboxSnapshotName(name) {
 					if res, rErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "rm", "--force", name}}); rErr != nil {
 						a.warnf("could not remove snapshot %s: %s", name, strings.TrimSpace(res.Stderr))
 					}
 				}
 			}
 		}
+
+		for _, grp := range []string{config.SnapGroup, config.BaseSandbox} {
+			if qRes, qErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "ls", "--group", grp, "-q"}}); qErr == nil {
+				for _, line := range strings.Split(qRes.Stdout, "\n") {
+					digest := strings.TrimSpace(line)
+					if digest != "" {
+						_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "rm", "--force", digest}})
+					}
+				}
+			}
+			if a.Env.MSBHome != "" {
+				_ = os.RemoveAll(filepath.Join(a.Env.MSBHome, "snapshots", grp))
+			}
+		}
+		_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "reindex"}})
+		_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"image", "prune", "-y"}})
+		_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"prune", "-y"}})
 	}
 
 	runRoot := filepath.Join(a.Env.DataDir, "run")
@@ -1449,6 +1478,20 @@ func (a *App) Remove(ctx context.Context, args []string) error {
 
 	a.logf("Removed all agbox state.")
 	return nil
+}
+
+func isAgboxSandboxName(name string) bool {
+	return name == config.BaseSandbox ||
+		strings.HasPrefix(name, config.RunPrefix+"-")
+}
+
+func isAgboxSnapshotName(name string) bool {
+	for _, grp := range []string{config.SnapGroup, config.BaseSandbox} {
+		if name == grp || strings.HasPrefix(name, grp+":") {
+			return true
+		}
+	}
+	return false
 }
 
 func containsStr(list []string, target string) bool {
