@@ -24,9 +24,9 @@ const (
 	GuestHome     = "/home/agent"
 	GuestKeysFile = "/home/agent/.agbox-keys.sh"
 
-	DefaultCPUs            = "2"
-	DefaultMemory          = "2G"
-	DefaultRootDisk        = "8G"
+	DefaultCPUs            = "4"
+	DefaultMemory          = "8G"
+	DefaultRootDisk        = "50G"
 	DefaultOpenCodeVersion = "latest"
 	DefaultAgyInstallerURL = "https://antigravity.google/cli/install.sh"
 )

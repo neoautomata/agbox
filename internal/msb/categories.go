@@ -229,14 +229,21 @@ func BuildCategoriesScript(cats []Category) string {
 	var b strings.Builder
 	b.WriteString("set -euo pipefail\n")
 	b.WriteString("export DEBIAN_FRONTEND=noninteractive\n")
+	b.WriteString("resize2fs /dev/vdb >/dev/null 2>&1 || true\n")
+	b.WriteString("mkdir -p /var/tmp && chmod 1777 /var/tmp\n")
+	b.WriteString("export TMPDIR=/var/tmp\n")
 	b.WriteString(ensureGuestPathProfileSnippet())
-	for _, c := range cats {
+	for i, c := range cats {
 		b.WriteString("\n# --- category: " + c.Name + " ---\n")
+		fmt.Fprintf(&b, "echo '[agbox] (%d/%d) Installing category %s...'\n", i+1, len(cats), c.Name)
 		b.WriteString(c.BuildScript())
 		b.WriteByte('\n')
+		b.WriteString("rm -rf /var/tmp/* /tmp/*\n")
+		fmt.Fprintf(&b, "echo '[agbox] (%d/%d) Completed category %s.'\n", i+1, len(cats), c.Name)
 	}
-	b.WriteString("\napt-get clean\nrm -rf /var/lib/apt/lists/*\n")
+	b.WriteString("\napt-get clean\nrm -rf /var/lib/apt/lists/* /var/tmp/* /tmp/*\n")
 	b.WriteString("chown -R 1000:1000 /home/agent /workspace\n")
+	b.WriteString("fstrim / >/dev/null 2>&1 || true\n")
 	return b.String()
 }
 
@@ -273,6 +280,7 @@ apt-get install -y -qq --no-install-recommends \
 
 # Install upstream Go toolchain in /usr/local/go if missing, with apt fallback.
 if [ ! -x /usr/local/go/bin/go ]; then
+  echo '[agbox]   -> Downloading upstream Go toolchain...'
   arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
   go_ver="$(curl -fsSL 'https://go.dev/VERSION?m=text' 2>/dev/null | head -1 || true)"
   if [ -n "${go_ver}" ]; then
@@ -290,12 +298,23 @@ fi
 su - agent -c '
   set -euo pipefail
   export PATH="/usr/local/go/bin:/home/agent/go/bin:$PATH"
-  go install github.com/go-delve/delve/cmd/dlv@latest
-  go install golang.org/x/tools/gopls@latest
-  go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-  go install golang.org/x/tools/cmd/goimports@latest
-  go install honnef.co/go/tools/cmd/staticcheck@latest
-  go install golang.org/x/vuln/cmd/govulncheck@latest
+  export TMPDIR=/var/tmp
+  mkdir -p /home/agent/go/bin
+  echo "[agbox]   -> Installing golangci-lint..."
+  if ! curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /home/agent/go/bin; then
+    go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+  fi
+  for pkg in \
+    github.com/go-delve/delve/cmd/dlv@latest \
+    golang.org/x/tools/gopls@latest \
+    golang.org/x/tools/cmd/goimports@latest \
+    honnef.co/go/tools/cmd/staticcheck@latest \
+    golang.org/x/vuln/cmd/govulncheck@latest
+  do
+    echo "[agbox]   -> go install ${pkg}..."
+    go install "${pkg}"
+  done
+  go clean -cache -modcache
 '
 `
 }
@@ -309,10 +328,12 @@ apt-get install -y -qq --no-install-recommends \
 su - agent -c '
   set -euo pipefail
   if [ ! -x /home/agent/.cargo/bin/rustup ]; then
+    echo "[agbox]   -> Installing rustup stable toolchain..."
     curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
   fi
   . "/home/agent/.cargo/env"
   rustup update
+  echo "[agbox]   -> Adding rustup components (clippy, rustfmt, rust-analyzer, rust-src)..."
   rustup component add clippy rustfmt rust-analyzer rust-src
 '
 `
@@ -330,9 +351,13 @@ apt-get install -y -qq --no-install-recommends \
 su - agent -c '
   set -euo pipefail
   export PATH="/home/agent/.local/bin:$PATH"
+  echo "[agbox]   -> pipx install esphome..."
   pipx install --force esphome
+  echo "[agbox]   -> pipx install esptool..."
   pipx install --force esptool
+  echo "[agbox]   -> pipx install platformio..."
   pipx install --force platformio
+  rm -rf /home/agent/.cache/pip
 '
 `
 }
@@ -341,8 +366,20 @@ func scriptCategoryEmbeddedRust() string {
 	return `su - agent -c '
   set -euo pipefail
   . "/home/agent/.cargo/env"
+  echo "[agbox]   -> Adding RISC-V Rust targets..."
   rustup target add riscv32imc-unknown-none-elf riscv32imac-unknown-none-elf
-  cargo install espflash cargo-espflash ldproxy
+  if ! command -v cargo-binstall >/dev/null 2>&1; then
+    echo "[agbox]   -> Installing cargo-binstall for fast prebuilt binary downloads..."
+    curl -L --proto "=https" --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash || true
+  fi
+  if command -v cargo-binstall >/dev/null 2>&1; then
+    echo "[agbox]   -> Installing espflash, cargo-espflash, and ldproxy via cargo-binstall..."
+    cargo binstall -y espflash cargo-espflash ldproxy || cargo install espflash cargo-espflash ldproxy
+  else
+    echo "[agbox]   -> Building espflash, cargo-espflash, and ldproxy via cargo install..."
+    cargo install espflash cargo-espflash ldproxy
+  fi
+  rm -rf /home/agent/.cargo/registry/cache /home/agent/.cargo/git/db
 '
 `
 }
@@ -384,13 +421,17 @@ func scriptCategoryCaddy() string {
 	return `su - agent -c '
   set -euo pipefail
   export PATH="/usr/local/go/bin:/home/agent/go/bin:$PATH"
+  export TMPDIR=/var/tmp
+  echo "[agbox]   -> Installing xcaddy..."
   go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+  echo "[agbox]   -> Building custom caddy binary with xcaddy..."
   xcaddy build \
     --output /home/agent/go/bin/caddy \
     --with github.com/caddy-dns/cloudflare \
     --with github.com/greenpau/caddy-security \
     --with github.com/point-c/caddy/module@latest \
     --with github.com/tailscale/caddy-tailscale
+  go clean -cache -modcache
 '
 install -m 0755 /home/agent/go/bin/caddy /usr/local/bin/caddy
 `

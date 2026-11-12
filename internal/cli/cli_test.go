@@ -119,6 +119,8 @@ func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 
 	for _, bad := range [][]string{
 		{"--serve", "--cmd", "id"},
+		{"--remote-control", "--serve"},
+		{"--remote-control", "--cmd", "id"},
 		{"--port"},
 		{"--port", "0"},
 		{"--port", "70000"},
@@ -134,9 +136,23 @@ func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 		}
 	}
 
+	optsRC, err := ParseRunArgs([]string{"--remote-control", "./proj"}, config.MaskAuto, nil)
+	if err != nil || !optsRC.RemoteControl {
+		t.Errorf("unexpected remote-control opts: %+v, %v", optsRC, err)
+	}
+
 	// SelectEffectiveAgent tests.
 	if ag, err := SelectEffectiveAgent("both", RunOpts{Serve: true}); err != nil || ag != "opencode" {
 		t.Errorf("SelectEffectiveAgent(both, Serve) = %q, %v", ag, err)
+	}
+	if ag, err := SelectEffectiveAgent("both", RunOpts{RemoteControl: true}); err != nil || ag != "antigravity" {
+		t.Errorf("SelectEffectiveAgent(both, RemoteControl) = %q, %v", ag, err)
+	}
+	if _, err := SelectEffectiveAgent("opencode", RunOpts{RemoteControl: true}); err == nil {
+		t.Error("expected error when --remote-control used with opencode-only base")
+	}
+	if _, err := SelectEffectiveAgent("both", RunOpts{Agent: "opencode", RemoteControl: true}); err == nil {
+		t.Error("expected error when --remote-control used with opencode agent")
 	}
 	if _, err := SelectEffectiveAgent("both", RunOpts{}); err == nil {
 		t.Error("expected error when base=both and no agent specified for TUI")
@@ -189,6 +205,16 @@ func TestParseStopAndRemoveArgsAndHelpers(t *testing.T) {
 	port, err := PickFreeLoopbackPort()
 	if err != nil || port < 1 || port > 65535 {
 		t.Fatalf("PickFreeLoopbackPort = %d, %v", port, err)
+	}
+
+	if sz, ok := parseSizeBytes("50G"); !ok || sz != 50*1024*1024*1024 {
+		t.Errorf("parseSizeBytes(50G) = %d, %v", sz, ok)
+	}
+	if sz, ok := parseSizeBytes("512M"); !ok || sz != 512*1024*1024 {
+		t.Errorf("parseSizeBytes(512M) = %d, %v", sz, ok)
+	}
+	if _, ok := parseSizeBytes("invalid"); ok {
+		t.Error("expected parseSizeBytes(invalid) to fail")
 	}
 }
 

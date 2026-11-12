@@ -138,18 +138,19 @@ func ParseEditBaseArgs(args []string) (EditBaseOpts, error) {
 
 // RunOpts holds parsed arguments for `agbox run`.
 type RunOpts struct {
-	Agent    string
-	Paths    []string
-	ReadOnly bool
-	Serve    bool
-	Probe    bool
-	Port     int
-	Cmd      string
-	NoNet    bool
-	NetSpecs []string
-	CPUs     string
-	Memory   string
-	MaskMode config.MaskMode
+	Agent         string
+	Paths         []string
+	ReadOnly      bool
+	Serve         bool
+	Probe         bool
+	Port          int
+	RemoteControl bool
+	Cmd           string
+	NoNet         bool
+	NetSpecs      []string
+	CPUs          string
+	Memory        string
+	MaskMode      config.MaskMode
 }
 
 // ParseRunArgs parses CLI arguments for `run`.
@@ -195,6 +196,8 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			opts.ReadOnly = true
 		case "--serve":
 			opts.Serve = true
+		case "--remote-control":
+			opts.RemoteControl = true
 		case "--probe":
 			opts.Probe = true
 			opts.Serve = true
@@ -254,6 +257,12 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	if opts.Serve && opts.Cmd != "" {
 		return RunOpts{}, errors.New("--serve and --cmd are mutually exclusive")
 	}
+	if opts.RemoteControl && opts.Serve {
+		return RunOpts{}, errors.New("--remote-control and --serve are mutually exclusive")
+	}
+	if opts.RemoteControl && opts.Cmd != "" {
+		return RunOpts{}, errors.New("--remote-control and --cmd are mutually exclusive")
+	}
 
 	return opts, nil
 }
@@ -271,6 +280,12 @@ func SelectEffectiveAgent(baseAgent string, opts RunOpts) (string, error) {
 	if opts.Serve && baseAgent != "opencode" && baseAgent != "both" {
 		return "", fmt.Errorf("--serve requires the OpenCode agent. This base (%s) does not include it", baseAgent)
 	}
+	if opts.RemoteControl && baseAgent != "antigravity" && baseAgent != "both" {
+		return "", fmt.Errorf("--remote-control requires the Antigravity (agy) agent. This base (%s) does not include it", baseAgent)
+	}
+	if opts.RemoteControl && opts.Agent == "opencode" {
+		return "", errors.New("--remote-control is only supported with the antigravity (agy) agent")
+	}
 	if opts.Cmd != "" {
 		return opts.Agent, nil
 	}
@@ -281,6 +296,9 @@ func SelectEffectiveAgent(baseAgent string, opts RunOpts) (string, error) {
 	if agent == "both" {
 		if opts.Serve {
 			return "opencode", nil
+		}
+		if opts.RemoteControl {
+			return "antigravity", nil
 		}
 		return "", errors.New("base includes both agents. Specify one: 'agbox run opencode ...' or 'agbox run antigravity ...'")
 	}
@@ -690,13 +708,15 @@ su - %q -c "opencode --version"`, config.GuestUser)
 
 	if opts.Agent == "antigravity" || opts.Agent == "both" {
 		a.logf("Installing Google Antigravity CLI (agy) from %s...", a.Env.AgyInstallerURL)
+		innerCmd := fmt.Sprintf("curl -fsSL %s | bash", msb.ShellQuote(a.Env.AgyInstallerURL))
 		agyScript := fmt.Sprintf(`set -euo pipefail
-curl -fsSL "$1" | bash
-install -m 0755 "${HOME}/.local/bin/agy" /usr/local/bin/agy
-rm -f "${HOME}/.local/bin/agy"
-su - %q -c "agy --version"`, config.GuestUser)
+su - %s -c %s
+if [ -x /home/agent/.local/bin/agy ]; then
+  ln -sf /home/agent/.local/bin/agy /usr/local/bin/agy
+fi
+su - %s -c "agy --version"`, config.GuestUser, msb.ShellQuote(innerCmd), config.GuestUser)
 		if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-			Args:   []string{"exec", config.BaseSandbox, "--", "bash", "-c", agyScript, "--", a.Env.AgyInstallerURL},
+			Args:   []string{"exec", config.BaseSandbox, "--", "bash", "-c", agyScript},
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		}); err != nil {
@@ -829,6 +849,10 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 		}
 	}
 
+	if err := a.ensureSparseRootDiskSize(ctx, baseInfo.Running); err != nil {
+		a.warnf("Could not expand base root disk: %v", err)
+	}
+
 	if !baseInfo.Running {
 		a.logf("Starting base sandbox...")
 		if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"start", config.BaseSandbox}}); err != nil {
@@ -895,11 +919,69 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 
 	st.Snapshot = snapSelector
 	st.SnapCount = count
+	st.RootDisk = a.Env.RootDisk
 	if err := config.SaveFile(a.Env.ConfigFile, st); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
 	a.logf("New runs use %s. Previous snapshots remain intact.", member)
 	return nil
+}
+
+// ensureSparseRootDiskSize expands the thin-provisioned (sparse) upper.ext4
+// image of `agbox-base` if it is currently smaller than a.Env.RootDisk.
+func (a *App) ensureSparseRootDiskSize(ctx context.Context, isRunning bool) error {
+	targetBytes, ok := parseSizeBytes(a.Env.RootDisk)
+	if !ok || targetBytes <= 0 {
+		return nil
+	}
+	upperPath := filepath.Join(a.Env.MSBHome, "sandboxes", config.BaseSandbox, "upper.ext4")
+	info, err := os.Stat(upperPath)
+	if err != nil || info.Size() >= targetBytes {
+		return nil
+	}
+
+	a.logf("Expanding thin-provisioned base disk (%s) to %s...", upperPath, a.Env.RootDisk)
+	if isRunning {
+		_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}})
+	}
+	if err := os.Truncate(upperPath, targetBytes); err != nil {
+		return fmt.Errorf("truncate %s: %w", upperPath, err)
+	}
+	// Resize the ext4 filesystem inside the sparse image on the host if resize2fs is available.
+	for _, dir := range []string{"/sbin", "/usr/sbin", "/bin", "/usr/bin"} {
+		r2fs := filepath.Join(dir, "resize2fs")
+		if _, sErr := os.Stat(r2fs); sErr == nil {
+			e2fsck := filepath.Join(dir, "e2fsck")
+			_ = exec.CommandContext(ctx, e2fsck, "-fp", upperPath).Run()
+			_ = exec.CommandContext(ctx, r2fs, upperPath).Run()
+			break
+		}
+	}
+	if isRunning {
+		_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"start", config.BaseSandbox}})
+	}
+	return nil
+}
+
+func parseSizeBytes(spec string) (int64, bool) {
+	s := strings.ToUpper(strings.TrimSpace(spec))
+	if s == "" {
+		return 0, false
+	}
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "G"):
+		mult = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "G")
+	case strings.HasSuffix(s, "M"):
+		mult = 1024 * 1024
+		s = strings.TrimSuffix(s, "M")
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n * mult, true
 }
 
 // Run restores an ephemeral `agbox-run-<pid>` microVM from the base snapshot.
@@ -1071,8 +1153,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		Snapshot: baseState.Snapshot,
 		Name:     runSandbox,
 		User:     config.GuestUser,
-		CPUs:     opts.CPUs,
-		Memory:   opts.Memory,
+		CPUs:     defaultStr(opts.CPUs, a.Env.CPUs),
+		Memory:   defaultStr(opts.Memory, a.Env.Memory),
 		Volumes:  volumes,
 		Ports:    portArgs,
 		NoNet:    opts.NoNet,
@@ -1184,6 +1266,9 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		bin = "opencode"
 	case "antigravity":
 		bin = "agy"
+		if opts.RemoteControl {
+			bin = "agy --remote-control"
+		}
 	}
 	modeStr := "rw"
 	if opts.ReadOnly {
@@ -1430,6 +1515,7 @@ Modes:
         --serve              Run 'opencode serve' and bind the web UI on 127.0.0.1
         --port N             Use fixed loopback TCP port N for --serve
         --probe              With --serve: wait for the web UI, then exit
+        --remote-control     Run 'agy --remote-control' for https://antigravity.google.com
         --cmd "shell"        Run one command in the ephemeral microVM and exit
         --no-net             Disable guest network access
         --net SPEC           Set network profile (public|none|private|host|all) or rule
@@ -1457,6 +1543,7 @@ func RunUsageText() string {
   --serve          run 'opencode serve' and bind the web UI on 127.0.0.1
   --port N         use fixed loopback port N for --serve (default: random)
   --probe          with --serve: wait for the web UI, then exit
+  --remote-control run 'agy --remote-control' for https://antigravity.google.com
   --cmd 'shell'    run one command in the ephemeral microVM and exit
   --no-net         disable guest network access
   --net SPEC       set network profile (public|none|private|host|all) or msb rule

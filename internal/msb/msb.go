@@ -163,11 +163,11 @@ func BuildCreateArgs(opts CreateOpts) ([]string, error) {
 	}
 	cpus := opts.CPUs
 	if cpus == "" {
-		cpus = "2"
+		cpus = "4"
 	}
 	mem := opts.Memory
 	if mem == "" {
-		mem = "2G"
+		mem = "8G"
 	}
 	args := []string{
 		"create", opts.Image,
@@ -318,15 +318,12 @@ if [[ -n "${cur_grp}" && "${cur_grp}" != "agent" ]] && ! getent group "agent" >/
   groupmod -n "agent" "${cur_grp}" || true
 fi
 usermod -s /bin/bash -d "/home/agent" -aG sudo "agent"
-mkdir -p /etc/sudoers.d "/home/agent" /workspace
+mkdir -p /etc/sudoers.d "/home/agent" "/home/agent/.local/bin" /workspace
 printf "%s ALL=(ALL:ALL) NOPASSWD: ALL\n" "agent" > /etc/sudoers.d/agent
 chmod 0440 /etc/sudoers.d/agent
-# The official agy installer places the binary in $HOME/.local/bin/agy (/root/.local/bin/agy)
-# and symlinks /usr/local/bin/agy -> /root/.local/bin/agy. Relocate the binary
-# directly to /usr/local/bin/agy so the non-root 'agent' user can execute it.
-if [[ -L /usr/local/bin/agy && -f /root/.local/bin/agy ]]; then
-  rm -f /usr/local/bin/agy
-  install -m 0755 /root/.local/bin/agy /usr/local/bin/agy
+if [[ -f /root/.local/bin/agy ]]; then
+  install -m 0755 -o 1000 -g 1000 /root/.local/bin/agy /home/agent/.local/bin/agy
+  ln -sf /home/agent/.local/bin/agy /usr/local/bin/agy
   rm -f /root/.local/bin/agy
 fi
 chown -R 1000:1000 "/home/agent" /workspace
