@@ -141,6 +141,7 @@ type RunOpts struct {
 	Agent         string
 	Paths         []string
 	ReadOnly      bool
+	Detach        bool
 	Serve         bool
 	Probe         bool
 	Port          int
@@ -194,6 +195,8 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			}
 		case "--ro":
 			opts.ReadOnly = true
+		case "-d", "--detach":
+			opts.Detach = true
 		case "--serve":
 			opts.Serve = true
 		case "--remote-control":
@@ -262,6 +265,9 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	}
 	if opts.RemoteControl && opts.Cmd != "" {
 		return RunOpts{}, errors.New("--remote-control and --cmd are mutually exclusive")
+	}
+	if opts.Detach && !opts.Serve && !opts.RemoteControl {
+		return RunOpts{}, errors.New("--detach (-d) requires --remote-control or --serve")
 	}
 
 	return opts, nil
@@ -1072,14 +1078,15 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		portArgs = []string{fmt.Sprintf("127.0.0.1:%d:%d", port, config.GuestPort)}
 	}
 
-	if !opts.Serve && opts.Cmd == "" {
+	isDetachedServe := opts.Serve && !opts.Probe && (opts.Detach || a.IsTTY == nil || !a.IsTTY())
+	isDetachedRC := opts.RemoteControl && (opts.Detach || a.IsTTY == nil || !a.IsTTY())
+	if !opts.Serve && !isDetachedRC && opts.Cmd == "" {
 		if a.IsTTY == nil || !a.IsTTY() {
-			return fmt.Errorf("the %s TUI requires a TTY (or use --serve / --cmd)", effectiveAgent)
+			return fmt.Errorf("the %s TUI requires a TTY (or use --serve / --remote-control -d / --cmd)", effectiveAgent)
 		}
 	}
 
-	isDetachedServe := opts.Serve && !opts.Probe && (a.IsTTY == nil || !a.IsTTY())
-	dieWithParent := !isDetachedServe
+	dieWithParent := !(isDetachedServe || isDetachedRC)
 
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
@@ -1269,6 +1276,65 @@ func (a *App) Run(ctx context.Context, args []string) error {
 				}
 			}
 		}
+	}
+
+	if isDetachedRC {
+		guestWorkDir := msb.GuestWorkspace
+		if len(validated) == 1 && validated[0].IsDir {
+			guestWorkDir = msb.GuestWorkspace + "/" + validated[0].GuestName
+		}
+		startDaemonCmd := fmt.Sprintf("%s cd %s && agy remote-control start --name %s",
+			msb.KeyLoaderPrefix, msb.ShellQuote(guestWorkDir), msb.ShellQuote(runSandbox))
+		startArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
+			Sandbox: runSandbox,
+			User:    config.GuestUser,
+			Env:     guestEnv,
+			Command: []string{"sh", "-c", startDaemonCmd},
+		})
+		res, startErr := a.MSB.Run(ctx, msb.CommandRequest{Args: startArgs})
+		if startErr != nil && a.IsTTY != nil && a.IsTTY() {
+			a.logf("Authenticating agy in %s. Open the printed URL in your browser, paste the verification code, and then run /exit to detach into the background...", runSandbox)
+			authArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
+				Sandbox: runSandbox,
+				TTY:     true,
+				User:    config.GuestUser,
+				Env:     guestEnv,
+				Command: []string{"sh", "-c", fmt.Sprintf("%s cd %s && exec agy", msb.KeyLoaderPrefix, msb.ShellQuote(guestWorkDir))},
+			})
+			_, _ = a.MSB.Run(ctx, msb.CommandRequest{
+				Args:        authArgs,
+				Interactive: true,
+			})
+			res, startErr = a.MSB.Run(ctx, msb.CommandRequest{Args: startArgs})
+		}
+		if startErr != nil {
+			msg := strings.TrimSpace(res.Stderr + "\n" + res.Stdout)
+			if msg != "" {
+				return fmt.Errorf("agy remote-control start failed: %w (%s)", startErr, msg)
+			}
+			return fmt.Errorf("agy remote-control start failed: %w", startErr)
+		}
+
+		statusArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
+			Sandbox: runSandbox,
+			User:    config.GuestUser,
+			Env:     guestEnv,
+			Command: []string{"sh", "-c", "agy remote-control status"},
+		})
+		if stRes, stErr := a.MSB.Run(ctx, msb.CommandRequest{Args: statusArgs}); stErr == nil && strings.TrimSpace(stRes.Stdout) != "" {
+			fmt.Fprintln(a.Stdout, strings.TrimSpace(stRes.Stdout))
+		}
+
+		if runFilterDir == "" {
+			runFilterDir = filepath.Join(a.Env.DataDir, "run", strconv.Itoa(a.PID))
+			_ = os.MkdirAll(runFilterDir, 0o700)
+		}
+		_ = os.WriteFile(filepath.Join(runFilterDir, "detached"), []byte(runSandbox+"\n"), 0o600)
+		detached = true
+		a.logf("Detached Remote Control microVM: %s (instance: %s)", runSandbox, runSandbox)
+		a.logf("Open https://antigravity.google.com and select %q in the instance switcher.", runSandbox)
+		a.logf("Stop and discard with: agbox stop %s", runSandbox)
+		return nil
 	}
 
 	bin := effectiveAgent
@@ -1558,7 +1624,8 @@ Modes:
         --serve              Run 'opencode serve' and bind the web UI on 127.0.0.1
         --port N             Use fixed loopback TCP port N for --serve
         --probe              With --serve: wait for the web UI, then exit
-        --remote-control     Run 'agy --remote-control' for https://antigravity.google.com
+        --remote-control     Run 'agy' with Remote Control for https://antigravity.google.com
+        -d, --detach         Keep --remote-control or --serve running in the background
         --cmd "shell"        Run one command in the ephemeral microVM and exit
         --no-net             Disable guest network access
         --net SPEC           Set network profile (public|none|private|host|all) or rule
@@ -1586,7 +1653,8 @@ func RunUsageText() string {
   --serve          run 'opencode serve' and bind the web UI on 127.0.0.1
   --port N         use fixed loopback port N for --serve (default: random)
   --probe          with --serve: wait for the web UI, then exit
-  --remote-control run 'agy --remote-control' for https://antigravity.google.com
+  --remote-control run 'agy' with Remote Control for https://antigravity.google.com
+  -d, --detach     keep --remote-control or --serve running in the background
   --cmd 'shell'    run one command in the ephemeral microVM and exit
   --no-net         disable guest network access
   --net SPEC       set network profile (public|none|private|host|all) or msb rule

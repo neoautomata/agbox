@@ -121,6 +121,8 @@ func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 		{"--serve", "--cmd", "id"},
 		{"--remote-control", "--serve"},
 		{"--remote-control", "--cmd", "id"},
+		{"-d"},
+		{"--detach", "antigravity"},
 		{"--port"},
 		{"--port", "0"},
 		{"--port", "70000"},
@@ -136,8 +138,8 @@ func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 		}
 	}
 
-	optsRC, err := ParseRunArgs([]string{"--remote-control", "./proj"}, config.MaskAuto, nil)
-	if err != nil || !optsRC.RemoteControl {
+	optsRC, err := ParseRunArgs([]string{"-d", "--remote-control", "./proj"}, config.MaskAuto, nil)
+	if err != nil || !optsRC.RemoteControl || !optsRC.Detach {
 		t.Errorf("unexpected remote-control opts: %+v, %v", optsRC, err)
 	}
 
@@ -410,6 +412,18 @@ func TestAppLifecycleModes(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(app.Env.DataDir, "run", "4242")); !os.IsNotExist(err) {
 		t.Errorf("expected filter dir for 4242 to be removed on Stop, stat err=%v", err)
+	}
+
+	// 6b. Run (-d --remote-control detached with TTY=true)
+	app.IsTTY = func() bool { return true }
+	if rc := app.Dispatch(ctx, []string{"run", "-d", "--remote-control", projDir}); rc != 0 {
+		t.Fatalf("Run -d --remote-control failed with rc=%d", rc)
+	}
+	if _, err := os.Stat(detachedMarker); err != nil {
+		t.Fatalf("expected detached marker for remote-control at %s: %v", detachedMarker, err)
+	}
+	if rc := app.Dispatch(ctx, []string{"stop", "agbox-run-4242"}); rc != 0 {
+		t.Fatalf("Stop failed with rc=%d", rc)
 	}
 
 	// 7. Status

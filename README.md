@@ -82,6 +82,9 @@ agbox run --serve --port 4096 ~/projects/myapp
 
 # Start Antigravity CLI (agy) with Remote Control for https://antigravity.google.com
 agbox run --remote-control ~/projects/myapp
+
+# Authenticate and run Antigravity Remote Control detached in the background
+agbox run -d --remote-control ~/projects/myapp
 ```
 
 ______________________________________________________________________
@@ -115,8 +118,8 @@ Supported passthrough variables:
 #### Temporary Sign-In (Single Session)
 
 1. Start the agent with `agbox run opencode ~/projects/myapp` or `agbox run antigravity ~/projects/myapp`.
-1. Run the agent's authentication command inside the TUI (for example, `/connect` in OpenCode or `agy auth login` in Antigravity).
-1. If the agent prints a localhost callback URL or device code, open the URL in your host browser to complete authentication.
+1. In OpenCode, run `/connect`. In `agy`, the CLI prints a browser authorization URL automatically on first launch.
+1. Open the URL in your host browser, authenticate, and paste the verification code into the terminal.
 1. When you exit `agbox run`, `agbox` deletes the microVM and the session token.
 
 #### Persistent Sign-In (Saved in Base Snapshot)
@@ -130,7 +133,7 @@ To avoid signing in on every run, authenticate as user `agent` inside `agbox edi
 1. Switch to user `agent` and run the authentication flow:
    ```bash
    su - agent
-   opencode auth login   # or: agy auth login
+   opencode auth login   # or: SSH_CONNECTION=1 agy (then /exit after sign-in)
    exit
    ```
 1. Exit the root shell (`exit`) so `agbox` saves a new snapshot (`agbox:v<N+1>`). Future `agbox run` sessions inherit that token in `/home/agent`.
@@ -180,10 +183,10 @@ Your browser will prompt for the username and password when you open `http://127
 
 ### 4. Run Detached in the Background
 
-When `agbox run --serve` runs without a TTY (for example, from a script or background job), `agbox` keeps the microVM and its FUSE filter daemons running after the CLI exits:
+Pass `-d` (or `--detach`) to keep the microVM and its FUSE filter daemons running in the background after `agbox` exits:
 
 ```bash
-agbox run --serve --port 4096 ~/projects/myapp </dev/null &
+agbox run -d --serve --port 4096 ~/projects/myapp
 ```
 
 Check active microVMs with `agbox status`. Stop and delete the detached microVM when you finish:
@@ -198,28 +201,29 @@ ______________________________________________________________________
 
 Antigravity Remote Control connects an `agy` session inside the microVM to the Antigravity web interface at [https://antigravity.google.com](https://antigravity.google.com). `agy` opens an outbound reverse tunnel over the default `public` network policy. You do not need `--port` or inbound firewall rules on the host.
 
-### 1. Authenticate with Your Google Account
+### 1. Authenticate and Run Detached in a Temporary Session (`-d --remote-control`)
 
-Remote Control requires the same Google Account in `agy` and at `https://antigravity.google.com`. To save your credentials in the base snapshot so every run inherits them:
+You can authenticate `agy` and run the Remote Control background daemon inside a temporary `agbox run` microVM without modifying the base image:
 
-1. Start a shell in the base microVM:
+1. Start a detached Remote Control microVM:
    ```bash
-   agbox edit-base --shell
+   agbox run -d --remote-control ~/projects/myapp
    ```
-1. Switch to user `agent` and authenticate:
+1. If the microVM is not authenticated yet, `agbox` opens `agy` interactively (`SSH_CONNECTION=1`). Open the printed authorization URL in your host browser, sign in with your Google Account, and paste the verification code into the terminal.
+1. Run `/exit` at the `agy` prompt. `agbox` starts the `agy` background daemon (`agy remote-control start --name agbox-run-<pid>`) inside the same microVM and returns your host terminal prompt.
+1. Open [https://antigravity.google.com](https://antigravity.google.com) in any browser and select `agbox-run-<pid>` from the instance switcher.
+1. Stop and delete the detached microVM when you finish:
    ```bash
-   su - agent
-   agy auth login
-   exit
+   agbox stop agbox-run-<pid>
    ```
-1. Exit the root shell (`exit`) to save a new base snapshot.
 
-### 2. Enable Remote Control Inside an Active `agy` Session
+### 2. Enable Remote Control Inside an Interactive `agy` Session
 
 1. Start `agy` on your project directory:
    ```bash
    agbox run antigravity ~/projects/myapp
    ```
+1. Complete the browser URL and verification code flow if prompted.
 1. Run the `/remote-control` slash command inside the `agy` prompt:
    ```text
    /remote-control
@@ -228,12 +232,12 @@ Remote Control requires the same Google Account in `agy` and at `https://antigra
    ```text
    https://antigravity.google.com/r/<instance-id>?p=c%2F<conversation-id>
    ```
-1. Open that URL in any browser or mobile device where you use the same Google Account. You can also open `https://antigravity.google.com` and select the microVM instance from the instance switcher.
+1. Open that URL in any browser or mobile device where you use the same Google Account.
 1. To stop Remote Control without ending the session, run `/remote-control off` in the `agy` prompt. When you exit `agy`, `agbox` closes the tunnel and deletes the microVM.
 
-### 3. Start `agy` with Remote Control Enabled at Launch
+### 3. Start Interactive `agy` with Remote Control Enabled at Launch
 
-Pass `--remote-control` to `agbox run`:
+Pass `--remote-control` (without `-d`) to keep the interactive TUI open in your terminal while Remote Control is active:
 
 ```bash
 agbox run --remote-control ~/projects/myapp
@@ -282,7 +286,8 @@ agbox run [options] [opencode|antigravity] [paths...]
       --serve              Run 'opencode serve' and bind the web UI on 127.0.0.1
       --port N             Use fixed loopback TCP port N for --serve
       --probe              With --serve: wait for the web UI, then exit
-      --remote-control     Run 'agy --remote-control' for https://antigravity.google.com
+      --remote-control     Run 'agy' with Remote Control for https://antigravity.google.com
+      -d, --detach         Keep --remote-control or --serve running in the background
       --cmd "shell"        Run one command in the ephemeral microVM and exit
       --no-net             Disable guest network access
       --net SPEC           Set network profile (public|none|private|host|all) or rule

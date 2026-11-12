@@ -281,13 +281,16 @@ func BuildExecArgs(opts ExecCmdOpts) []string {
 }
 
 // GuestEnvFlags returns the standard environment key=value pairs passed to
-// guest `msb exec` invocations for the non-root `agent` user.
+// guest `msb exec` invocations for the non-root `agent` user. Setting
+// SSH_CONNECTION=1 instructs `agy` to use its remote SSH OAuth flow (printing
+// a browser URL and prompting for the verification code) inside the microVM.
 func GuestEnvFlags() []string {
 	return []string{
 		"HOME=" + GuestHome,
 		"USER=" + GuestUser,
 		"LOGNAME=" + GuestUser,
 		"PATH=" + GuestDefaultPath,
+		"SSH_CONNECTION=1",
 	}
 }
 

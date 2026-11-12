@@ -172,6 +172,7 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		"-e", "USER=agent",
 		"-e", "LOGNAME=agent",
 		"-e", "PATH=" + GuestDefaultPath,
+		"-e", "SSH_CONNECTION=1",
 		"agbox-run-99",
 		"--",
 		"bash", "-c", "id",
