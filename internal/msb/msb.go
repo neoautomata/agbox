@@ -43,6 +43,9 @@ const GuestSkillsMount = "/home/agent/.agbox-skills"
 // GuestRulesMount is the read-only virtiofs mountpoint for host global rules.
 const GuestRulesMount = "/home/agent/.agbox-rules"
 
+// GuestAgentsMount is the read-only virtiofs mountpoint for cached agent binaries.
+const GuestAgentsMount = "/home/agent/.agbox-agents"
+
 // GuestProfileMount is the ext4 disk volume mountpoint for conversation profiles.
 const GuestProfileMount = "/home/agent/.agbox-profile"
 
@@ -545,8 +548,30 @@ if [[ -n "${cur_grp}" && "${cur_grp}" != "agent" ]] && ! getent group "agent" >/
   groupmod -n "agent" "${cur_grp}" || true
 fi
 usermod -s /bin/bash -d "/home/agent" -aG sudo "agent"
-mkdir -p /etc/sudoers.d "/home/agent" "/home/agent/.local/bin" "/home/agent/.agbox-skills" "/home/agent/.agbox-rules" "/home/agent/.agbox-profile" /workspace
-chmod 0700 "/home/agent/.agbox-skills" "/home/agent/.agbox-rules" "/home/agent/.agbox-profile"
+mkdir -p /etc/sudoers.d "/home/agent" "/home/agent/.local/bin" "/home/agent/.agbox-skills" "/home/agent/.agbox-rules" "/home/agent/.agbox-agents" "/home/agent/.agbox-profile" "/home/agent/.gemini/antigravity-cli" "/home/agent/.config/opencode" /workspace
+chmod 0700 "/home/agent/.agbox-skills" "/home/agent/.agbox-rules" "/home/agent/.agbox-agents" "/home/agent/.agbox-profile" "/home/agent/.gemini" "/home/agent/.gemini/antigravity-cli" "/home/agent/.config" "/home/agent/.config/opencode"
+if [[ ! -e /home/agent/.gemini/antigravity-cli/settings.json ]]; then
+  cat <<'EOF' > /home/agent/.gemini/antigravity-cli/settings.json
+{
+  "allowNonWorkspaceAccess": true,
+  "queuedMessages": "send-immediately",
+  "toolPermission": "always-proceed",
+  "trustedWorkspaces": [
+    "/workspace"
+  ]
+}
+EOF
+  chmod 0600 /home/agent/.gemini/antigravity-cli/settings.json
+fi
+if [[ ! -e /home/agent/.config/opencode/opencode.json ]]; then
+  cat <<'EOF' > /home/agent/.config/opencode/opencode.json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": "allow"
+}
+EOF
+  chmod 0600 /home/agent/.config/opencode/opencode.json
+fi
 printf "%s ALL=(ALL:ALL) NOPASSWD: ALL\n" "agent" > /etc/sudoers.d/agent
 chmod 0440 /etc/sudoers.d/agent
 if [[ -f /root/.local/bin/agy ]]; then

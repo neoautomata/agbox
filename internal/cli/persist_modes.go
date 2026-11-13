@@ -931,6 +931,9 @@ func (a *App) setupGuestProfile(ctx context.Context, sandbox string) error {
 
 func (a *App) suspendSandboxOnExit(sandbox, runFilterDir string, meta config.RunMeta) {
 	savedMeta := meta
+	if latest, lErr := config.LoadRunMeta(filepath.Join(runFilterDir, "run.meta")); lErr == nil {
+		savedMeta = latest
+	}
 	savedMeta.Continue = false
 	savedMeta.ContinueSession = ""
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
@@ -945,14 +948,20 @@ func (a *App) suspendSandboxOnExit(sandbox, runFilterDir string, meta config.Run
 	a.logf("Persisted %s (stopped). Resume with 'agbox resume %s' or delete with 'agbox stop %s'.", sandbox, sandbox, sandbox)
 }
 
-func sharesMatchRecorded(validated []pathsec.ShareTarget, recorded []config.ShareRecord, useMask bool) bool {
+func sharesMatchRecorded(validated []pathsec.ShareTarget, recorded []config.ShareRecord, useMask bool, metaReadOnly bool) bool {
 	if len(validated) != len(recorded) {
 		return false
 	}
 	for i, v := range validated {
 		rec := recorded[i]
-		wantMasked := v.IsDir && useMask
+		wantMasked := v.IsDir && useMask && v.VCSPolicy == config.VCSMask
 		if rec.Index != i || rec.HostPath != v.HostPath || rec.GuestName != v.GuestName || rec.IsDir != v.IsDir || rec.Masked != wantMasked {
+			return false
+		}
+		if rec.EffectiveReadOnly(metaReadOnly) != v.ReadOnly {
+			return false
+		}
+		if useMask && rec.EffectiveVCSPolicy() != v.VCSPolicy {
 			return false
 		}
 	}
@@ -966,22 +975,13 @@ func (a *App) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string
 		return fmt.Errorf("load suspended metadata for %q: %w", runSandbox, err)
 	}
 
-	if len(opts.Paths) > 0 {
-		pol := a.sharePolicy(opts.ReadOnly)
-		var validated []pathsec.ShareTarget
-		for _, rawPath := range opts.Paths {
-			if rawPath == "" {
-				continue
-			}
-			target, vErr := pathsec.ValidateShare(rawPath, pol)
-			if vErr != nil {
-				return vErr
-			}
-			validated = append(validated, target)
+	if len(opts.Paths) > 0 || len(opts.ShareSpecs) > 0 {
+		validated, vErr := a.resolveRunShareTargets(opts)
+		if vErr != nil {
+			return vErr
 		}
-		validated = pathsec.AssignGuestNames(validated)
-		if opts.ReadOnly != meta.ReadOnly || opts.MaskMode != meta.MaskMode || !sharesMatchRecorded(validated, meta.Shares, useMask) {
-			return fmt.Errorf("persistent sandbox %q has different shared paths or mount flags. Run 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+		if opts.ReadOnly != meta.ReadOnly || opts.MaskMode != meta.MaskMode || !sharesMatchRecorded(validated, meta.Shares, useMask, meta.ReadOnly) {
+			return fmt.Errorf("persistent sandbox %q has different shared paths or mount flags. Use 'agbox share' to modify shares or 'agbox stop %s' to recreate it", runSandbox, runSandbox)
 		}
 	}
 
@@ -1027,6 +1027,7 @@ func (a *App) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string
 		NoAuth:          opts.NoAuth,
 		NoSkills:        opts.NoSkills,
 		NoRules:         opts.NoRules,
+		NoAgentCache:    opts.NoAgentCache,
 	})
 
 	if opts.Cmd != "" && origMode != config.RunModeCmd && hasMarker(suspendedPath) {
@@ -1066,7 +1067,9 @@ func buildTUIInvokeCommand(meta config.RunMeta) string {
 		} else if meta.ContinueSession != "" {
 			parts = append(parts, "--conversation", msb.ShellQuote(meta.ContinueSession))
 		}
-		if len(meta.Shares) > 1 {
+		if len(meta.Shares) == 1 && meta.Shares[0].IsDir && meta.WorkspaceHub {
+			parts = append(parts, "--add-dir", msb.ShellQuote(msb.GuestWorkspace))
+		} else if len(meta.Shares) > 1 {
 			for _, sh := range meta.Shares {
 				if sh.IsDir {
 					parts = append(parts, "--add-dir", msb.ShellQuote(msb.GuestWorkspace+"/"+sh.GuestName))
@@ -1092,6 +1095,18 @@ func (a *App) printPersistenceStatus(ctx context.Context) {
 			fmt.Fprintln(a.Stdout, "auth: none")
 		} else {
 			fmt.Fprintf(a.Stdout, "auth: %s\n", strings.Join(configured, ", "))
+		}
+	}
+	agentsDir := filepath.Join(a.Env.DataDir, "agents")
+	if cached, err := persist.InspectAgentsDir(agentsDir); err == nil {
+		if len(cached) == 0 {
+			fmt.Fprintln(a.Stdout, "cached_agents: none")
+		} else {
+			var entries []string
+			for _, info := range cached {
+				entries = append(entries, fmt.Sprintf("%s (%s)", info.Agent, info.Version))
+			}
+			fmt.Fprintf(a.Stdout, "cached_agents: %s\n", strings.Join(entries, ", "))
 		}
 	}
 	skillsDir := filepath.Join(a.Env.DataDir, "skills")

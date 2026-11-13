@@ -546,3 +546,21 @@ printf '%s\0%s\0%s' "$ANTHROPIC_API_KEY" "$OPENAI_API_KEY" "$GEMINI_API_KEY"`
 		}
 	}
 }
+
+func TestProvisionGuestUserScriptAgentDefaults(t *testing.T) {
+	script := ProvisionGuestUserScript()
+	for _, want := range []string{
+		"/home/agent/.agbox-agents",
+		"/home/agent/.gemini/antigravity-cli/settings.json",
+		`"toolPermission": "always-proceed"`,
+		`"queuedMessages": "send-immediately"`,
+		`"allowNonWorkspaceAccess": true`,
+		`"trustedWorkspaces"`,
+		"/home/agent/.config/opencode/opencode.json",
+		`"permission": "allow"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("ProvisionGuestUserScript missing %q", want)
+		}
+	}
+}

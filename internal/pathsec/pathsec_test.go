@@ -6,6 +6,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"agbox/internal/config"
 )
 
 func TestIsSubpath(t *testing.T) {
@@ -384,5 +386,118 @@ func TestAllDefaultVCSNamesAndBlocklistCategories(t *testing.T) {
 		if _, err := ValidateShare(bf, pol); err == nil {
 			t.Errorf("expected blocklisted file %q to fail ValidateShare", bf)
 		}
+	}
+}
+
+func TestParseShareSpecAndResolveConflicts(t *testing.T) {
+	root := t.TempDir()
+	home, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(home, ".local", "share", "agbox")
+	msbHome := filepath.Join(home, ".microsandbox")
+	pol := Policy{
+		HomeReal:  home,
+		Blocklist: DefaultBlocklist(home, dataDir, msbHome),
+		VCSNames:  DefaultVCSNames(),
+	}
+
+	dirA := filepath.Join(home, "projA")
+	dirB := filepath.Join(home, "projB")
+	dirC := filepath.Join(home, "projC")
+	nestedInA := filepath.Join(dirA, "subpkg")
+	for _, d := range []string{dirA, dirB, dirC, nestedInA} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fileNote := filepath.Join(home, "notes.txt")
+	if err := os.WriteFile(fileNote, []byte("hi\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Valid modifier parsing (including trailing slash before :ro).
+	s1, err := ParseShareSpec(dirA)
+	if err != nil || s1.HasAccessOpt || s1.HasVCSOpt || s1.RawPath != dirA {
+		t.Fatalf("ParseShareSpec(dirA) = %+v, %v", s1, err)
+	}
+	s2, err := ParseShareSpec(dirB + "/:ro,mask,as=docs")
+	if err != nil || !s2.HasAccessOpt || !s2.ReadOnly || !s2.HasVCSOpt || s2.VCSPolicy != config.VCSMask || s2.GuestAlias != "docs" {
+		t.Fatalf("ParseShareSpec(dirB:ro,mask,as=docs) = %+v, %v", s2, err)
+	}
+	s3, err := ParseShareSpec(dirC + ":rw,vcs-hooks")
+	if err != nil || s3.ReadOnly || s3.VCSPolicy != config.VCSAllowHooks {
+		t.Fatalf("ParseShareSpec(dirC:rw,vcs-hooks) = %+v, %v", s3, err)
+	}
+
+	// 2. Conflicting, duplicate, or invalid inline modifiers must fail.
+	colonOnDisk := filepath.Join(home, "literal:ro")
+	if err := os.MkdirAll(colonOnDisk, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{
+		"",
+		":ro",
+		dirA + ":",
+		dirA + ":ro,",
+		dirA + ":ro,rw",
+		dirA + ":ro,ro",
+		dirA + ":mask,vcs",
+		dirA + ":vcs,vcs-hooks",
+		dirA + ":ro,vcs-hooks",
+		dirA + ":as=a,as=b",
+		dirA + ":as=.git",
+		dirA + ":as=../bad",
+		dirA + ":unknown",
+		colonOnDisk,
+	} {
+		if _, err := ParseShareSpec(bad); err == nil {
+			t.Errorf("ParseShareSpec(%q) succeeded, want error", bad)
+		}
+	}
+
+	// 3. ResolveShareSpecs with mixed permissions and alias collision avoidance.
+	resolved, err := ResolveShareSpecs([]ShareSpec{s1, s2, s3}, ResolveOpts{
+		Policy:     pol,
+		DefaultRO:  false,
+		DefaultVCS: config.VCSMask,
+	})
+	if err != nil || len(resolved) != 3 {
+		t.Fatalf("ResolveShareSpecs = %+v, %v", resolved, err)
+	}
+	if resolved[0].ReadOnly || resolved[0].VCSPolicy != config.VCSMask {
+		t.Errorf("resolved[0] = %+v, want rw + mask", resolved[0])
+	}
+	if !resolved[1].ReadOnly || resolved[1].GuestName != "docs" {
+		t.Errorf("resolved[1] = %+v, want ro + GuestName=docs", resolved[1])
+	}
+	if resolved[2].ReadOnly || resolved[2].VCSPolicy != config.VCSAllowHooks {
+		t.Errorf("resolved[2] = %+v, want rw + vcs-hooks", resolved[2])
+	}
+
+	// 4. Global locked flag conflicts, file VCS modifier conflict, duplicate host path, nested path, and duplicate alias must fail.
+	if _, err := ResolveShareSpecs([]ShareSpec{s3}, ResolveOpts{Policy: pol, DefaultRO: true, LockRO: true}); err == nil {
+		t.Error("expected LockRO + :rw conflict to fail")
+	}
+	if _, err := ResolveShareSpecs([]ShareSpec{s3}, ResolveOpts{Policy: pol, DefaultVCS: config.VCSMask, LockVCS: true}); err == nil {
+		t.Error("expected LockVCS(mask) + :vcs-hooks conflict to fail")
+	}
+	fileVCS, _ := ParseShareSpec(fileNote + ":vcs")
+	if _, err := ResolveShareSpecs([]ShareSpec{fileVCS}, ResolveOpts{Policy: pol}); err == nil {
+		t.Error("expected :vcs on single-file share to fail")
+	}
+	dupSpec, _ := ParseShareSpec(dirA + ":ro")
+	if _, err := ResolveShareSpecs([]ShareSpec{s1, dupSpec}, ResolveOpts{Policy: pol}); err == nil {
+		t.Error("expected duplicate host path to fail")
+	}
+	nestedSpec, _ := ParseShareSpec(nestedInA + ":ro")
+	if _, err := ResolveShareSpecs([]ShareSpec{s1, nestedSpec}, ResolveOpts{Policy: pol}); err == nil {
+		t.Error("expected nested host paths to fail")
+	}
+	alias1, _ := ParseShareSpec(dirA + ":as=same")
+	alias2, _ := ParseShareSpec(dirB + ":as=same")
+	if _, err := ResolveShareSpecs([]ShareSpec{alias1, alias2}, ResolveOpts{Policy: pol}); err == nil {
+		t.Error("expected duplicate explicit alias to fail")
 	}
 }

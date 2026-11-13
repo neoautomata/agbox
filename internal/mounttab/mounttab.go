@@ -220,7 +220,7 @@ func (OSController) Sleep(d time.Duration) {
 	time.Sleep(d)
 }
 
-// UnmountFilterDir stops FUSE filter daemons recorded in dir/m*.pid and
+// UnmountFilterDir stops FUSE filter daemons recorded in dir/*.pid and
 // unmounts all mountpoints under dir while keeping dir and its metadata files.
 func UnmountFilterDir(dir string, ctl Controller) error {
 	cleanDir := filepath.Clean(dir)
@@ -279,10 +279,11 @@ func UnmountFilterDir(dir string, ctl Controller) error {
 	}
 
 	removePIDFiles(cleanDir)
+	_ = os.Remove(filepath.Join(cleanDir, "ws.sock"))
 	return nil
 }
 
-// TeardownFilterDir stops FUSE filter daemons recorded in dir/m*.pid and
+// TeardownFilterDir stops FUSE filter daemons recorded in dir/*.pid and
 // unmounts all mountpoints under dir. It deletes dir only after it verifies
 // that zero mounts remain under dir in /proc/self/mountinfo.
 func TeardownFilterDir(dir string, ctl Controller) error {
@@ -300,7 +301,7 @@ func TeardownFilterDir(dir string, ctl Controller) error {
 }
 
 func removePIDFiles(dir string) {
-	matches, err := filepath.Glob(filepath.Join(dir, "m*.pid"))
+	matches, err := filepath.Glob(filepath.Join(dir, "*.pid"))
 	if err != nil {
 		return
 	}
@@ -310,7 +311,7 @@ func removePIDFiles(dir string) {
 }
 
 func signalRecordedPIDs(dir string, sig syscall.Signal, ctl Controller) {
-	matches, err := filepath.Glob(filepath.Join(dir, "m*.pid"))
+	matches, err := filepath.Glob(filepath.Join(dir, "*.pid"))
 	if err != nil {
 		return
 	}

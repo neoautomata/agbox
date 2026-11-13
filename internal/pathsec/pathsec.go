@@ -12,11 +12,14 @@
 package pathsec
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"agbox/internal/config"
 )
 
 // DefaultVCSNames returns the version-control directory and control file names
@@ -214,10 +217,216 @@ type Policy struct {
 // ShareTarget represents a validated host filesystem entry to be mounted at
 // /workspace/<GuestName> inside the guest.
 type ShareTarget struct {
-	HostPath  string
-	BaseName  string
-	GuestName string
-	IsDir     bool
+	HostPath      string
+	BaseName      string
+	GuestName     string
+	IsDir         bool
+	ReadOnly      bool
+	VCSPolicy     config.VCSPolicy
+	ExplicitAlias bool
+}
+
+// ShareSpec holds a parsed CLI share argument before filesystem validation.
+type ShareSpec struct {
+	RawPath      string
+	ReadOnly     bool
+	HasAccessOpt bool
+	VCSPolicy    config.VCSPolicy
+	HasVCSOpt    bool
+	GuestAlias   string
+}
+
+// ResolveOpts defines default share permissions and conflict locks when resolving ShareSpecs.
+type ResolveOpts struct {
+	Policy     Policy
+	DefaultRO  bool
+	LockRO     bool
+	DefaultVCS config.VCSPolicy
+	LockVCS    bool
+}
+
+// ValidateGuestAlias checks a custom guest mount name (`as=<name>` or `--as <name>`).
+func ValidateGuestAlias(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("guest share name must not be empty")
+	}
+	if len(name) > 128 {
+		return "", fmt.Errorf("guest share name %q exceeds 128 characters", name)
+	}
+	if name == "." || name == ".." || strings.ContainsAny(name, "/\\:, \t\n\r") || hasControlChar(name) {
+		return "", fmt.Errorf("invalid guest share name %q", name)
+	}
+	if vcs, bad := ContainsVCSComponent(name, DefaultVCSNames()); bad {
+		return "", fmt.Errorf("guest share name %q cannot match VCS entry %s", name, vcs)
+	}
+	return name, nil
+}
+
+// ParseShareSpec splits `<path>[:<mod1>,<mod2>,...]` and validates share modifiers.
+// Conflicting, duplicate, or unknown modifiers return an error.
+func ParseShareSpec(raw string) (ShareSpec, error) {
+	if raw == "" {
+		return ShareSpec{}, errors.New("share path must not be empty")
+	}
+	if hasControlChar(raw) {
+		return ShareSpec{}, fmt.Errorf("refusing path containing control character: %q", raw)
+	}
+
+	colonIdx := strings.IndexByte(raw, ':')
+	if colonIdx < 0 {
+		return ShareSpec{RawPath: raw}, nil
+	}
+	if _, err := os.Lstat(raw); err == nil {
+		return ShareSpec{}, fmt.Errorf("refusing to share path containing ':' (conflicts with share modifier syntax): %s", raw)
+	}
+
+	rawPath := raw[:colonIdx]
+	modStr := raw[colonIdx+1:]
+	if rawPath == "" {
+		return ShareSpec{}, fmt.Errorf("missing host path before ':' in %q", raw)
+	}
+	if strings.ContainsAny(rawPath, ":,") {
+		return ShareSpec{}, fmt.Errorf("refusing to share path containing ':' or ',': %s", rawPath)
+	}
+	if modStr == "" {
+		return ShareSpec{}, fmt.Errorf("empty share modifier after ':' in %q", raw)
+	}
+
+	spec := ShareSpec{RawPath: rawPath}
+	for _, tok := range strings.Split(modStr, ",") {
+		if tok == "" {
+			return ShareSpec{}, fmt.Errorf("empty share modifier token in %q", raw)
+		}
+		if strings.HasPrefix(tok, "as=") {
+			if spec.GuestAlias != "" {
+				return ShareSpec{}, fmt.Errorf("duplicate guest alias modifier in %q", raw)
+			}
+			alias, err := ValidateGuestAlias(strings.TrimPrefix(tok, "as="))
+			if err != nil {
+				return ShareSpec{}, err
+			}
+			spec.GuestAlias = alias
+			continue
+		}
+		switch tok {
+		case "ro":
+			if spec.HasAccessOpt {
+				return ShareSpec{}, fmt.Errorf("conflicting or duplicate access modifiers in %q", raw)
+			}
+			spec.ReadOnly = true
+			spec.HasAccessOpt = true
+		case "rw":
+			if spec.HasAccessOpt {
+				return ShareSpec{}, fmt.Errorf("conflicting or duplicate access modifiers in %q", raw)
+			}
+			spec.ReadOnly = false
+			spec.HasAccessOpt = true
+		case "mask", "mask-vcs":
+			if spec.HasVCSOpt {
+				return ShareSpec{}, fmt.Errorf("conflicting or duplicate VCS modifiers in %q", raw)
+			}
+			spec.VCSPolicy = config.VCSMask
+			spec.HasVCSOpt = true
+		case "vcs":
+			if spec.HasVCSOpt {
+				return ShareSpec{}, fmt.Errorf("conflicting or duplicate VCS modifiers in %q", raw)
+			}
+			spec.VCSPolicy = config.VCSAllow
+			spec.HasVCSOpt = true
+		case "vcs-hooks":
+			if spec.HasVCSOpt {
+				return ShareSpec{}, fmt.Errorf("conflicting or duplicate VCS modifiers in %q", raw)
+			}
+			spec.VCSPolicy = config.VCSAllowHooks
+			spec.HasVCSOpt = true
+		default:
+			return ShareSpec{}, fmt.Errorf("unknown share modifier %q in %q (expected ro, rw, mask, vcs, vcs-hooks, or as=<name>)", tok, raw)
+		}
+	}
+
+	if spec.HasAccessOpt && spec.ReadOnly && spec.HasVCSOpt && spec.VCSPolicy == config.VCSAllowHooks {
+		return ShareSpec{}, fmt.Errorf("conflicting modifiers ro and vcs-hooks in %q: read-only shares cannot write hooks", raw)
+	}
+	return spec, nil
+}
+
+// ResolveShareSpecs validates ShareSpecs against host filesystem policies, resolves
+// defaults, rejects conflicting options or overlapping host paths, and assigns guest names.
+func ResolveShareSpecs(specs []ShareSpec, opts ResolveOpts) ([]ShareTarget, error) {
+	defaultVCS := opts.DefaultVCS
+	if defaultVCS == "" {
+		defaultVCS = config.VCSMask
+	}
+	if opts.DefaultRO && defaultVCS == config.VCSAllowHooks {
+		return nil, errors.New("conflicting options: read-only mode cannot be combined with vcs-hooks")
+	}
+
+	targets := make([]ShareTarget, 0, len(specs))
+	for _, spec := range specs {
+		ro := opts.DefaultRO
+		if spec.HasAccessOpt {
+			if opts.LockRO && spec.ReadOnly != opts.DefaultRO {
+				return nil, fmt.Errorf("conflicting access options for %q: flag and modifier disagree on ro/rw", spec.RawPath)
+			}
+			ro = spec.ReadOnly
+		}
+
+		vcsPol := defaultVCS
+		if spec.HasVCSOpt {
+			if opts.LockVCS && spec.VCSPolicy != defaultVCS {
+				return nil, fmt.Errorf("conflicting VCS options for %q: flag (%s) and modifier (%s) disagree", spec.RawPath, defaultVCS, spec.VCSPolicy)
+			}
+			vcsPol = spec.VCSPolicy
+		}
+
+		if ro && vcsPol == config.VCSAllowHooks {
+			return nil, fmt.Errorf("conflicting options for %q: read-only share cannot enable vcs-hooks", spec.RawPath)
+		}
+
+		itemPol := opts.Policy
+		itemPol.ReadOnly = ro
+		target, err := ValidateShare(spec.RawPath, itemPol)
+		if err != nil {
+			return nil, err
+		}
+		if !target.IsDir {
+			if spec.HasVCSOpt && spec.VCSPolicy != config.VCSMask {
+				return nil, fmt.Errorf("VCS modifier %q applies only to directory shares: %s", spec.VCSPolicy, target.HostPath)
+			}
+			vcsPol = config.VCSMask
+		}
+
+		target.ReadOnly = ro
+		target.VCSPolicy = vcsPol
+		if spec.GuestAlias != "" {
+			target.GuestName = spec.GuestAlias
+			target.ExplicitAlias = true
+		}
+		targets = append(targets, target)
+	}
+
+	if err := CheckDisjointHostPaths(targets); err != nil {
+		return nil, err
+	}
+	return AssignGuestNamesChecked(targets)
+}
+
+// CheckDisjointHostPaths rejects duplicate or nested host share paths so one share
+// cannot bypass another share's read-only or VCS-masking restrictions.
+func CheckDisjointHostPaths(targets []ShareTarget) error {
+	for i := 0; i < len(targets); i++ {
+		for j := i + 1; j < len(targets); j++ {
+			a := targets[i].HostPath
+			b := targets[j].HostPath
+			if a == b {
+				return fmt.Errorf("duplicate share path: %s", a)
+			}
+			if IsSubpath(a, b) || IsSubpath(b, a) {
+				return fmt.Errorf("overlapping share paths %s and %s: nested shares are forbidden", a, b)
+			}
+		}
+	}
+	return nil
 }
 
 // ValidateShare resolves symlinks on rawPath and verifies that it satisfies all
@@ -316,9 +525,53 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 // AssignGuestNames returns a new slice of ShareTargets where duplicate
 // BaseNames receive collision-free suffixes ("foo", "foo-2", "foo-3", ...).
 func AssignGuestNames(targets []ShareTarget) []ShareTarget {
+	out, err := AssignGuestNamesChecked(targets)
+	if err != nil {
+		// Fallback for callers that did not set ExplicitAlias.
+		out = make([]ShareTarget, len(targets))
+		used := make(map[string]bool, len(targets))
+		for idx, t := range targets {
+			base := t.BaseName
+			if base == "" {
+				base = filepath.Base(t.HostPath)
+			}
+			name := base
+			for suffix := 2; used[name]; suffix++ {
+				name = fmt.Sprintf("%s-%d", base, suffix)
+			}
+			used[name] = true
+			t.BaseName = base
+			t.GuestName = name
+			out[idx] = t
+		}
+	}
+	return out
+}
+
+// AssignGuestNamesChecked assigns collision-free guest names while rejecting
+// duplicate ExplicitAlias values.
+func AssignGuestNamesChecked(targets []ShareTarget) ([]ShareTarget, error) {
 	out := make([]ShareTarget, len(targets))
 	used := make(map[string]bool, len(targets))
+
 	for idx, t := range targets {
+		if !t.ExplicitAlias {
+			continue
+		}
+		if used[t.GuestName] {
+			return nil, fmt.Errorf("duplicate guest share name %q", t.GuestName)
+		}
+		used[t.GuestName] = true
+		if t.BaseName == "" {
+			t.BaseName = filepath.Base(t.HostPath)
+		}
+		out[idx] = t
+	}
+
+	for idx, t := range targets {
+		if t.ExplicitAlias {
+			continue
+		}
 		base := t.BaseName
 		if base == "" {
 			base = filepath.Base(t.HostPath)
@@ -332,7 +585,7 @@ func AssignGuestNames(targets []ShareTarget) []ShareTarget {
 		t.GuestName = name
 		out[idx] = t
 	}
-	return out
+	return out, nil
 }
 
 // FormatVolumeSpec formats an `msb -v` volume argument mapping hostSource to

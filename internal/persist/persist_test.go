@@ -486,3 +486,131 @@ func TestGlobalRulesInstallInspectStageAndSecurity(t *testing.T) {
 		t.Fatalf("InspectRulesDir after RemoveAllRules = (%v, %v)", left, err)
 	}
 }
+
+func TestAgentsCacheInstallInspectRemoveAndSecurity(t *testing.T) {
+	base := t.TempDir()
+	agentsDir := filepath.Join(base, "agents")
+
+	// Missing directory returns nil, nil.
+	if got, err := InspectAgentsDir(agentsDir); err != nil || len(got) != 0 {
+		t.Fatalf("InspectAgentsDir(missing) = (%v, %v)", got, err)
+	}
+
+	// Build valid synthetic 64-byte+ ELF payloads for agy and opencode.
+	agyELF := append([]byte{0x7f, 'E', 'L', 'F'}, bytes.Repeat([]byte("A"), 128)...)
+	ocELF := append([]byte{0x7f, 'E', 'L', 'F'}, bytes.Repeat([]byte("O"), 160)...)
+
+	agyInfo, err := InstallAgentBinaryFromReader(agentsDir, "antigravity", "2.1.0\nextra-line", bytes.NewReader(agyELF))
+	if err != nil {
+		t.Fatalf("InstallAgentBinaryFromReader(antigravity): %v", err)
+	}
+	if agyInfo.BinName != "agy" || agyInfo.Version != "2.1.0" || agyInfo.SizeBytes != int64(len(agyELF)) {
+		t.Fatalf("unexpected agyInfo: %+v", agyInfo)
+	}
+	ocInfo, err := InstallAgentBinaryFromReader(agentsDir, "opencode", "1.4.2", bytes.NewReader(ocELF))
+	if err != nil {
+		t.Fatalf("InstallAgentBinaryFromReader(opencode): %v", err)
+	}
+	if ocInfo.BinName != "opencode" || ocInfo.Version != "1.4.2" {
+		t.Fatalf("unexpected ocInfo: %+v", ocInfo)
+	}
+
+	cached, err := InspectAgentsDir(agentsDir)
+	if err != nil || len(cached) != 2 || cached[0].Agent != "antigravity" || cached[1].Agent != "opencode" {
+		t.Fatalf("InspectAgentsDir = (%+v, %v)", cached, err)
+	}
+
+	// Reject non-ELF binary streams and undersized streams without corrupting existing cache.
+	if _, err := InstallAgentBinaryFromReader(agentsDir, "antigravity", "bad", bytes.NewReader(bytes.Repeat([]byte("X"), 128))); err == nil {
+		t.Fatal("expected non-ELF binary stream to be rejected")
+	}
+	if _, err := InstallAgentBinaryFromReader(agentsDir, "antigravity", "tiny", bytes.NewReader([]byte{0x7f, 'E', 'L', 'F'})); err == nil {
+		t.Fatal("expected undersized ELF stream to be rejected")
+	}
+	if afterBad, err := InspectAgentsDir(agentsDir); err != nil || len(afterBad) != 2 || afterBad[0].Version != "2.1.0" {
+		t.Fatalf("failed install corrupted cache: (%+v, %v)", afterBad, err)
+	}
+
+	// Tampering with cached binary bytes must fail SHA-256 verification.
+	agyPath := filepath.Join(agentsDir, "bin", "agy")
+	tampered := append([]byte{}, agyELF...)
+	tampered[len(tampered)-1] = 'Z'
+	if err := os.WriteFile(agyPath, tampered, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectAgentsDir(agentsDir); err == nil {
+		t.Fatal("expected InspectAgentsDir to reject SHA-256 mismatch")
+	}
+	if err := os.WriteFile(agyPath, agyELF, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hardlinked binary must fail closed (st_nlink != 1).
+	hardlinkOutside := filepath.Join(base, "outside-link")
+	if err := os.Link(agyPath, hardlinkOutside); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectAgentsDir(agentsDir); err == nil {
+		t.Fatal("expected InspectAgentsDir to reject hardlinked binary")
+	}
+	_ = os.Remove(hardlinkOutside)
+
+	// Unexpected file or symlink inside agentsDir/bin must fail closed.
+	extraPath := filepath.Join(agentsDir, "bin", "evil")
+	if err := os.WriteFile(extraPath, agyELF, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectAgentsDir(agentsDir); err == nil {
+		t.Fatal("expected InspectAgentsDir to reject unexpected binary name")
+	}
+	_ = os.Remove(extraPath)
+
+	symPath := filepath.Join(agentsDir, "evil-sym")
+	if err := os.Symlink("/etc/passwd", symPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectAgentsDir(agentsDir); err == nil {
+		t.Fatal("expected InspectAgentsDir to reject symlink in agentsDir")
+	}
+	_ = os.Remove(symPath)
+
+	// RemoveCachedAgent(antigravity) leaves opencode intact, and RemoveCachedAgent(all) clears all.
+	if err := RemoveCachedAgent(agentsDir, "antigravity"); err != nil {
+		t.Fatalf("RemoveCachedAgent(antigravity): %v", err)
+	}
+	rem, err := InspectAgentsDir(agentsDir)
+	if err != nil || len(rem) != 1 || rem[0].Agent != "opencode" {
+		t.Fatalf("InspectAgentsDir after single remove = (%+v, %v)", rem, err)
+	}
+	if err := RemoveCachedAgent(agentsDir, "all"); err != nil {
+		t.Fatalf("RemoveCachedAgent(all): %v", err)
+	}
+	empty, err := InspectAgentsDir(agentsDir)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("InspectAgentsDir after remove all = (%+v, %v)", empty, err)
+	}
+
+	// Verify BuildAgentUpdateScript, BuildGuestAgentsMountScript, and BuildGuestProfileMountScript.
+	upAgy, catAgy, _, err := BuildAgentUpdateScript("antigravity", "", "")
+	if err != nil || !strings.Contains(upAgy, "--proto") || !strings.Contains(upAgy, "=https") || !strings.Contains(upAgy, "--tlsv1.2") || catAgy == "" {
+		t.Errorf("BuildAgentUpdateScript(antigravity) = (%q, %q, %v)", upAgy, catAgy, err)
+	}
+	upOC, catOC, _, err := BuildAgentUpdateScript("opencode", "latest", "")
+	if err != nil || !strings.Contains(upOC, "'opencode-ai@latest'") || catOC == "" {
+		t.Errorf("BuildAgentUpdateScript(opencode) = (%q, %q, %v)", upOC, catOC, err)
+	}
+	mntAgents := BuildGuestAgentsMountScript()
+	for _, want := range []string{
+		"/home/agent/.agbox-agents",
+		"remount,ro,bind /home/agent/.local/bin/agy",
+		"remount,ro,bind /usr/local/bin/opencode",
+	} {
+		if !strings.Contains(mntAgents, want) {
+			t.Errorf("BuildGuestAgentsMountScript missing %q", want)
+		}
+	}
+	profScript := BuildGuestProfileMountScript()
+	if !strings.Contains(profScript, "/home/agent/.agbox-profile/agy-cli/settings.json") {
+		t.Errorf("BuildGuestProfileMountScript missing settings.json profile seed")
+	}
+}

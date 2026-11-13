@@ -2,13 +2,13 @@
 //
 // Security properties:
 //   - Rejects root execution by default unless --allow-root or AGBOX_ALLOW_ROOT=1 is set.
-//   - Fails closed across setup, create-base, edit-base, auth, skills, profile, run, and resume
-//     whenever a prerequisite, FUSE filter, network rule, or secret transfer fails.
+//   - Fails closed across setup, create-base, edit-base, update, auth, skills, rules, profile,
+//     share, run, and resume whenever a prerequisite, FUSE filter, network rule, or secret transfer fails.
 //   - Enforces MaskStrict FUSE VCS filtering and default-deny public-only egress
 //     by default on every run.
 //   - Binds --serve web interfaces strictly to host loopback (127.0.0.1).
 //   - Streams host API keys and saved sandbox login credentials over stdin into the microVM.
-//   - Mounts global skills from $DATA_DIR/skills read-only and isolates --profile disks with flock.
+//   - Mounts cached agent updates, global skills, and global rules read-only and isolates --profile disks with flock.
 package cli
 
 import (
@@ -340,8 +340,13 @@ type RunOpts struct {
 	Name            string
 	Agent           string
 	Paths           []string
+	ShareSpecs      []string
+	ShareHub        bool
 	AllowRoot       bool
 	ReadOnly        bool
+	LockAccess      bool
+	DefaultVCS      config.VCSPolicy
+	LockVCS         bool
 	Detach          bool
 	Serve           bool
 	Probe           bool
@@ -360,6 +365,7 @@ type RunOpts struct {
 	NoAuth          bool
 	NoSkills        bool
 	NoRules         bool
+	NoAgentCache    bool
 }
 
 // ParseRunArgs parses CLI arguments for `run`.
@@ -376,8 +382,15 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	}
 
 	opts := RunOpts{
-		MaskMode: defaultMask,
+		MaskMode:   defaultMask,
+		DefaultVCS: config.VCSMask,
 	}
+	sawRO := false
+	sawRW := false
+	sawMaskVCS := false
+	sawNoMask := false
+	sawVCS := false
+	sawVCSHooks := false
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -398,6 +411,14 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 				return RunOpts{}, nErr
 			}
 			opts.Name = validName
+			continue
+		}
+		if strings.HasPrefix(arg, "--share=") {
+			rawShare := strings.TrimPrefix(arg, "--share=")
+			if _, sErr := pathsec.ParseShareSpec(rawShare); sErr != nil {
+				return RunOpts{}, sErr
+			}
+			opts.ShareSpecs = append(opts.ShareSpecs, rawShare)
 			continue
 		}
 		if strings.HasPrefix(arg, "--profile=") {
@@ -442,10 +463,25 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			}
 			opts.Name = validName
 			i++
+		case "--share":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return RunOpts{}, errors.New("--share requires a path[:opts] argument")
+			}
+			if _, sErr := pathsec.ParseShareSpec(args[i+1]); sErr != nil {
+				return RunOpts{}, sErr
+			}
+			opts.ShareSpecs = append(opts.ShareSpecs, args[i+1])
+			i++
+		case "--share-hub":
+			opts.ShareHub = true
 		case "--allow-root":
 			opts.AllowRoot = true
 		case "--ro":
+			sawRO = true
 			opts.ReadOnly = true
+		case "--rw":
+			sawRW = true
+			opts.ReadOnly = false
 		case "-d", "--detach":
 			opts.Detach = true
 		case "--serve":
@@ -500,9 +536,20 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			opts.Memory = strings.ToUpper(strings.TrimSpace(args[i+1]))
 			i++
 		case "--mask-vcs":
+			sawMaskVCS = true
 			opts.MaskMode = config.MaskStrict
+			opts.DefaultVCS = config.VCSMask
 		case "--no-mask":
+			sawNoMask = true
 			opts.MaskMode = config.MaskOff
+		case "--vcs":
+			sawVCS = true
+			opts.MaskMode = config.MaskStrict
+			opts.DefaultVCS = config.VCSAllow
+		case "--vcs-hooks":
+			sawVCSHooks = true
+			opts.MaskMode = config.MaskStrict
+			opts.DefaultVCS = config.VCSAllowHooks
 		case "--persist":
 			opts.Persist = true
 		case "--profile":
@@ -533,11 +580,67 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			opts.NoSkills = true
 		case "--no-rules":
 			opts.NoRules = true
+		case "--no-agent-cache", "--no-agent-override":
+			opts.NoAgentCache = true
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return RunOpts{}, fmt.Errorf("unknown run option: %s ('agbox run --help')", arg)
 			}
 			opts.Paths = append(opts.Paths, arg)
+		}
+	}
+
+	if sawRO && sawRW {
+		return RunOpts{}, errors.New("conflicting options: cannot combine --ro and --rw")
+	}
+	vcsModeFlags := 0
+	for _, b := range []bool{sawMaskVCS, sawNoMask, sawVCS, sawVCSHooks} {
+		if b {
+			vcsModeFlags++
+		}
+	}
+	if vcsModeFlags > 1 {
+		return RunOpts{}, errors.New("conflicting VCS options: specify at most one of --mask-vcs, --no-mask, --vcs, or --vcs-hooks")
+	}
+	if sawRO && sawVCSHooks {
+		return RunOpts{}, errors.New("conflicting options: cannot combine --ro and --vcs-hooks")
+	}
+	if opts.MaskMode == config.MaskOff && opts.ShareHub {
+		return RunOpts{}, errors.New("conflicting options: cannot combine --no-mask and --share-hub")
+	}
+	opts.LockAccess = sawRO || sawRW
+	opts.LockVCS = sawMaskVCS || sawVCS || sawVCSHooks
+
+	allRawShares := make([]string, 0, len(opts.ShareSpecs)+len(opts.Paths))
+	allRawShares = append(allRawShares, opts.ShareSpecs...)
+	allRawShares = append(allRawShares, opts.Paths...)
+	for _, raw := range allRawShares {
+		if raw == "" {
+			continue
+		}
+		spec, sErr := pathsec.ParseShareSpec(raw)
+		if sErr != nil {
+			return RunOpts{}, sErr
+		}
+		if opts.MaskMode == config.MaskOff && spec.HasVCSOpt {
+			return RunOpts{}, fmt.Errorf("conflicting options for %q: per-share VCS modifier requires FUSE filtering (cannot combine with --no-mask)", raw)
+		}
+		effRO := opts.ReadOnly
+		if spec.HasAccessOpt {
+			if opts.LockAccess && spec.ReadOnly != opts.ReadOnly {
+				return RunOpts{}, fmt.Errorf("conflicting access options for %q: flag and modifier disagree on ro/rw", raw)
+			}
+			effRO = spec.ReadOnly
+		}
+		effVCS := opts.DefaultVCS
+		if spec.HasVCSOpt {
+			if opts.LockVCS && spec.VCSPolicy != opts.DefaultVCS {
+				return RunOpts{}, fmt.Errorf("conflicting VCS options for %q: flag (%s) and modifier (%s) disagree", raw, opts.DefaultVCS, spec.VCSPolicy)
+			}
+			effVCS = spec.VCSPolicy
+		}
+		if effRO && effVCS == config.VCSAllowHooks {
+			return RunOpts{}, fmt.Errorf("conflicting options for %q: read-only share cannot enable vcs-hooks", raw)
 		}
 	}
 
@@ -657,6 +760,7 @@ type ResumeOpts struct {
 	NoAuth          bool
 	NoSkills        bool
 	NoRules         bool
+	NoAgentCache    bool
 }
 
 // ParseResumeArgs validates CLI arguments for `agbox resume`.
@@ -706,9 +810,11 @@ func ParseResumeArgs(args []string) (ResumeOpts, error) {
 			opts.NoSkills = true
 		case "--no-rules":
 			opts.NoRules = true
+		case "--no-agent-cache", "--no-agent-override":
+			opts.NoAgentCache = true
 		default:
 			if strings.HasPrefix(a, "-") {
-				return ResumeOpts{}, fmt.Errorf("unknown resume option: %s (expected --allow-root, --detach, --continue, --session, --no-auth, --no-skills, or --no-rules)", a)
+				return ResumeOpts{}, fmt.Errorf("unknown resume option: %s (expected --allow-root, --detach, --continue, --session, --no-auth, --no-skills, --no-rules, or --no-agent-cache)", a)
 			}
 			pos = append(pos, a)
 		}
@@ -851,6 +957,7 @@ type App struct {
 	CheckFUSE   func() error
 	PID         int
 	StartFilter func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error)
+	StartHub    func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error)
 	WaitServeUI func(ctx context.Context, port int, sandbox string) bool
 }
 
@@ -890,6 +997,9 @@ func NewApp() (*App, error) {
 	}
 	app.StartFilter = func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error) {
 		return vcsfuse.StartSubprocess(app.ExePath, srcDir, mntDir, pidFile, dieWithParent)
+	}
+	app.StartHub = func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error) {
+		return vcsfuse.StartHubSubprocess(app.ExePath, mntDir, sockPath, pidFile, initial, app.Env.DataDir, dieWithParent)
 	}
 	app.WaitServeUI = app.defaultWaitServeUI
 	return app, nil
@@ -1717,6 +1827,23 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		}
 	}
 
+	agentsDir := filepath.Join(a.Env.DataDir, "agents")
+	var cachedAgents []persist.CachedAgentInfo
+	agentsMounted := false
+	if !opts.NoAgentCache {
+		var agErr error
+		cachedAgents, agErr = persist.InspectAgentsDir(agentsDir)
+		if agErr != nil {
+			return agErr
+		}
+		if len(cachedAgents) > 0 || opts.Persist {
+			if err := persist.EnsureAgentsDir(agentsDir); err != nil {
+				return err
+			}
+			agentsMounted = true
+		}
+	}
+
 	var profLock *persist.ProfileLock
 	var namedVolumes []msb.NamedVolumeSpec
 	if opts.Profile != "" {
@@ -1740,19 +1867,13 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		})
 	}
 
-	pol := a.sharePolicy(opts.ReadOnly)
-	var validated []pathsec.ShareTarget
-	for _, rawPath := range opts.Paths {
-		if rawPath == "" {
-			continue
-		}
-		target, vErr := pathsec.ValidateShare(rawPath, pol)
-		if vErr != nil {
-			return vErr
-		}
-		validated = append(validated, target)
+	validated, err := a.resolveRunShareTargets(opts)
+	if err != nil {
+		return err
 	}
-	validated = pathsec.AssignGuestNames(validated)
+	if opts.ShareHub && !useMask {
+		return fmt.Errorf("DATA_DIR (%s) does not support FUSE mounts required by --share-hub", a.Env.DataDir)
+	}
 
 	var port int
 	var portArgs []string
@@ -1849,49 +1970,91 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	var shareRecords []config.ShareRecord
 	maskedCount := 0
 	directCount := 0
-	for i, target := range validated {
-		guestPath := msb.GuestWorkspace + "/" + target.GuestName
-		masked := false
-		if target.IsDir && useMask {
-			if a.StartFilter == nil {
-				if maskStrict {
-					return errors.New("FUSE filter starter is not configured")
-				}
-			} else {
-				mntDir := filepath.Join(runFilterDir, fmt.Sprintf("m%d", i))
-				pidFile := mntDir + ".pid"
-				if _, fErr := a.StartFilter(target.HostPath, mntDir, pidFile, dieWithParent); fErr == nil {
-					volumes = append(volumes, msb.VolumeSpec{
-						HostPath:  mntDir,
-						GuestPath: guestPath,
-						ReadOnly:  opts.ReadOnly,
+	workspaceHubActive := false
+
+	if useMask && (opts.ShareHub || len(validated) > 0) {
+		if a.StartHub == nil {
+			if maskStrict || opts.ShareHub {
+				return errors.New("FUSE workspace hub starter is not configured")
+			}
+		} else {
+			hubInitial := make([]vcsfuse.HubShareConfig, 0, len(validated))
+			for _, target := range validated {
+				hubInitial = append(hubInitial, vcsfuse.HubShareConfig{
+					GuestName: target.GuestName,
+					HostPath:  target.HostPath,
+					ReadOnly:  target.ReadOnly,
+					VCSPolicy: target.VCSPolicy,
+				})
+			}
+			wsDir := filepath.Join(runFilterDir, "ws")
+			sockPath := filepath.Join(runFilterDir, "ws.sock")
+			pidFile := filepath.Join(runFilterDir, "ws.pid")
+			if _, fErr := a.StartHub(wsDir, sockPath, pidFile, hubInitial, dieWithParent); fErr == nil {
+				workspaceHubActive = true
+				volumes = append(volumes, msb.VolumeSpec{
+					HostPath:  wsDir,
+					GuestPath: msb.GuestWorkspace,
+					ReadOnly:  false,
+				})
+				for i, target := range validated {
+					masked := target.IsDir && target.VCSPolicy == config.VCSMask
+					if masked {
+						maskedCount++
+					}
+					accessMode := "rw"
+					if target.ReadOnly {
+						accessMode = "ro"
+					}
+					shareRecords = append(shareRecords, config.ShareRecord{
+						Index:      i,
+						HostPath:   target.HostPath,
+						GuestName:  target.GuestName,
+						IsDir:      target.IsDir,
+						Masked:     masked,
+						AccessMode: accessMode,
+						ReadOnly:   target.ReadOnly,
+						VCSPolicy:  target.VCSPolicy,
 					})
-					masked = true
-					maskedCount++
-				} else if maskStrict {
-					return fmt.Errorf("mount FUSE filter for %s: %w", target.HostPath, fErr)
-				} else {
-					a.warnf("FUSE filter failed for %s (%v). Sharing directory without VCS filter.", target.HostPath, fErr)
 				}
+			} else if maskStrict || opts.ShareHub {
+				return fmt.Errorf("mount FUSE workspace hub: %w", fErr)
+			} else {
+				a.warnf("FUSE workspace hub failed (%v). Sharing paths directly without VCS filter.", fErr)
 			}
 		}
-		if !masked {
+	}
+
+	if !workspaceHubActive {
+		for i, target := range validated {
+			guestPath := msb.GuestWorkspace + "/" + target.GuestName
 			volumes = append(volumes, msb.VolumeSpec{
 				HostPath:  target.HostPath,
 				GuestPath: guestPath,
-				ReadOnly:  opts.ReadOnly,
+				ReadOnly:  target.ReadOnly,
 			})
 			if target.IsDir {
 				directCount++
 			}
+			accessMode := "rw"
+			if target.ReadOnly {
+				accessMode = "ro"
+			}
+			vcsPol := config.VCSMask
+			if target.IsDir {
+				vcsPol = config.VCSAllowHooks
+			}
+			shareRecords = append(shareRecords, config.ShareRecord{
+				Index:      i,
+				HostPath:   target.HostPath,
+				GuestName:  target.GuestName,
+				IsDir:      target.IsDir,
+				Masked:     false,
+				AccessMode: accessMode,
+				ReadOnly:   target.ReadOnly,
+				VCSPolicy:  vcsPol,
+			})
 		}
-		shareRecords = append(shareRecords, config.ShareRecord{
-			Index:     i,
-			HostPath:  target.HostPath,
-			GuestName: target.GuestName,
-			IsDir:     target.IsDir,
-			Masked:    masked,
-		})
 	}
 
 	if skillsMounted {
@@ -1905,6 +2068,13 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		volumes = append(volumes, msb.VolumeSpec{
 			HostPath:  rulesDir,
 			GuestPath: msb.GuestRulesMount,
+			ReadOnly:  true,
+		})
+	}
+	if agentsMounted {
+		volumes = append(volumes, msb.VolumeSpec{
+			HostPath:  agentsDir,
+			GuestPath: msb.GuestAgentsMount,
 			ReadOnly:  true,
 		})
 	}
@@ -1928,6 +2098,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		Cmd:             opts.Cmd,
 		ReadOnly:        opts.ReadOnly,
 		MaskMode:        opts.MaskMode,
+		WorkspaceHub:    workspaceHubActive,
 		Shares:          shareRecords,
 		Persist:         opts.Persist,
 		Profile:         opts.Profile,
@@ -1936,8 +2107,10 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		NoAuth:          opts.NoAuth,
 		NoSkills:        opts.NoSkills,
 		NoRules:         opts.NoRules,
+		NoAgentCache:    opts.NoAgentCache,
 		SkillsMounted:   skillsMounted,
 		RulesMounted:    rulesMounted,
+		AgentsMounted:   agentsMounted,
 	}
 	if err := config.SaveRunMeta(filepath.Join(runFilterDir, "run.meta"), meta); err != nil {
 		return fmt.Errorf("save run metadata: %w", err)
@@ -1971,6 +2144,12 @@ func (a *App) Run(ctx context.Context, args []string) error {
 
 	if err := a.ensureGuestUser(runCtx, runSandbox); err != nil {
 		return err
+	}
+	if agentsMounted && len(cachedAgents) > 0 {
+		if err := a.setupGuestAgents(runCtx, runSandbox); err != nil {
+			return err
+		}
+		a.logf("Cached agents: %d updated binary(ies) mounted read-only.", len(cachedAgents))
 	}
 	if skillsMounted {
 		if err := a.setupGuestSkills(runCtx, runSandbox); err != nil {
@@ -2229,6 +2408,29 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 		}
 	}
 
+	agentsDir := filepath.Join(a.Env.DataDir, "agents")
+	skipAgents := meta.NoAgentCache || opts.NoAgentCache
+	var cachedAgents []persist.CachedAgentInfo
+	if meta.AgentsMounted {
+		var agErr error
+		cachedAgents, agErr = persist.InspectAgentsDir(agentsDir)
+		if agErr != nil {
+			return agErr
+		}
+		if err := persist.EnsureAgentsDir(agentsDir); err != nil {
+			return err
+		}
+	} else if !skipAgents {
+		var agErr error
+		cachedAgents, agErr = persist.InspectAgentsDir(agentsDir)
+		if agErr != nil {
+			return agErr
+		}
+		if len(cachedAgents) > 0 {
+			a.logf("Note: %s was created without $DATA_DIR/agents mounted. Recreate it with 'agbox stop %s' to use cached agent updates.", opts.Sandbox, opts.Sandbox)
+		}
+	}
+
 	var profLock *persist.ProfileLock
 	if meta.Profile != "" {
 		var lErr error
@@ -2251,10 +2453,11 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 		}
 	}
 
-	pol := a.sharePolicy(meta.ReadOnly)
 	needsMask := false
 	seenIndex := make(map[int]bool, len(meta.Shares))
 	seenGuest := make(map[string]bool, len(meta.Shares))
+	disjointTargets := make([]pathsec.ShareTarget, 0, len(meta.Shares))
+	hubConfigs := make([]vcsfuse.HubShareConfig, 0, len(meta.Shares))
 	for _, sh := range meta.Shares {
 		if seenIndex[sh.Index] {
 			return fmt.Errorf("duplicate share index %d in suspended metadata", sh.Index)
@@ -2263,47 +2466,99 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 		if !isSafeGuestShareName(sh.GuestName) {
 			return fmt.Errorf("invalid guest share name %q in suspended metadata", sh.GuestName)
 		}
+		if _, gErr := pathsec.ValidateGuestAlias(sh.GuestName); gErr != nil {
+			return fmt.Errorf("invalid guest share name %q in suspended metadata: %w", sh.GuestName, gErr)
+		}
 		if seenGuest[sh.GuestName] {
 			return fmt.Errorf("duplicate guest share name %q in suspended metadata", sh.GuestName)
 		}
 		seenGuest[sh.GuestName] = true
-		target, vErr := pathsec.ValidateShare(sh.HostPath, pol)
+
+		shRO := sh.EffectiveReadOnly(meta.ReadOnly)
+		if sh.VCSPolicy != "" {
+			if _, pErr := config.ParseVCSPolicy(string(sh.VCSPolicy)); pErr != nil {
+				return fmt.Errorf("invalid VCS policy in suspended metadata: %w", pErr)
+			}
+		}
+		shVCS := sh.EffectiveVCSPolicy()
+		if shRO && shVCS == config.VCSAllowHooks {
+			return fmt.Errorf("conflicting options in suspended metadata for %s: read-only share cannot enable vcs-hooks", sh.HostPath)
+		}
+
+		target, vErr := pathsec.ValidateShare(sh.HostPath, a.sharePolicy(shRO))
 		if vErr != nil {
 			return fmt.Errorf("validate share %s: %w", sh.HostPath, vErr)
 		}
 		if target.IsDir != sh.IsDir {
 			return fmt.Errorf("share type changed for %s", sh.HostPath)
 		}
-		if maskMode == config.MaskStrict && sh.IsDir && !sh.Masked {
-			return fmt.Errorf("directory share %s must use the FUSE VCS filter in strict mode", sh.HostPath)
+		if !sh.IsDir && (sh.Masked || shVCS != config.VCSMask) {
+			return fmt.Errorf("file share %s cannot enable directory VCS filtering or VCS policy", sh.HostPath)
 		}
-		if sh.Masked {
-			if !sh.IsDir {
-				return fmt.Errorf("file share %s cannot use the directory FUSE filter", sh.HostPath)
-			}
-			needsMask = true
-		}
-	}
 
-	if needsMask {
-		if !DataDirSupportsFilter(a.Env.DataDir) {
-			return fmt.Errorf("DATA_DIR (%s) cannot contain whitespace or backslashes when VCS masking is active", a.Env.DataDir)
+		if meta.WorkspaceHub {
+			if maskMode == config.MaskStrict && sh.IsDir && !sh.Masked && sh.VCSPolicy == "" {
+				return fmt.Errorf("directory share %s must use the FUSE VCS filter in strict mode", sh.HostPath)
+			}
+		} else {
+			if maskMode == config.MaskStrict && sh.IsDir && !sh.Masked {
+				return fmt.Errorf("directory share %s must use the FUSE VCS filter in strict mode", sh.HostPath)
+			}
+			if sh.Masked {
+				needsMask = true
+			}
 		}
-		if a.StartFilter == nil {
-			return errors.New("FUSE filter starter is not configured")
-		}
+
+		disjointTargets = append(disjointTargets, pathsec.ShareTarget{
+			HostPath:  target.HostPath,
+			GuestName: sh.GuestName,
+			IsDir:     sh.IsDir,
+		})
+		hubConfigs = append(hubConfigs, vcsfuse.HubShareConfig{
+			GuestName: sh.GuestName,
+			HostPath:  target.HostPath,
+			ReadOnly:  shRO,
+			VCSPolicy: shVCS,
+		})
+	}
+	if err := pathsec.CheckDisjointHostPaths(disjointTargets); err != nil {
+		return fmt.Errorf("suspended share metadata invalid: %w", err)
 	}
 
 	dieWithParent := !isDetached
-	for _, sh := range meta.Shares {
-		if !sh.Masked {
-			continue
+	if meta.WorkspaceHub {
+		if !DataDirSupportsFilter(a.Env.DataDir) {
+			return fmt.Errorf("DATA_DIR (%s) cannot contain whitespace or backslashes when FUSE workspace hub is active", a.Env.DataDir)
 		}
-		mntDir := filepath.Join(runFilterDir, fmt.Sprintf("m%d", sh.Index))
-		pidFile := mntDir + ".pid"
-		if _, fErr := a.StartFilter(sh.HostPath, mntDir, pidFile, dieWithParent); fErr != nil {
+		if a.StartHub == nil {
+			return errors.New("FUSE workspace hub starter is not configured")
+		}
+		wsDir := filepath.Join(runFilterDir, "ws")
+		sockPath := filepath.Join(runFilterDir, "ws.sock")
+		pidFile := filepath.Join(runFilterDir, "ws.pid")
+		if _, fErr := a.StartHub(wsDir, sockPath, pidFile, hubConfigs, dieWithParent); fErr != nil {
 			_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
-			return fmt.Errorf("mount FUSE filter for %s: %w", sh.HostPath, fErr)
+			return fmt.Errorf("mount FUSE workspace hub: %w", fErr)
+		}
+	} else {
+		if needsMask {
+			if !DataDirSupportsFilter(a.Env.DataDir) {
+				return fmt.Errorf("DATA_DIR (%s) cannot contain whitespace or backslashes when VCS masking is active", a.Env.DataDir)
+			}
+			if a.StartFilter == nil {
+				return errors.New("FUSE filter starter is not configured")
+			}
+		}
+		for _, sh := range meta.Shares {
+			if !sh.Masked {
+				continue
+			}
+			mntDir := filepath.Join(runFilterDir, fmt.Sprintf("m%d", sh.Index))
+			pidFile := mntDir + ".pid"
+			if _, fErr := a.StartFilter(sh.HostPath, mntDir, pidFile, dieWithParent); fErr != nil {
+				_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+				return fmt.Errorf("mount FUSE filter for %s: %w", sh.HostPath, fErr)
+			}
 		}
 	}
 
@@ -2371,6 +2626,11 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 	if err := a.ensureGuestUser(runCtx, opts.Sandbox); err != nil {
 		return err
 	}
+	if meta.AgentsMounted && !skipAgents && len(cachedAgents) > 0 {
+		if err := a.setupGuestAgents(runCtx, opts.Sandbox); err != nil {
+			return err
+		}
+	}
 	if meta.SkillsMounted && !skipSkills && len(skillNames) > 0 {
 		if err := a.setupGuestSkills(runCtx, opts.Sandbox); err != nil {
 			return err
@@ -2400,6 +2660,44 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 	execMeta.ContinueSession = wantSession
 	sessionStarted = true
 	return a.execSession(runCtx, execMeta, runFilterDir, false, &detached)
+}
+
+func (a *App) resolveRunShareTargets(opts RunOpts) ([]pathsec.ShareTarget, error) {
+	var specs []pathsec.ShareSpec
+	for _, raw := range opts.ShareSpecs {
+		if raw == "" {
+			continue
+		}
+		spec, err := pathsec.ParseShareSpec(raw)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, spec)
+	}
+	for _, raw := range opts.Paths {
+		if raw == "" {
+			continue
+		}
+		spec, err := pathsec.ParseShareSpec(raw)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, spec)
+	}
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	defaultVCS := opts.DefaultVCS
+	if defaultVCS == "" {
+		defaultVCS = config.VCSMask
+	}
+	return pathsec.ResolveShareSpecs(specs, pathsec.ResolveOpts{
+		Policy:     a.sharePolicy(opts.ReadOnly),
+		DefaultRO:  opts.ReadOnly,
+		LockRO:     opts.LockAccess,
+		DefaultVCS: defaultVCS,
+		LockVCS:    opts.LockVCS,
+	})
 }
 
 func (a *App) sharePolicy(readOnly bool) pathsec.Policy {
@@ -2587,10 +2885,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 
 	default:
 		inv := buildTUIInvokeCommand(meta)
-		modeStr := "rw"
-		if meta.ReadOnly {
-			modeStr = "ro"
-		}
+		modeStr := summarizeShareModes(meta)
 		a.logf("Starting %s (%s) in %s as %s (passwordless sudo available).",
 			meta.Agent, inv, runSandbox, config.GuestUser)
 		a.logf("Shared: %d path(s) under /workspace (%s).", len(meta.Shares), modeStr)
@@ -2612,6 +2907,31 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 		}
 		return err
 	}
+}
+
+func summarizeShareModes(meta config.RunMeta) string {
+	if len(meta.Shares) == 0 {
+		if meta.ReadOnly {
+			return "ro"
+		}
+		return "none"
+	}
+	hasRO := false
+	hasRW := false
+	for _, sh := range meta.Shares {
+		if sh.EffectiveReadOnly(meta.ReadOnly) {
+			hasRO = true
+		} else {
+			hasRW = true
+		}
+	}
+	if hasRO && hasRW {
+		return "mixed ro/rw"
+	}
+	if hasRO {
+		return "ro"
+	}
+	return "rw"
 }
 
 func (a *App) pushKeys(ctx context.Context, sandbox string) error {
@@ -2884,6 +3204,10 @@ Modes:
       Start the base microVM and install categories or run custom updates.
       Save snapshot agbox:v<N+1> unless you pass --no-snap.
 
+  agbox update [--allow-root] [antigravity|opencode|both|status|clear]
+      Update agent binaries inside a disposable zero-share microVM and cache
+      verified ELF binaries in $DATA_DIR/agents without rebuilding the base snapshot.
+
   agbox auth [--allow-root] [antigravity|opencode|status|logout]
       Sign in inside a disposable microVM and save credentials in $DATA_DIR/auth.
 
@@ -2896,7 +3220,11 @@ Modes:
   agbox profile [--allow-root] [list|create [--size SIZE] <name>|rm [--force] <name>]
       Manage ext4 disk profiles for conversation history across ephemeral runs.
 
-  agbox run [options] [opencode|antigravity] [paths...]
+  agbox share [--allow-root] <list|add|set|rm> <sandbox> [...]
+      List, attach, update permissions on, or detach /workspace shares on a running
+      or suspended sandbox (agbox share add defaults to ro,mask).
+
+  agbox run [options] [opencode|antigravity] [path[:opts]...]
       Restore a microVM and mask VCS files and directories.
       Block local, private, multicast, and cloud-config IPs by default.
       Delete the microVM on exit unless you pass --persist or suspend it.
@@ -2909,9 +3237,14 @@ Modes:
         --no-auth            Skip saved login credentials from $DATA_DIR/auth
         --no-skills          Skip global skills from $DATA_DIR/skills
         --no-rules           Skip global rules from $DATA_DIR/rules
+        --no-agent-cache     Skip cached agent binary updates from $DATA_DIR/agents
         --allow-root         Allow agbox to run as the root user
-        --ro                 Mount shared paths read-only
-        --mask-vcs           Require the FUSE VCS filter for directory shares (default)
+        --share PATH[:OPTS]  Share a host path with modifiers (ro,rw,mask,vcs,vcs-hooks,as=NAME)
+        --share-hub          Mount an empty /workspace FUSE hub so shares can be added live
+        --ro / --rw          Set default share access mode (conflicts with opposite modifier)
+        --mask-vcs           Mask VCS metadata inside directory shares (default)
+        --vcs                Allow VCS metadata inside shares while write-protecting hooks
+        --vcs-hooks          Allow VCS metadata and writable hooks inside writable shares
         --no-mask            Disable the FUSE VCS filter (.git is visible to guest)
         --serve              Run 'opencode serve' and bind the web UI on 127.0.0.1
         --port N             Use fixed loopback TCP port N for --serve
@@ -2943,31 +3276,36 @@ Modes:
 
 // RunUsageText returns the help message for `agbox run --help`.
 func RunUsageText() string {
-	return `Usage: agbox run [options] [agent] [path...]
+	return `Usage: agbox run [options] [agent] [path[:opts]...]
 
-  --name NAME      name the sandbox agbox-NAME instead of agbox-run-PID
-  --persist        keep the named microVM on exit and resume it on repeat runs
-  --profile NAME   mount ext4 profile volume agbox-profile-NAME for conversations
-  -c, --continue   continue the most recent conversation in TUI mode
-  -s, --session ID continue conversation ID in TUI mode (alias: --conversation)
-  --no-auth        skip saved login credentials from $DATA_DIR/auth
-  --no-skills      skip global skills from $DATA_DIR/skills
-  --no-rules       skip global rules from $DATA_DIR/rules
-  --allow-root     allow agbox to run as the root user
-  --ro             mount shared paths read-only
-  --mask-vcs       require the FUSE VCS filter for directory shares (default)
-  --no-mask        disable the FUSE VCS filter (.git is visible to guest)
-  --serve          run 'opencode serve' and bind the web UI on 127.0.0.1
-  --port N         use fixed loopback port N for --serve (default: random)
-  --probe          with --serve: wait for the web UI, then exit
-  --remote-control run 'agy' with Remote Control for https://antigravity.google.com
-  -d, --detach     keep --remote-control or --serve running in the background
-  --cmd 'shell'    run one command in the microVM and exit
-  --no-net         disable guest network access
-  --net SPEC       set network profile (public|none|private|host|all) or msb rule
+  --name NAME          name the sandbox agbox-NAME instead of agbox-run-PID
+  --persist            keep the named microVM on exit and resume it on repeat runs
+  --profile NAME       mount ext4 profile volume agbox-profile-NAME for conversations
+  -c, --continue       continue the most recent conversation in TUI mode
+  -s, --session ID     continue conversation ID in TUI mode (alias: --conversation)
+  --no-auth            skip saved login credentials from $DATA_DIR/auth
+  --no-skills          skip global skills from $DATA_DIR/skills
+  --no-rules           skip global rules from $DATA_DIR/rules
+  --no-agent-cache     skip cached agent binary updates from $DATA_DIR/agents
+  --allow-root         allow agbox to run as the root user
+  --share PATH[:OPTS]  share a host path (modifiers: ro,rw,mask,vcs,vcs-hooks,as=NAME)
+  --share-hub          mount an empty /workspace FUSE hub for live 'agbox share add'
+  --ro / --rw          set default share access mode (errors on conflicting modifiers)
+  --mask-vcs           mask VCS metadata in directory shares (default)
+  --vcs                allow VCS metadata in shares while write-protecting hooks
+  --vcs-hooks          allow VCS metadata and writable hooks in writable shares
+  --no-mask            disable the FUSE VCS filter (.git is visible to guest)
+  --serve              run 'opencode serve' and bind the web UI on 127.0.0.1
+  --port N             use fixed loopback port N for --serve (default: random)
+  --probe              with --serve: wait for the web UI, then exit
+  --remote-control     run 'agy' with Remote Control for https://antigravity.google.com
+  -d, --detach         keep --remote-control or --serve running in the background
+  --cmd 'shell'        run one command in the microVM and exit
+  --no-net             disable guest network access
+  --net SPEC           set network profile (public|none|private|host|all) or msb rule
   --cpus N / --memory S   override vCPU count or RAM size for this run
-  agent            opencode | antigravity (default: the base's agent)
-  path...          host dirs/files mounted at /workspace/<name>
+  agent                opencode | antigravity (default: the base's agent)
+  path[:opts]...       host dirs/files mounted at /workspace/<name>
 `
 }
 
@@ -2997,6 +3335,12 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 		err = a.CreateBase(ctx, rest)
 	case "edit-base":
 		err = a.EditBase(ctx, rest)
+	case "update":
+		err = a.Update(ctx, rest)
+		if errors.Is(err, ErrHelp) {
+			fmt.Fprint(a.Stdout, UpdateUsageText())
+			return 0
+		}
 	case "auth":
 		err = a.Auth(ctx, rest)
 		if errors.Is(err, ErrHelp) {
@@ -3021,6 +3365,12 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 			fmt.Fprint(a.Stdout, ProfileUsageText())
 			return 0
 		}
+	case "share":
+		err = a.Share(ctx, rest)
+		if errors.Is(err, ErrHelp) {
+			fmt.Fprint(a.Stdout, ShareUsageText())
+			return 0
+		}
 	case "run":
 		err = a.Run(ctx, rest)
 		if errors.Is(err, ErrHelp) {
@@ -3038,7 +3388,7 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 	case "status":
 		err = a.Status(ctx, rest)
 	default:
-		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup create-base edit-base auth skills rules profile run suspend resume stop remove status)\n", mode)
+		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup create-base edit-base update auth skills rules profile share run suspend resume stop remove status)\n", mode)
 		return 1
 	}
 

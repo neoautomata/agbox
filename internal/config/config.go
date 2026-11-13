@@ -260,13 +260,64 @@ const (
 	RunModeCmd           RunMode = "cmd"
 )
 
+// VCSPolicy controls whether VCS metadata and hooks are accessible inside a share.
+type VCSPolicy string
+
+const (
+	VCSMask       VCSPolicy = "mask"
+	VCSAllow      VCSPolicy = "vcs"
+	VCSAllowHooks VCSPolicy = "vcs-hooks"
+)
+
+// ParseVCSPolicy validates a per-share VCS policy string. Empty input defaults to VCSMask.
+func ParseVCSPolicy(raw string) (VCSPolicy, error) {
+	switch VCSPolicy(strings.ToLower(strings.TrimSpace(raw))) {
+	case "", VCSMask:
+		return VCSMask, nil
+	case VCSAllow:
+		return VCSAllow, nil
+	case VCSAllowHooks:
+		return VCSAllowHooks, nil
+	default:
+		return "", fmt.Errorf("invalid VCS policy %q (expected: mask, vcs, or vcs-hooks)", raw)
+	}
+}
+
 // ShareRecord records one validated host share attached to a run sandbox.
 type ShareRecord struct {
-	Index     int    `json:"index"`
-	HostPath  string `json:"host_path"`
-	GuestName string `json:"guest_name"`
-	IsDir     bool   `json:"is_dir"`
-	Masked    bool   `json:"masked"`
+	Index      int       `json:"index"`
+	HostPath   string    `json:"host_path"`
+	GuestName  string    `json:"guest_name"`
+	IsDir      bool      `json:"is_dir"`
+	Masked     bool      `json:"masked"`
+	AccessMode string    `json:"access_mode,omitempty"`
+	ReadOnly   bool      `json:"read_only,omitempty"`
+	VCSPolicy  VCSPolicy `json:"vcs_policy,omitempty"`
+}
+
+// EffectiveReadOnly returns whether the share is read-only, falling back to
+// metaReadOnly for legacy metadata records without an explicit AccessMode.
+func (s ShareRecord) EffectiveReadOnly(metaReadOnly bool) bool {
+	switch s.AccessMode {
+	case "ro":
+		return true
+	case "rw":
+		return s.ReadOnly
+	default:
+		return s.ReadOnly || metaReadOnly
+	}
+}
+
+// EffectiveVCSPolicy returns the share's validated VCS policy, falling back to
+// Masked for legacy metadata records without an explicit VCSPolicy.
+func (s ShareRecord) EffectiveVCSPolicy() VCSPolicy {
+	if s.VCSPolicy != "" {
+		return s.VCSPolicy
+	}
+	if !s.IsDir || s.Masked {
+		return VCSMask
+	}
+	return VCSAllow
 }
 
 // RunMeta stores per-run metadata in $DATA_DIR/run/<id>/run.meta and suspended.
@@ -281,6 +332,7 @@ type RunMeta struct {
 	Cmd             string        `json:"cmd,omitempty"`
 	ReadOnly        bool          `json:"read_only"`
 	MaskMode        MaskMode      `json:"mask_mode"`
+	WorkspaceHub    bool          `json:"workspace_hub,omitempty"`
 	Persist         bool          `json:"persist,omitempty"`
 	Profile         string        `json:"profile,omitempty"`
 	Continue        bool          `json:"continue,omitempty"`
@@ -290,6 +342,8 @@ type RunMeta struct {
 	SkillsMounted   bool          `json:"skills_mounted,omitempty"`
 	NoRules         bool          `json:"no_rules,omitempty"`
 	RulesMounted    bool          `json:"rules_mounted,omitempty"`
+	NoAgentCache    bool          `json:"no_agent_cache,omitempty"`
+	AgentsMounted   bool          `json:"agents_mounted,omitempty"`
 	Shares          []ShareRecord `json:"shares,omitempty"`
 }
 
@@ -320,6 +374,17 @@ func ParseRunMeta(r io.Reader) (RunMeta, error) {
 	for _, sh := range meta.Shares {
 		if sh.Index < 0 {
 			return RunMeta{}, fmt.Errorf("parse run metadata: negative share index %d", sh.Index)
+		}
+		if sh.AccessMode != "" && sh.AccessMode != "ro" && sh.AccessMode != "rw" {
+			return RunMeta{}, fmt.Errorf("parse run metadata: invalid share access_mode %q", sh.AccessMode)
+		}
+		if sh.VCSPolicy != "" {
+			if _, err := ParseVCSPolicy(string(sh.VCSPolicy)); err != nil {
+				return RunMeta{}, fmt.Errorf("parse run metadata: %w", err)
+			}
+		}
+		if sh.EffectiveReadOnly(meta.ReadOnly) && sh.EffectiveVCSPolicy() == VCSAllowHooks {
+			return RunMeta{}, fmt.Errorf("parse run metadata: read-only share %q cannot enable vcs-hooks", sh.GuestName)
 		}
 	}
 	return meta, nil

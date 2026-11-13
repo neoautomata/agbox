@@ -5,10 +5,14 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
+
+	"agbox/internal/config"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -862,5 +866,343 @@ func TestProjectSkillsAndRulesPassThroughFUSEWhileVCSRemainsMasked(t *testing.T)
 	}
 	if _, sErr := os.Stat(filepath.Join(srcDir, ".agents", "skills", "created-in-guest", "SKILL.md")); sErr != nil {
 		t.Errorf("expected guest-created skill to persist in host share: %v", sErr)
+	}
+}
+
+func TestVCSHookProtectionAndPolicySymlinks(t *testing.T) {
+	hidden := buildHiddenSet(DefaultHiddenEntries)
+
+	// Hook path detection across Git, submodules/worktrees, Jujutsu, SVN, Darcs, Pijul, and Mercurial.
+	for _, protected := range []string{
+		".git/hooks",
+		".git/hooks/pre-commit",
+		".GIT/HOOKS/post-checkout",
+		"sub/.git/hooks/pre-push",
+		".git/modules/sub/hooks/commit-msg",
+		".git/worktrees/wt1/hooks/pre-commit",
+		".jj/repo/store/git/hooks/pre-commit",
+		".svn/hooks/pre-commit",
+		"_darcs/prefs/defaults",
+		".pijul/hooks/record",
+		".hg/hgrc",
+	} {
+		if !isProtectedVCSHookRelPath(protected) {
+			t.Errorf("expected %q to be protected under VCSAllow", protected)
+		}
+	}
+	for _, allowed := range []string{
+		".",
+		"src/hooks/useAuth.ts",
+		".git/config",
+		".git/index.lock",
+		".git/HEAD",
+		".git/objects/pack",
+		".jj/repo/op_heads",
+		".hg/store/00changelog.i",
+	} {
+		if isProtectedVCSHookRelPath(allowed) {
+			t.Errorf("expected %q to be writable under VCSAllow", allowed)
+		}
+	}
+
+	// Symlink validation under VCSAllow allows intra-repo .git/refs links while blocking .git/hooks targets and host escapes.
+	if errNo := ValidateSymlinkTargetForPolicy("", "ref-link", ".git/HEAD", hidden, config.VCSAllow); errNo != 0 {
+		t.Errorf("expected intra-share .git/HEAD symlink under VCSAllow to succeed, got %v", errNo)
+	}
+	if errNo := ValidateSymlinkTargetForPolicy("src", "evil-hook", "../.git/hooks/pre-commit", hidden, config.VCSAllow); errNo != syscall.EPERM {
+		t.Errorf("expected symlink targeting .git/hooks under VCSAllow to fail with EPERM, got %v", errNo)
+	}
+	if errNo := ValidateSymlinkTargetForPolicy(".git/hooks", "pre-commit", "../../script.sh", hidden, config.VCSAllow); errNo != syscall.EPERM {
+		t.Errorf("expected symlink inside .git/hooks under VCSAllow to fail with EPERM, got %v", errNo)
+	}
+	if errNo := ValidateSymlinkTargetForPolicy(".git/hooks", "pre-commit", "../../script.sh", hidden, config.VCSAllowHooks); errNo != 0 {
+		t.Errorf("expected intra-share symlink inside .git/hooks under VCSAllowHooks to succeed, got %v", errNo)
+	}
+	if errNo := ValidateSymlinkTargetForPolicy(".git/hooks", "escape", "../../../etc/passwd", hidden, config.VCSAllowHooks); errNo != syscall.EPERM {
+		t.Errorf("expected escaping symlink under VCSAllowHooks to fail with EPERM, got %v", errNo)
+	}
+}
+
+func TestWorkspaceHubControlSocketPermissionsAndRevocation(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "agbox-data")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	roDir := filepath.Join(base, "docs-ro")
+	vcsDir := filepath.Join(base, "repo-vcs")
+	hooksDir := filepath.Join(base, "repo-hooks")
+	hotDir := filepath.Join(base, "hot-added")
+	cfgFile := filepath.Join(base, "app.yaml")
+	hardFile := filepath.Join(base, "hard.txt")
+	hardPeer := filepath.Join(base, "hard-peer.txt")
+
+	for _, d := range []string{
+		roDir,
+		filepath.Join(roDir, ".git"),
+		filepath.Join(vcsDir, ".git", "hooks"),
+		filepath.Join(hooksDir, ".git", "hooks"),
+		filepath.Join(hotDir, ".git"),
+	} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = os.WriteFile(filepath.Join(roDir, "readme.md"), []byte("read-only doc\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(roDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(vcsDir, "main.go"), []byte("package main\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(vcsDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(vcsDir, ".git", "hooks", "pre-commit"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(hooksDir, ".git", "hooks", "pre-commit"), []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	_ = os.WriteFile(filepath.Join(hotDir, "hello.txt"), []byte("hot\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(hotDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
+	_ = os.WriteFile(cfgFile, []byte("port: 8080\n"), 0o600)
+	_ = os.WriteFile(hardFile, []byte("linked\n"), 0o600)
+	if err := os.Link(hardFile, hardPeer); err != nil {
+		t.Fatal(err)
+	}
+
+	initial := []HubShareConfig{
+		{GuestName: "docs", HostPath: roDir, ReadOnly: true, VCSPolicy: config.VCSMask},
+		{GuestName: "repo", HostPath: vcsDir, ReadOnly: false, VCSPolicy: config.VCSAllow},
+		{GuestName: "hooksrepo", HostPath: hooksDir, ReadOnly: false, VCSPolicy: config.VCSAllowHooks},
+		{GuestName: "app.yaml", HostPath: cfgFile, IsFile: true, ReadOnly: false, VCSPolicy: config.VCSMask},
+		{GuestName: "hard.txt", HostPath: hardFile, IsFile: true, ReadOnly: true, VCSPolicy: config.VCSMask},
+	}
+
+	hub, err := NewWorkspaceHub(initial, dataDir)
+	if err != nil {
+		t.Fatalf("NewWorkspaceHub: %v", err)
+	}
+	defer hub.CloseAll()
+
+	sockDir := filepath.Join(base, "filter")
+	sockPath := filepath.Join(sockDir, "ws.sock")
+	ln, err := listenVerifiedUnixSocket(sockPath, hub)
+	if err != nil {
+		t.Fatalf("listenVerifiedUnixSocket: %v", err)
+	}
+	defer ln.Close()
+
+	if err := PingHub(sockPath); err != nil {
+		t.Fatalf("PingHub: %v", err)
+	}
+	listed, err := ListHubShares(sockPath)
+	if err != nil || len(listed) != 5 {
+		t.Fatalf("ListHubShares = (%+v, %v), want 5 shares", listed, err)
+	}
+
+	// Synthetic /workspace root rejects direct mutations with EROFS.
+	var eOut fuse.EntryOut
+	if _, _, _, errNo := hub.Create(ctx, "evil.txt", syscall.O_RDWR, 0o644, &eOut); errNo != syscall.EROFS {
+		t.Errorf("hub.Create = %v, want EROFS", errNo)
+	}
+	if _, errNo := hub.Mkdir(ctx, "evil", 0o755, &eOut); errNo != syscall.EROFS {
+		t.Errorf("hub.Mkdir = %v, want EROFS", errNo)
+	}
+	if errNo := hub.Rmdir(ctx, "docs"); errNo != syscall.EROFS {
+		t.Errorf("hub.Rmdir = %v, want EROFS", errNo)
+	}
+
+	// Security rejections over ws.sock: duplicate name, nested path, dataDir path, ro+vcs-hooks, single-file vcs, hardlinked ro->rw.
+	if _, err := AddHubShare(sockPath, HubShareConfig{GuestName: "docs", HostPath: hotDir, ReadOnly: true, VCSPolicy: config.VCSMask}); err == nil {
+		t.Error("expected duplicate guest name on AddHubShare to fail")
+	}
+	if _, err := AddHubShare(sockPath, HubShareConfig{GuestName: "nested", HostPath: filepath.Join(vcsDir, ".git"), ReadOnly: true, VCSPolicy: config.VCSMask}); err == nil {
+		t.Error("expected nested/VCS host path on AddHubShare to fail")
+	}
+	if _, err := AddHubShare(sockPath, HubShareConfig{GuestName: "datadir", HostPath: dataDir, ReadOnly: true, VCSPolicy: config.VCSMask}); err == nil {
+		t.Error("expected dataDir overlap on AddHubShare to fail")
+	}
+	if _, err := AddHubShare(sockPath, HubShareConfig{GuestName: "conflict", HostPath: hotDir, ReadOnly: true, VCSPolicy: config.VCSAllowHooks}); err == nil {
+		t.Error("expected ReadOnly + VCSAllowHooks on AddHubShare to fail")
+	}
+	roFalse := false
+	if _, err := SetHubShare(sockPath, "hard.txt", &roFalse, nil, false); err == nil {
+		t.Error("expected upgrading hardlinked single-file share from ro to rw to fail")
+	}
+	vcsAllow := config.VCSAllow
+	if _, err := SetHubShare(sockPath, "app.yaml", nil, &vcsAllow, false); err == nil {
+		t.Error("expected setting VCS policy on single-file share to fail")
+	}
+
+	// Verify in-process slot enforcement for docs (ro,mask) and repo (rw,vcs).
+	docsSlot := hub.slots["docs"]
+	docsSt, _ := os.Stat(roDir)
+	var sySt syscall.Stat_t
+	_ = syscall.Stat(roDir, &sySt)
+	docsRoot := buildRootFilteredNode(roDir, docsSlot.root, sySt, docsSlot)
+	fs.NewNodeFS(docsRoot, &fs.Options{})
+	if _, errNo := docsRoot.Lookup(ctx, ".git", &eOut); errNo != syscall.ENOENT {
+		t.Errorf("docs(ro,mask) Lookup(.git) = %v, want ENOENT", errNo)
+	}
+	if _, errNo := docsRoot.Mkdir(ctx, "newdir", 0o755, &eOut); errNo != syscall.EROFS {
+		t.Errorf("docs(ro,mask) Mkdir = %v, want EROFS", errNo)
+	}
+
+	repoSlot := hub.slots["repo"]
+	_ = syscall.Stat(vcsDir, &sySt)
+	repoRoot := buildRootFilteredNode(vcsDir, repoSlot.root, sySt, repoSlot)
+	fs.NewNodeFS(repoRoot, &fs.Options{})
+	gitIno, errNo := repoRoot.Lookup(ctx, ".git", &eOut)
+	if errNo != 0 {
+		t.Fatalf("repo(rw,vcs) Lookup(.git) = %v, want 0", errNo)
+	}
+	repoRoot.AddChild(".git", gitIno, true)
+	gitNode := gitIno.Operations().(*FilteredNode)
+	// Writing .git/index.lock is allowed under VCSAllow, whereas .git/hooks/* is blocked with EPERM!
+	_, idxFH, _, errNo := gitNode.Create(ctx, "index.lock", syscall.O_RDWR, 0o600, &eOut)
+	if errNo != 0 {
+		t.Fatalf("repo(rw,vcs) Create(.git/index.lock) = %v, want 0", errNo)
+	}
+	_ = idxFH.(fs.FileReleaser).Release(ctx)
+
+	hooksIno, errNo := gitNode.Lookup(ctx, "hooks", &eOut)
+	if errNo != 0 {
+		t.Fatalf("repo(rw,vcs) Lookup(.git/hooks) = %v, want 0", errNo)
+	}
+	gitNode.AddChild("hooks", hooksIno, true)
+	if eOut.Attr.Mode&0o222 != 0 {
+		t.Errorf("expected .git/hooks mode bits to have write bits masked under VCSAllow, got %o", eOut.Attr.Mode)
+	}
+	hooksNode := hooksIno.Operations().(*FilteredNode)
+	if _, _, _, cErr := hooksNode.Create(ctx, "post-commit", syscall.O_RDWR, 0o755, &eOut); cErr != syscall.EPERM {
+		t.Errorf("repo(rw,vcs) Create(.git/hooks/post-commit) = %v, want EPERM", cErr)
+	}
+	if uErr := hooksNode.Unlink(ctx, "pre-commit"); uErr != syscall.EPERM {
+		t.Errorf("repo(rw,vcs) Unlink(.git/hooks/pre-commit) = %v, want EPERM", uErr)
+	}
+	// Removing or renaming top-level .git under VCSAllow is also blocked with EPERM.
+	if rErr := repoRoot.Rename(ctx, ".git", repoRoot, ".git-bak", 0); rErr != syscall.EPERM {
+		t.Errorf("repo(rw,vcs) Rename(.git) = %v, want EPERM", rErr)
+	}
+
+	// Open writable handle tracking + non-forced rejection + forced revocation!
+	hotStatus, err := AddHubShare(sockPath, HubShareConfig{
+		GuestName: "hot",
+		HostPath:  hotDir,
+		ReadOnly:  false,
+		VCSPolicy: config.VCSMask,
+	})
+	if err != nil || hotStatus.GuestName != "hot" {
+		t.Fatalf("AddHubShare(hot) = (%+v, %v)", hotStatus, err)
+	}
+	_ = docsSt
+	hotSlot := hub.slots["hot"]
+	_ = syscall.Stat(hotDir, &sySt)
+	hotRoot := buildRootFilteredNode(hotDir, hotSlot.root, sySt, hotSlot)
+	fs.NewNodeFS(hotRoot, &fs.Options{})
+	_, openHotFH, _, errNo := hotRoot.Create(ctx, "active.txt", syscall.O_RDWR, 0o644, &eOut)
+	if errNo != 0 {
+		t.Fatalf("hot Create(active.txt): %v", errNo)
+	}
+	sfHot := openHotFH.(*safeFile)
+	if nW, wErr := sfHot.Write(ctx, []byte("before"), 0); wErr != 0 || nW != 6 {
+		t.Fatalf("sfHot.Write = (%d, %v)", nW, wErr)
+	}
+
+	// Downgrading rw -> ro without --force fails closed while sfHot is open.
+	roTrue := true
+	if _, err := SetHubShare(sockPath, "hot", &roTrue, nil, false); err == nil || !strings.Contains(err.Error(), "open writable") {
+		t.Fatalf("expected non-forced SetHubShare(--ro) to fail on open writable FD, got %v", err)
+	}
+	// Removing share without --force fails closed while sfHot is open.
+	if err := RemoveHubShare(sockPath, "hot", false); err == nil || !strings.Contains(err.Error(), "open writable") {
+		t.Fatalf("expected non-forced RemoveHubShare to fail on open writable FD, got %v", err)
+	}
+
+	// Forced SetHubShare(--ro) revokes sfHot with EROFS!
+	if _, err := SetHubShare(sockPath, "hot", &roTrue, nil, true); err != nil {
+		t.Fatalf("SetHubShare(--ro, force=true): %v", err)
+	}
+	if _, wErr := sfHot.Write(ctx, []byte("after"), 0); wErr != syscall.EROFS {
+		t.Errorf("sfHot.Write after forced ro downgrade = %v, want EROFS", wErr)
+	}
+	_ = sfHot.Release(ctx)
+
+	// Open a read handle and call RemoveHubShare. Subsequent Read calls return ESTALE.
+	helloIno, errNo := hotRoot.Lookup(ctx, "hello.txt", &eOut)
+	if errNo != 0 {
+		t.Fatalf("hot Lookup(hello.txt): %v", errNo)
+	}
+	hotRoot.AddChild("hello.txt", helloIno, true)
+	helloFH, _, errNo := helloIno.Operations().(*FilteredNode).Open(ctx, syscall.O_RDONLY)
+	if errNo != 0 {
+		t.Fatalf("hot Open(hello.txt): %v", errNo)
+	}
+	if err := RemoveHubShare(sockPath, "hot", false); err != nil {
+		t.Fatalf("RemoveHubShare(hot): %v", err)
+	}
+	buf := make([]byte, 16)
+	if _, rErr := helloFH.(*safeFile).Read(ctx, buf, 0); rErr != syscall.ESTALE {
+		t.Errorf("Read after RemoveHubShare = %v, want ESTALE", rErr)
+	}
+	_ = helloFH.(*safeFile).Release(ctx)
+
+	// Optional end-to-end kernel FUSE mount test when /dev/fuse is available.
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		return
+	}
+	mntDir := filepath.Join(base, "hub-mnt")
+	sockPath2 := filepath.Join(base, "filter2", "ws.sock")
+	if err := os.MkdirAll(mntDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hub2, server2, ln2, mErr := MountWorkspaceHub(mntDir, sockPath2, initial[:4], dataDir)
+	if mErr != nil {
+		t.Logf("skipping live kernel MountWorkspaceHub check: %v", mErr)
+		return
+	}
+	defer func() {
+		if ln2 != nil {
+			_ = ln2.Close()
+		}
+		_ = server2.Unmount()
+		server2.Wait()
+		hub2.CloseAll()
+	}()
+
+	// Real git commit inside mntDir/repo (:rw,vcs) must succeed while writing .git/hooks fails with EPERM!
+	if _, gErr := exec.LookPath("git"); gErr == nil {
+		gitInitRepo := filepath.Join(base, "real-git")
+		if err := exec.Command("git", "init", gitInitRepo).Run(); err == nil {
+			if _, aErr := AddHubShare(sockPath2, HubShareConfig{
+				GuestName: "realgit",
+				HostPath:  gitInitRepo,
+				ReadOnly:  false,
+				VCSPolicy: config.VCSAllow,
+			}); aErr != nil {
+				t.Fatalf("AddHubShare(realgit): %v", aErr)
+			}
+			mountedGit := filepath.Join(mntDir, "realgit")
+			if err := os.WriteFile(filepath.Join(mountedGit, "hello.go"), []byte("package main\n"), 0o644); err != nil {
+				t.Fatalf("write hello.go through hub FUSE: %v", err)
+			}
+			if out, err := exec.Command("git", "-C", mountedGit, "add", "hello.go").CombinedOutput(); err != nil {
+				t.Fatalf("git add through hub FUSE failed: %v (%s)", err, string(out))
+			}
+			if out, err := exec.Command("git", "-C", mountedGit, "-c", "user.name=Test", "-c", "user.email=t@e.st", "commit", "-m", "test commit").CombinedOutput(); err != nil {
+				t.Fatalf("git commit through hub FUSE failed: %v (%s)", err, string(out))
+			}
+			hookFile := filepath.Join(mountedGit, ".git", "hooks", "post-commit")
+			if err := os.WriteFile(hookFile, []byte("#!/bin/sh\nid\n"), 0o755); !errors.Is(err, syscall.EPERM) {
+				t.Errorf("WriteFile(.git/hooks/post-commit) on :vcs = %v, want EPERM", err)
+			}
+		}
+	}
+
+	// Single-file share read/write through live FUSE mount.
+	rawCfg, err := os.ReadFile(filepath.Join(mntDir, "app.yaml"))
+	if err != nil || string(rawCfg) != "port: 8080\n" {
+		t.Errorf("ReadFile(mnt/app.yaml) = (%q, %v)", string(rawCfg), err)
+	}
+	if err := os.WriteFile(filepath.Join(mntDir, "app.yaml"), []byte("port: 9090\n"), 0o600); err != nil {
+		t.Errorf("WriteFile(mnt/app.yaml): %v", err)
+	}
+	// Cross-share rename returns EXDEV.
+	if err := os.Rename(filepath.Join(mntDir, "repo", "main.go"), filepath.Join(mntDir, "hooksrepo", "main.go")); !errors.Is(err, syscall.EXDEV) {
+		t.Errorf("cross-share Rename = %v, want EXDEV", err)
 	}
 }

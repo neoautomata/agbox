@@ -61,6 +61,11 @@ Create a base snapshot with `opencode`, `antigravity` (`agy`), or `both`. You ca
 agbox create-base --add core,go,rust,esphome both
 ```
 
+Inside the isolated microVM, `create-base` configures default agent settings for unattended sandbox execution:
+
+- **Antigravity (`agy`):** Sets `toolPermission` to `"always-proceed"` (`turbo`), `queuedMessages` to `"send-immediately"`, `allowNonWorkspaceAccess` to `true`, and `trustedWorkspaces` to `["/workspace"]` in `/home/agent/.gemini/antigravity-cli/settings.json`.
+- **OpenCode (`opencode`):** Sets `"permission": "allow"` in `/home/agent/.config/opencode/opencode.json`. Queued follow-up messages already steer active turns immediately by default.
+
 To add categories later, run `edit-base`:
 
 ```bash
@@ -74,7 +79,7 @@ agbox edit-base --list
 agbox edit-base --add chrome,hugo,caddy
 ```
 
-### 3. Run an Agent on a Project Directory
+### 3. Run an Agent on Project Directories
 
 Place all option flags before the agent name and shared paths:
 
@@ -82,8 +87,8 @@ Place all option flags before the agent name and shared paths:
 # Run the OpenCode TUI in a named sandbox (agbox-myapp)
 agbox run --name myapp opencode ~/projects/myapp
 
-# Run Google Antigravity CLI (agy) with read-only mounts
-agbox run --ro antigravity ~/projects/myapp ~/projects/shared-lib
+# Mix read-only, writable, and VCS-enabled shares in one microVM
+agbox run antigravity ~/projects/docs:ro ~/projects/lib:rw ~/projects/app:rw,vcs
 
 # Run one shell command inside an ephemeral microVM
 agbox run --cmd "go test ./..." ~/projects/myapp
@@ -120,16 +125,105 @@ You can adjust network access per run:
 
 ### Default Shared Directory Policy
 
-`agbox` never mounts the host filesystem unless you pass explicit paths to `agbox run`:
+`agbox` never mounts host paths or starts a host FUSE daemon unless you pass explicit paths or `--share-hub` to `agbox run`:
 
-1. **Strict VCS Masking and Syscall Confinement (`AGBOX_MASK_VCS=strict`):**
-   Every shared directory mounts through the embedded FUSE filter (`nosuid,nodev`) by default. The filter hides and write-protects all 22 VCS directories and control files (`.git*`, `.jj`, `.sl`, `.svn`, `.hg*`, `.bzr*`, `_darcs`, `.pijul`, Fossil, and `.cvsignore`) case-insensitively at every depth. All host file operations use `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`). The filter allows regular files, directories, and intra-share relative symlinks that do not reference VCS names. It blocks out-of-tree symlinks, device/FIFO/socket nodes, `setuid`/`setgid` bits, cross-UID ownership changes, host `ioctl` calls, and non-`user.*` extended attributes. If the FUSE mount fails, `agbox` aborts immediately. Pass `--no-mask` (or set `AGBOX_MASK_VCS=off`) only when the guest must access VCS metadata directly.
-1. **Path Canonicalization and Containment (`internal/pathsec`):**
-   `pathsec.ValidateShare` resolves all symlinks before mounting. Missing paths, dangling symlinks, and paths containing `:`, `,`, or control characters fail validation. Paths outside `$HOME` fail validation unless you set `AGBOX_ALLOW_OUTSIDE_HOME=1`.
+1. **Multiplexed FUSE Workspace Hub and Strict VCS Masking (`AGBOX_MASK_VCS=strict`):**
+   Shared paths mount through an embedded FUSE Workspace Hub (`nosuid,nodev`) at `/workspace/<name>`. By default (`:mask`), the filter hides and write-protects all 22 VCS directories and control files (`.git*`, `.jj`, `.sl`, `.svn`, `.hg*`, `.bzr*`, `_darcs`, `.pijul`, Fossil, and `.cvsignore`) case-insensitively at every depth. All host file operations use `openat2` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`). The filter allows regular files, directories, and intra-share relative symlinks that do not reference masked VCS names. It blocks out-of-tree symlinks, device/FIFO/socket nodes, `setuid`/`setgid` bits, cross-UID ownership changes, host `ioctl` calls, and non-`user.*` extended attributes. If the FUSE mount fails, `agbox` aborts immediately.
+1. **Hook Protection on VCS-Enabled Shares (`:vcs` vs `:vcs-hooks`):**
+   When you opt into VCS access on a share with `:vcs` (or `--vcs`), the FUSE filter still keeps the share inside `openat2` confinement and write-protects executable VCS hook and config paths (`.git/hooks`, `.git/**/hooks`, `.jj/**/hooks`, `.svn/**/hooks`, `_darcs/**/prefs`, `.pijul/**/hooks`, and `.hg/hgrc`) with `EPERM`. Writable hooks require explicit `:vcs-hooks` (or `--vcs-hooks`).
+1. **Path Canonicalization, Disjointness, and Containment (`internal/pathsec`):**
+   `pathsec.ValidateShare` resolves all symlinks before mounting. Missing paths, dangling symlinks, overlapping or nested host directories, conflicting modifiers, and paths containing `:`, `,`, or control characters fail validation. Paths outside `$HOME` fail validation unless you set `AGBOX_ALLOW_OUTSIDE_HOME=1`.
 1. **VCS, Credential, and System Blocklist:**
    `agbox` rejects direct shares of any VCS directory, VCS subdirectory (such as `.git/hooks` or `.jj/repo`), or VCS control file. `agbox` also blocks SSH keys (`~/.ssh`), cloud and VCS credentials (`~/.aws`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/hub`, `~/.config/glab`, `~/.gitconfig`, `~/.git-credentials`, `~/.jjconfig.toml`, `~/.config/jj`, `~/.hgrc`, `~/.subversion`, `~/.bazaar`), agent state (`~/.gemini`, `~/.antigravity`, `~/.claude`, `~/.config/opencode`), shell and `direnv` configs, `DATA_DIR` (rejecting symlinks), and system paths (`/etc`, `/proc`, `/sys`, `/dev`). Parent directories of blocklisted paths (including `$HOME` itself) also fail validation.
 1. **Single-File Hardlink Check:**
-   Writable single-file shares must be regular files with a hardlink count of `1` (`st_nlink == 1`) so the guest cannot alter a hardlinked file outside the share. Read-only shares (`--ro`) allow multiple hardlinks.
+   Writable single-file shares must be regular files with a hardlink count of `1` (`st_nlink == 1`) so the guest cannot alter a hardlinked file outside the share. Read-only shares (`:ro` or `--ro`) allow multiple hardlinks.
+
+______________________________________________________________________
+
+## User Guide: Per-Share Permissions and Dynamic Shares (`agbox share`)
+
+### 1. Mix Permissions Across Project Directories
+
+Pass per-share modifiers either as `<path>[:opts]` positional arguments or with repeatable `--share <path[:opts]>` flags:
+
+```bash
+# Reference docs read-only, shared library writable with VCS masked, main repo writable with VCS
+agbox run antigravity \
+  ~/projects/docs:ro \
+  ~/projects/shared-lib:rw,mask \
+  ~/projects/main-app:rw,vcs,as=app
+```
+
+Supported per-share modifiers:
+
+- `ro`: Read-only access (`EROFS` on writes and `0222` permission bits masked).
+- `rw`: Read-write access (default for `agbox run` unless you pass `--ro`).
+- `mask`: Hide and write-protect all VCS directories and control files (default).
+- `vcs`: Allow VCS operations (`git`, `jj`) while write-protecting `.git/hooks` and equivalent hook paths (`EPERM`).
+- `vcs-hooks`: Allow VCS operations and writable hooks on a writable share.
+- `as=<name>`: Mount the share at `/workspace/<name>` (`1..63` ASCII letters, digits, `.`, `_`, or `-`, starting with an alphanumeric character).
+
+`agbox` rejects conflicting options immediately rather than overriding them silently. For example, passing both `--ro` and `--rw`, passing `:ro,rw` on one share, or combining `:ro` with `:vcs-hooks` returns an error.
+
+### 2. Add, Update, or Remove Shares on a Running or Suspended Sandbox
+
+Every sandbox with at least one share (or started with `--share-hub`) mounts a multiplexed `/workspace` FUSE hub controlled over a host-only `0600` Unix socket (`$DATA_DIR/run/<id>/ws.sock`, verified via `SO_PEERCRED`). You can list, attach, update, or detach project directories while the microVM is **running** or **suspended**:
+
+```bash
+# Start a sandbox with an empty /workspace hub ready for live shares
+agbox run --name work --share-hub opencode
+
+# Attach a share in another terminal (defaults to safe ro,mask)
+agbox share add agbox-work ~/projects/docs
+
+# Attach a writable VCS-enabled share under a custom alias
+agbox share add --rw --vcs --as app agbox-work ~/projects/main-app
+
+# Inspect active shares and open file-handle counts
+agbox share list agbox-work
+
+# Downgrade a live share to read-only or mask its VCS metadata
+agbox share set --ro --mask agbox-work app
+
+# Detach a share from /workspace
+agbox share rm agbox-work docs
+```
+
+Safe-by-default rules for `agbox share`:
+
+- `agbox share add` defaults to **`ro,mask`** unless you pass `--rw` (`:rw`) or `--vcs` (`:vcs`).
+- `agbox share rm` and `agbox share set --ro` fail closed if the guest holds open writable file descriptors on that share. Pass `--force` to revoke open handles immediately (`ESTALE` on removed shares, `EROFS` on downgraded writers).
+- Live changes persist in `$DATA_DIR/run/<id>/run.meta` across `agbox suspend` and `agbox resume`, and flush guest VFS lookup caches automatically.
+
+______________________________________________________________________
+
+## User Guide: Updating Agents Without Rebuilding the Base (`agbox update`)
+
+Use `agbox update` to install newer `agy` or `opencode` releases into a read-only host cache (`$DATA_DIR/agents`) without rebuilding `agbox:vN` or losing logins, skills, rules, conversation profiles, or base-image categories:
+
+```bash
+# Update all agents installed in the base image
+agbox update
+
+# Update only Antigravity or only OpenCode
+agbox update antigravity
+agbox update opencode
+
+# Check cached agent versions and SHA-256 digests
+agbox update status
+
+# Revert to the binaries baked into the base snapshot
+agbox update clear
+```
+
+`agbox update` performs four steps:
+
+1. Boots a disposable `agbox-update-<pid>` microVM with zero host shares, zero host API keys, and zero saved login tokens.
+1. Runs the upstream HTTPS (TLS 1.2+) installer inside the isolated microVM and verifies `--version`.
+1. Streams the updated binary back to the host, verifies the ELF header (`\x7fELF`), enforces size bounds and `st_nlink == 1`, records the SHA-256 digest in `$DATA_DIR/agents/manifest.json`, and seals the binary at mode `0755` inside `$DATA_DIR/agents/bin` (`0700` parent directory).
+1. Mounts `$DATA_DIR/agents` read-only (`:ro`) at `/home/agent/.agbox-agents` on subsequent `agbox run` and `agbox resume` sessions, and bind-mounts the verified binaries read-only (`ro,bind`) over `/home/agent/.local/bin/agy`, `/usr/local/bin/agy`, and `/usr/local/bin/opencode`.
+
+Pass `--no-agent-cache` to `agbox run` or `agbox resume` to skip `$DATA_DIR/agents` for a single session.
 
 ______________________________________________________________________
 
@@ -174,7 +268,7 @@ agbox resume agbox-feature-auth
 `agbox resume` performs four steps:
 
 1. Validates every recorded share path again with `pathsec.ValidateShare`.
-1. Mounts the FUSE VCS filters at the same `$DATA_DIR/run/<id>/m*` paths.
+1. Mounts the FUSE Workspace Hub (or legacy `m*` filters) at the recorded `$DATA_DIR/run/<id>` mountpoint.
 1. Runs `msb start <sandbox>` and streams current host API keys over `stdin`.
 1. Starts the recorded TUI agent, `--serve` web server, `--remote-control` daemon, or command. Pass `-d` to detach a `--serve` or `--remote-control` session on resume.
 
@@ -457,6 +551,10 @@ Modes:
       Start the base microVM and install categories or run custom updates.
       Save snapshot agbox:v<N+1> unless you pass --no-snap.
 
+  agbox update [--allow-root] [antigravity|opencode|both|status|clear]
+      Update agent binaries inside a disposable zero-share microVM and cache
+      verified ELF binaries in $DATA_DIR/agents without rebuilding the base snapshot.
+
   agbox auth [--allow-root] [antigravity|opencode|status|logout]
       Sign in inside a disposable microVM and save credentials in $DATA_DIR/auth.
 
@@ -469,7 +567,11 @@ Modes:
   agbox profile [--allow-root] [list|create [--size SIZE] <name>|rm [--force] <name>]
       Manage ext4 disk profiles for conversation history across ephemeral runs.
 
-  agbox run [options] [opencode|antigravity] [paths...]
+  agbox share [--allow-root] <list|add|set|rm> <sandbox> [...]
+      List, attach, update permissions on, or detach /workspace shares on a running
+      or suspended sandbox (agbox share add defaults to ro,mask).
+
+  agbox run [options] [opencode|antigravity] [path[:opts]...]
       Restore a microVM and mask VCS files and directories.
       Block local, private, multicast, and cloud-config IPs by default.
       Delete the microVM on exit unless you pass --persist or suspend it.
@@ -482,9 +584,14 @@ Modes:
         --no-auth            Skip saved login credentials from $DATA_DIR/auth
         --no-skills          Skip global skills from $DATA_DIR/skills
         --no-rules           Skip global rules from $DATA_DIR/rules
+        --no-agent-cache     Skip cached agent binary updates from $DATA_DIR/agents
         --allow-root         Allow agbox to run as the root user
-        --ro                 Mount shared paths read-only
-        --mask-vcs           Require the FUSE VCS filter for directory shares (default)
+        --share PATH[:OPTS]  Share a host path with modifiers (ro,rw,mask,vcs,vcs-hooks,as=NAME)
+        --share-hub          Mount an empty /workspace FUSE hub so shares can be added live
+        --ro / --rw          Set default share access mode (conflicts with opposite modifier)
+        --mask-vcs           Mask VCS metadata inside directory shares (default)
+        --vcs                Allow VCS metadata inside shares while write-protecting hooks
+        --vcs-hooks          Allow VCS metadata and writable hooks inside writable shares
         --no-mask            Disable the FUSE VCS filter (.git is visible to guest)
         --serve              Run 'opencode serve' and bind the web UI on 127.0.0.1
         --port N             Use fixed loopback TCP port N for --serve
@@ -519,7 +626,7 @@ ______________________________________________________________________
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config`, `auth`, `skills`, `rules`, `profiles`, and `run/<id>`. |
+| `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config`, `auth`, `agents`, `skills`, `rules`, `profiles`, and `run/<id>`. |
 | `AGBOX_INSTALL_DIR` | `~/.local/bin` (`/usr/local/bin` for `root`) | Target directory where `install.sh` installs the `agbox` binary. |
 | `AGBOX_ALLOW_ROOT` | `0` | Set to `1` to allow `install.sh` and `agbox` to run as `root`. |
 | `AGBOX_CPUS` | `4` | Default vCPU count for `create-base` and `run`. |
@@ -528,8 +635,8 @@ ______________________________________________________________________
 | `AGBOX_PROFILE_DISK` | `10G` | Default `ext4` disk volume size for `agbox profile create` and `run --profile`. |
 | `AGBOX_MASK_VCS` | `strict` | FUSE filter policy for directory shares: `strict`, `auto`, or `off`. |
 | `AGBOX_ALLOW_OUTSIDE_HOME` | `0` | Set to `1` to allow shares outside `$HOME`. Blocklists still apply. |
-| `AGBOX_OPENCODE_VERSION` | `latest` | npm version or tag for `opencode-ai` during `create-base`. |
-| `AGBOX_AGY_INSTALLER_URL` | `https://antigravity.google/cli/install.sh` | Installer URL for `agy` during `create-base`. |
+| `AGBOX_OPENCODE_VERSION` | `latest` | npm version or tag for `opencode-ai` during `create-base` and `update`. |
+| `AGBOX_AGY_INSTALLER_URL` | `https://antigravity.google/cli/install.sh` | Installer URL for `agy` during `create-base` and `update`. |
 | `OPENCODE_SERVER_PASSWORD` | *(unset)* | Optional HTTP Basic Auth password for `agbox run --serve`. |
 | `OPENCODE_SERVER_USERNAME` | `opencode` | Optional HTTP Basic Auth username for `agbox run --serve`. |
 
@@ -539,7 +646,7 @@ ______________________________________________________________________
 
 - `mounttab` reads `/proc/self/mountinfo` and decodes octal escape sequences (`\040`, `\134`). It does not rely on `os.Stat` because a crashed FUSE daemon returns `ENOTCONN` while the mount stays active.
 - `mounttab.OSController` checks `/proc/<pid>/cmdline` for `agbox __filter` before it signals a recorded PID. This check prevents signaling an unrelated host process after PID reuse.
-- `mounttab.UnmountFilterDir` sends `SIGTERM` to verified FUSE daemons and unmounts each mountpoint with `fusermount3 -u` (or `fusermount -u`). If a mount stays active, it sends `SIGKILL`, runs a lazy unmount, and checks `/proc/self/mountinfo` again.
+- `mounttab.UnmountFilterDir` sends `SIGTERM` to verified FUSE daemons (`ws.pid` and `m*.pid`) and unmounts each mountpoint with `fusermount3 -u` (or `fusermount -u`). If a mount stays active, it sends `SIGKILL`, runs a lazy unmount, and checks `/proc/self/mountinfo` again.
 - `mounttab.TeardownFilterDir` calls `UnmountFilterDir` first and refuses to run `os.RemoveAll` if any mountpoint remains active.
 - `ReapOrphanRuns` and `ReapStaleFilterDirs` delete crashed run sandboxes while preserving running detached sessions and stopped suspended sessions.
 
@@ -552,28 +659,31 @@ ______________________________________________________________________
 | Hardware microVM isolation | `msb` (`/dev/kvm`, `libkrun`) | Each session boots its own guest kernel. Guest root commands do not affect the host kernel. |
 | Non-root host execution | `cli.CheckRootExecution`, `install.sh` | Rejects `euid == 0` unless `--allow-root` or `AGBOX_ALLOW_ROOT=1` is set. |
 | Private state directories | `config.EnsurePrivateDir`, `vcsfuse` | Rejects symlinks via `Lstat`, sets directory mode `0700`, and writes metadata files with mode `0600`. |
-| Boundary input validation | `config.FromLookup`, `cli`, `persist` | Rejects invalid CPU/RAM/disk specs, control characters, unsafe session IDs, malformed `--net-rule` tokens, and non-`https://` installer URLs. |
-| Explicit opt-in host shares | `cli.Run`, `pathsec.ValidateShare` | Mounts zero host paths unless passed on the CLI. Resolves symlinks and restricts shares to `$HOME` by default. |
+| Boundary input validation | `config.FromLookup`, `cli`, `persist` | Rejects invalid CPU/RAM/disk specs, conflicting share flags, control characters, unsafe session IDs, malformed `--net-rule` tokens, and non-`https://` installer URLs. |
+| Explicit opt-in host shares | `cli.Run`, `pathsec.ValidateShare` | Mounts zero host paths unless passed on the CLI. Resolves symlinks, rejects overlapping host trees, and restricts shares to `$HOME` by default. |
 | Credential and system blocklist | `pathsec.DefaultBlocklist` | Blocks SSH, cloud, agent, VCS, shell, `direnv`, `DATA_DIR`, `MSB_HOME`, and system paths (plus parent directories and symlink targets). |
 | Direct VCS share prohibition | `pathsec.ContainsVCSComponent` | Blocks direct shares of any VCS directory, VCS subdirectory, or VCS working-tree file (case-insensitive). |
 | Single-file hardlink check | `pathsec.ValidateShare` | Requires regular files and `st_nlink == 1` on writable single-file shares. |
-| Case-insensitive VCS masking | `vcsfuse.FilteredNode` | Hides all 22 VCS directories and control files (`ENOENT`) and blocks all writes to those names (`EPERM`) at every depth. |
+| Case-insensitive VCS masking | `vcsfuse.FilteredNode` | Hides all 22 VCS directories and control files (`ENOENT`) and blocks all writes to those names (`EPERM`) at every depth by default (`:mask`). |
+| VCS hook write-protection | `vcsfuse.shareSlot` (`:vcs`) | Write-protects `.git/hooks`, `.git/**/hooks`, `.jj/**/hooks`, `.svn/**/hooks`, `_darcs/**/prefs`, `.pijul/**/hooks`, and `.hg/hgrc` (`EPERM`) unless `:vcs-hooks` is set. |
+| Dynamic share control & FD revocation | `vcsfuse.WorkspaceHub`, `cli.Share` | Restricts `ws.sock` (`0600`) to the host UID via `SO_PEERCRED`, defaults `share add` to `ro,mask`, blocks busy detach/downgrade without `--force`, and revokes open descriptors (`ESTALE` / `EROFS`). |
 | Root-pinned `openat2` resolution | `vcsfuse.pinnedRoot` | Resolves every FUSE operation with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` and rejects detached child inodes (`ENOENT`). |
-| Intra-share symlink confinement | `vcsfuse.ValidateSymlinkTarget` | Blocks absolute targets, `..` root escapes, and VCS targets on both `Symlink` and `Readlink` (`EPERM`). |
+| Intra-share symlink confinement | `vcsfuse.ValidateSymlinkTarget` | Blocks absolute targets, `..` root escapes, and masked VCS targets on both `Symlink` and `Readlink` (`EPERM`). |
 | Special-file and `ioctl` blocking | `vcsfuse` (`safeFile`, `Mknod`, `Open`) | Mounts with `nosuid,nodev`, allows `S_IFREG` only, and hides `PassthroughFd` and `Ioctl` on file and directory handles. |
 | Privilege-bit and `chown` blocking | `vcsfuse` (`sanitizeCreateMode`, `Setattr`) | Strips `setuid`/`setgid` on creation and rejects `setuid`/`setgid` modes and cross-UID/GID `chown` (`EPERM`). |
 | Extended attribute isolation | `vcsfuse.IsProtectedXattr` | Allows `user.<name>` attributes only and blocks `security.*`, `system.*`, and `trusted.*` (`EPERM` / `ENODATA`). |
 | Default-deny public-only network | `msb.BuildNetArgs` | Places `deny@host`, `deny@loopback`, `deny@private`, `deny@link-local`, `deny@multicast`, `deny@metadata`, and cloud-config CIDRs before `allow@public`. |
 | Loopback-only web server binding | `cli.Run` (`--serve`) | Binds host TCP forwarding strictly on `127.0.0.1:<port>`. |
-| HTTPS and TLS 1.2+ downloads | `install.sh`, `cli`, `msb` | Enforces `--proto '=https' --tlsv1.2` on all `curl` installer downloads. |
+| HTTPS and TLS 1.2+ downloads | `install.sh`, `cli`, `msb`, `persist` | Enforces `--proto '=https' --tlsv1.2` on all `curl` installer downloads. |
 | Secret streaming over `stdin` | `msb.FormatEnvExports`, `cli.pushKeys` | Quotes values for POSIX `sh` and streams keys over `stdin` into `/home/agent/.agbox-keys.sh` (`0600`). Never passes secrets in CLI arguments. |
 | Allowlisted `agbox auth` credentials | `persist`, `cli.Auth`, `cli.pushAuth` | Captures only allowlisted login files (max 64 KiB, `Lstat` no-symlink check) from a zero-share microVM, stores them at `0600` in `$DATA_DIR/auth`, and streams them over `stdin`. |
+| Verified read-only agent cache | `persist.InspectAgentsDir`, `cli.Update` | Fetches updates in a zero-share, zero-secret microVM, verifies ELF magic, SHA-256 digests, and `st_nlink == 1` in `$DATA_DIR/agents`, and enforces `:ro` + guest `ro,bind` mounts. |
 | Read-only global skills | `persist.InspectSkillsDir`, `cli` | Rejects symlinks and special files in `$DATA_DIR/skills`, mounts the volume read-only (`:ro`), and enforces `ro,bind` mounts inside the guest. |
 | Read-only global rules | `persist.InspectRulesDir`, `cli` | Rejects symlinks, subdirectories, non-`.md` entries, NUL bytes, and files over 64 KiB in `$DATA_DIR/rules`, mounts the volume read-only (`:ro`), and enforces `ro,bind` mounts inside the guest. |
 | Isolated `ext4` conversation profiles | `persist.LockProfile`, `cli` | Guards each `agbox-profile-<name>` disk volume with an exclusive host `flock` and bind-mounts only conversation directories while keeping global skills, rules, hooks, plugins, and `mcp_config.json` outside the profile disk. |
 | PID-reuse signal protection | `mounttab.IsFilterCmdline` | Verifies `/proc/<pid>/cmdline` has `argv[1] == "__filter"` before sending `SIGTERM` or `SIGKILL`. |
 | Mount-verified directory deletion | `mounttab.TeardownFilterDir` | Verifies zero active mounts in `/proc/self/mountinfo` before running `os.RemoveAll`. |
-| Tamper-evident `resume` & fail-closed setup | `cli` (`Setup`, `EditBase`, `Run`, `Resume`), `install.sh` | Checks FUSE, KVM, and an offline smoke microVM in `setup`, re-validates shares, skills, rules, profiles, and strict masking on `resume`, and aborts on any error. |
+| Tamper-evident `resume` & fail-closed setup | `cli` (`Setup`, `EditBase`, `Run`, `Resume`), `install.sh` | Checks FUSE, KVM, and an offline smoke microVM in `setup`, re-validates shares, cached agents, skills, rules, profiles, and strict masking on `resume`, and aborts on any error. |
 
 ______________________________________________________________________
 
@@ -587,10 +697,11 @@ agbox/
 │   ├── config/        Environment settings, state and run metadata files, and snapshot numbering
 │   ├── mounttab/      /proc/self/mountinfo parser and FUSE unmount verification
 │   ├── msb/           Argument builders, network rules, categories, and Runner interface
-│   ├── pathsec/       Host path validation, blocklist checks, and mount naming
-│   ├── persist/       Persistent login capture/streaming, read-only skills and rules, and profile locking
-│   └── vcsfuse/       Loopback FUSE filesystem that hides VCS directories and blocks xattrs
+│   ├── pathsec/       Host path validation, share spec parsing, blocklists, and alias checks
+│   ├── persist/       Persistent login capture, verified agent cache, skills, rules, and profiles
+│   └── vcsfuse/       Multiplexed FUSE Workspace Hub, VCS/hook filter, and control socket
 ├── install.sh         Idempotent host check, build, and installation script
+├── AGENTS.md          Architecture, safe-by-default rules, and verification guide for agents
 └── README.md          User and security documentation
 ```
 

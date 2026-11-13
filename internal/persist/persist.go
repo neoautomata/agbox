@@ -1,11 +1,16 @@
-// Package persist manages persistent sandbox authentication, global skills, global rules, and profile metadata.
+// Package persist manages persistent sandbox authentication, global skills,
+// global rules, cached agent binaries, and conversation profile metadata.
 //
 // Security properties:
 //   - Stores sandbox credentials in $DATA_DIR/auth with directory mode 0700 and file mode 0600.
-//   - Rejects symlinks via Lstat across $DATA_DIR/auth, $DATA_DIR/skills, $DATA_DIR/rules, and $DATA_DIR/profiles.
+//   - Rejects symlinks via Lstat across $DATA_DIR/auth, $DATA_DIR/skills, $DATA_DIR/rules,
+//     $DATA_DIR/agents, and $DATA_DIR/profiles.
 //   - Captures and restores only allowlisted credential files within a 64 KiB size limit.
 //   - Streams credential restore scripts over stdin so tokens never appear in CLI arguments.
-//   - Rejects symlinks, special files, and unsafe path delimiters in $DATA_DIR/skills and $DATA_DIR/rules.
+//   - Rejects symlinks, special files, and unsafe path delimiters in $DATA_DIR/skills,
+//     $DATA_DIR/rules, and $DATA_DIR/agents.
+//   - Verifies ELF magic, regular single-link files, and SHA-256 manifest digests for cached
+//     agent binaries in $DATA_DIR/agents/bin before mounting them read-only into sandboxes.
 //   - Enforces exclusive host flock locking per conversation profile to prevent concurrent ext4 mounts.
 package persist
 
@@ -1228,6 +1233,9 @@ if ! grep -qs ' /home/agent/.gemini/antigravity-cli ' /proc/self/mountinfo; then
       chown -R 1000:1000 "/home/agent/.agbox-profile/agy-cli/${sub}"
     fi
   done
+  if [ -f "/home/agent/.gemini/antigravity-cli/settings.json" ] && [ ! -e "/home/agent/.agbox-profile/agy-cli/settings.json" ]; then
+    install -m 0600 -o 1000 -g 1000 "/home/agent/.gemini/antigravity-cli/settings.json" "/home/agent/.agbox-profile/agy-cli/settings.json"
+  fi
 fi
 
 mkdir -p \
