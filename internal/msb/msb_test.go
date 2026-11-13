@@ -9,8 +9,24 @@ import (
 	"testing"
 )
 
-func TestTranslateNetSpec(t *testing.T) {
-	publicWant := []string{"--net-default", "deny", "--net-rule", "allow@public"}
+func TestTranslateNetSpecAndBuildNetArgs(t *testing.T) {
+	publicWant := []string{
+		"--net-default", "deny",
+		"--net-rule", "deny@host",
+		"--net-rule", "deny@loopback",
+		"--net-rule", "deny@private",
+		"--net-rule", "deny@link-local",
+		"--net-rule", "deny@multicast",
+		"--net-rule", "deny@metadata",
+		"--net-rule", "deny@0.0.0.0/8",
+		"--net-rule", "deny@100.100.100.200/32",
+		"--net-rule", "deny@168.63.129.16/32",
+		"--net-rule", "deny@169.254.0.0/16",
+		"--net-rule", "deny@240.0.0.0/4",
+		"--net-rule", "deny@fe80::/10",
+		"--net-rule", "deny@fd00:ec2::254/128",
+		"--net-rule", "allow@public",
+	}
 	for _, spec := range []string{"", "public", "public-only", "  public "} {
 		got, err := TranslateNetSpec(spec)
 		if err != nil {
@@ -21,12 +37,45 @@ func TestTranslateNetSpec(t *testing.T) {
 		}
 	}
 
-	if got, err := TranslateNetSpec("private"); err != nil || !slices.Equal(got, []string{"--net-default", "deny", "--net-rule", "allow@public,allow@private"}) {
-		t.Errorf("TranslateNetSpec(private) = %v, %v", got, err)
+	// private allows RFC1918/CGNAT/ULA after blocking host, loopback, link-local, multicast, and cloud-config IMDS CIDRs.
+	gotPrivate, err := TranslateNetSpec("private")
+	if err != nil {
+		t.Fatalf("TranslateNetSpec(private): %v", err)
 	}
-	if got, err := TranslateNetSpec("host"); err != nil || !slices.Equal(got, []string{"--net-default", "deny", "--net-rule", "allow@public,allow@host"}) {
-		t.Errorf("TranslateNetSpec(host) = %v, %v", got, err)
+	privJoined := strings.Join(gotPrivate, " ")
+	for _, mustContain := range []string{
+		"--net-default deny",
+		"--net-rule deny@host",
+		"--net-rule deny@loopback",
+		"--net-rule deny@link-local",
+		"--net-rule deny@multicast",
+		"--net-rule deny@metadata",
+		"--net-rule deny@100.100.100.200/32",
+		"--net-rule deny@168.63.129.16/32",
+		"--net-rule deny@fd00:ec2::254/128",
+		"--net-rule allow@public",
+		"--net-rule allow@private",
+	} {
+		if !strings.Contains(privJoined, mustContain) {
+			t.Errorf("TranslateNetSpec(private) = %q, missing %q", privJoined, mustContain)
+		}
 	}
+	if strings.Contains(privJoined, "deny@private") {
+		t.Errorf("TranslateNetSpec(private) should not contain deny@private: %q", privJoined)
+	}
+
+	// host places allow@host before deny@private while still blocking loopback, multicast, and metadata.
+	gotHost, err := TranslateNetSpec("host")
+	if err != nil {
+		t.Fatalf("TranslateNetSpec(host): %v", err)
+	}
+	hostJoined := strings.Join(gotHost, " ")
+	allowHostIdx := strings.Index(hostJoined, "allow@host")
+	denyPrivIdx := strings.Index(hostJoined, "deny@private")
+	if allowHostIdx < 0 || denyPrivIdx < 0 || allowHostIdx > denyPrivIdx {
+		t.Errorf("expected allow@host before deny@private in %q", hostJoined)
+	}
+
 	for _, spec := range []string{"all", "allow"} {
 		if got, err := TranslateNetSpec(spec); err != nil || !slices.Equal(got, []string{"--net-default", "allow"}) {
 			t.Errorf("TranslateNetSpec(%q) = %v, %v", spec, got, err)
@@ -37,11 +86,33 @@ func TestTranslateNetSpec(t *testing.T) {
 			t.Errorf("TranslateNetSpec(%q) = %v, %v", spec, got, err)
 		}
 	}
-	if got, err := TranslateNetSpec("allow@example.com:tcp:443"); err != nil || !slices.Equal(got, []string{"--net-default", "deny", "--net-rule", "allow@example.com:tcp:443"}) {
-		t.Errorf("TranslateNetSpec(custom rule) = %v, %v", got, err)
+
+	// Multi-spec BuildNetArgs must emit --net-default deny once and place user deny@ rules before allow@public!
+	multiGot, err := BuildNetArgs(false, []string{"public", "deny@93.184.216.34/32", "allow@example.com:tcp:443"})
+	if err != nil {
+		t.Fatalf("BuildNetArgs multi-spec: %v", err)
 	}
-	if _, err := TranslateNetSpec("invalid-profile"); err == nil {
-		t.Fatal("expected error for unsupported network profile")
+	multiJoined := strings.Join(multiGot, " ")
+	if strings.Count(multiJoined, "--net-default") != 1 {
+		t.Errorf("expected single --net-default in %q", multiJoined)
+	}
+	denyCustomIdx := strings.Index(multiJoined, "deny@93.184.216.34/32")
+	allowPubIdx := strings.Index(multiJoined, "allow@public")
+	if denyCustomIdx < 0 || allowPubIdx < 0 || denyCustomIdx > allowPubIdx {
+		t.Errorf("expected custom deny@ rule before allow@public in %q", multiJoined)
+	}
+
+	for _, badSpec := range []string{
+		"invalid-profile",
+		"foo@bar",
+		"allow@",
+		"deny@",
+		"allow@example.com --privileged",
+		"allow@example.com,deny@",
+	} {
+		if _, err := TranslateNetSpec(badSpec); err == nil {
+			t.Errorf("expected error for invalid --net spec %q", badSpec)
+		}
 	}
 }
 
@@ -107,6 +178,15 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		t.Errorf("createArgs = %v, want %v", createArgs, wantCreate)
 	}
 
+	createNetArgs, err := BuildCreateArgs(CreateOpts{
+		Image:    "debian:bookworm-slim",
+		Name:     "agbox-base",
+		NetSpecs: []string{"public"},
+	})
+	if err != nil || !slices.Contains(createNetArgs, "deny@metadata") || !slices.Contains(createNetArgs, "deny@168.63.129.16/32") {
+		t.Errorf("expected BuildCreateArgs with NetSpecs=[public] to include metadata/cloud-config denies: %v, %v", createNetArgs, err)
+	}
+
 	if _, err := BuildRestoreArgs(RestoreOpts{Name: "agbox-run-1"}); err == nil {
 		t.Fatal("expected error when Snapshot is empty")
 	}
@@ -138,11 +218,39 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		"-v /tmp/mnt0:/workspace/proj:rw,uid=1000,gid=1000",
 		"-v /tmp/file.txt:/workspace/file.txt:ro,uid=1000,gid=1000",
 		"-p 127.0.0.1:4096:3000",
-		"--net-default deny --net-rule allow@public",
+		"--net-default deny --net-rule deny@host --net-rule deny@loopback --net-rule deny@private --net-rule deny@link-local --net-rule deny@multicast --net-rule deny@metadata",
+		"--net-rule deny@168.63.129.16/32",
+		"--net-rule deny@100.100.100.200/32",
+		"--net-rule allow@public",
 		"--net-rule allow@example.com:tcp:443",
 	} {
 		if !strings.Contains(joined, substr) {
 			t.Errorf("restoreArgs %q missing %q", joined, substr)
+		}
+	}
+
+	defaultNetArgs, err := BuildRestoreArgs(RestoreOpts{
+		Snapshot: "agbox:v1",
+		Name:     "agbox-run-default",
+	})
+	if err != nil {
+		t.Fatalf("BuildRestoreArgs default net: %v", err)
+	}
+	defaultNetJoined := strings.Join(defaultNetArgs, " ")
+	for _, must := range []string{
+		"--net-default deny",
+		"--net-rule deny@host",
+		"--net-rule deny@loopback",
+		"--net-rule deny@private",
+		"--net-rule deny@link-local",
+		"--net-rule deny@multicast",
+		"--net-rule deny@metadata",
+		"--net-rule deny@168.63.129.16/32",
+		"--net-rule deny@fd00:ec2::254/128",
+		"--net-rule allow@public",
+	} {
+		if !strings.Contains(defaultNetJoined, must) {
+			t.Errorf("expected %q in default net policy %q", must, defaultNetJoined)
 		}
 	}
 
@@ -325,5 +433,83 @@ func TestProvisionScriptAndExecRunner(t *testing.T) {
 	res, err := runner.Run(context.Background(), CommandRequest{Args: []string{"fail"}})
 	if err == nil || res.ExitCode != 3 {
 		t.Fatalf("expected exit code 3 on failure, got res=%+v, err=%v", res, err)
+	}
+
+	extraBin := filepath.Join(tmp, "usr-local-msb")
+	if err := os.WriteFile(extraBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	noLook := func(string) (string, error) { return "", os.ErrNotExist }
+	resolved, err := resolveBinaryWith("", noLook, filepath.Join(tmp, "nohome"), []string{extraBin})
+	if err != nil || resolved != extraBin {
+		t.Errorf("resolveBinaryWith extra fallback = %q, %v", resolved, err)
+	}
+	if _, err := resolveBinaryWith("", noLook, filepath.Join(tmp, "nohome"), nil); err == nil {
+		t.Error("expected error when msb is missing from all locations")
+	}
+}
+
+func TestSecretShellInjectionResistanceAndCategoryTLS(t *testing.T) {
+	canary := filepath.Join(t.TempDir(), "pwned")
+	secretMap := map[string]string{
+		"ANTHROPIC_API_KEY": "sk-ant-'$(touch " + canary + ")'\"`touch " + canary + "`\"",
+		"OPENAI_API_KEY":    "line1\nexport INJECTED=1\n$HOME; echo pwn > " + canary,
+		"GEMINI_API_KEY":    `backslash\and$VAR'single'"double"`,
+	}
+	script, count := FormatEnvExports(func(k string) string { return secretMap[k] }, []string{
+		"ANTHROPIC_API_KEY",
+		"OPENAI_API_KEY",
+		"GEMINI_API_KEY",
+	})
+	if count != 3 {
+		t.Fatalf("count = %d, want 3", count)
+	}
+
+	// Execute the generated export script in real /bin/sh and verify literal values and zero command execution.
+	keysFile := filepath.Join(t.TempDir(), ".agbox-keys.sh")
+	if err := os.WriteFile(keysFile, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkCmd := `. "$1"
+test -z "${INJECTED:-}" || exit 11
+printf '%s\0%s\0%s' "$ANTHROPIC_API_KEY" "$OPENAI_API_KEY" "$GEMINI_API_KEY"`
+	runner := &ExecRunner{BinaryPath: "/bin/sh"}
+	res, err := runner.Run(context.Background(), CommandRequest{
+		Args: []string{"-c", checkCmd, "--", keysFile},
+	})
+	if err != nil {
+		t.Fatalf("shell evaluation of FormatEnvExports failed: %v (stderr=%s)", err, res.Stderr)
+	}
+	if _, statErr := os.Stat(canary); !os.IsNotExist(statErr) {
+		t.Fatalf("CRITICAL: command injection executed and created %s", canary)
+	}
+	parts := strings.Split(res.Stdout, "\x00")
+	if len(parts) != 3 ||
+		parts[0] != secretMap["ANTHROPIC_API_KEY"] ||
+		parts[1] != secretMap["OPENAI_API_KEY"] ||
+		parts[2] != secretMap["GEMINI_API_KEY"] {
+		t.Fatalf("round-tripped secrets mismatch: got %q", parts)
+	}
+
+	// Verify every curl command in all category install scripts enforces HTTPS and TLS 1.2+.
+	allCats, err := ResolveCategories([]string{"all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catScript := BuildCategoriesScript(allCats)
+	for _, line := range strings.Split(catScript, "\n") {
+		trimmed := strings.TrimSpace(line)
+		isCurlCmd := strings.HasPrefix(trimmed, "curl ") ||
+			strings.Contains(trimmed, "$(curl ") ||
+			strings.Contains(trimmed, "! curl ") ||
+			strings.Contains(trimmed, "&& curl ")
+		if isCurlCmd {
+			if !strings.Contains(trimmed, "--proto") || !strings.Contains(trimmed, "=https") || !strings.Contains(trimmed, "--tlsv1.2") {
+				t.Errorf("category curl command missing --proto '=https' --tlsv1.2: %s", trimmed)
+			}
+			if strings.Contains(trimmed, "http://") {
+				t.Errorf("category curl command uses plaintext http://: %s", trimmed)
+			}
+		}
 	}
 }

@@ -145,3 +145,73 @@ func TestTeardownFilterDirRefusesRemoveWhenStillMounted(t *testing.T) {
 		t.Fatalf("CRITICAL: canary file inside stubborn mount was deleted: %v", err)
 	}
 }
+
+func TestUnmountFilterDirPreservesMetadata(t *testing.T) {
+	runDir := filepath.Join(t.TempDir(), "run", "feat1")
+	mp := filepath.Join(runDir, "m0")
+	if err := os.MkdirAll(mp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := filepath.Join(runDir, "m0.pid")
+	suspendedPath := filepath.Join(runDir, "suspended")
+	if err := os.WriteFile(pidPath, []byte("4321\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(suspendedPath, []byte("{\"sandbox\":\"agbox-feat1\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctl := &fakeController{
+		mounts: []Entry{{MountPoint: mp, FSType: "fuse.agboxfilter"}},
+	}
+	if err := UnmountFilterDir(runDir, ctl); err != nil {
+		t.Fatalf("UnmountFilterDir failed: %v", err)
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Errorf("expected m0.pid to be deleted, err = %v", err)
+	}
+	if _, err := os.Stat(suspendedPath); err != nil {
+		t.Errorf("expected suspended metadata to remain intact, err = %v", err)
+	}
+
+	stubbornCtl := &fakeController{
+		mounts:       []Entry{{MountPoint: mp, FSType: "fuse.agboxfilter"}},
+		keepStubborn: true,
+	}
+	if err := UnmountFilterDir(runDir, stubbornCtl); err == nil {
+		t.Error("expected UnmountFilterDir to fail when mount stays active")
+	}
+}
+
+func TestIsFilterCmdlineAndPIDReuseGuard(t *testing.T) {
+	if !IsFilterCmdline([]byte("/usr/local/bin/agbox\x00__filter\x00-src\x00/a\x00-mnt\x00/b\x00")) {
+		t.Error("expected valid __filter cmdline to match")
+	}
+	for _, nonFilter := range [][]byte{
+		nil,
+		[]byte(""),
+		[]byte("/usr/bin/bash\x00-l\x00"),
+		[]byte("/usr/local/bin/agbox\x00run\x00__filter\x00"),
+	} {
+		if IsFilterCmdline(nonFilter) {
+			t.Errorf("expected %q not to match __filter argv[1]", string(nonFilter))
+		}
+	}
+
+	// OSController.SignalPID must refuse to signal the current test process
+	// because its /proc/<pid>/cmdline does not have argv[1] == "__filter".
+	var osCtl OSController
+	if err := osCtl.SignalPID(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatalf("OSController.SignalPID on non-filter process returned error: %v", err)
+	}
+
+	// Unsafe root/empty paths must be rejected by both UnmountFilterDir and TeardownFilterDir.
+	for _, unsafeDir := range []string{"", ".", "/"} {
+		if err := UnmountFilterDir(unsafeDir, &fakeController{}); err == nil {
+			t.Errorf("expected UnmountFilterDir(%q) to fail", unsafeDir)
+		}
+		if err := TeardownFilterDir(unsafeDir, &fakeController{}); err == nil {
+			t.Errorf("expected TeardownFilterDir(%q) to fail", unsafeDir)
+		}
+	}
+}

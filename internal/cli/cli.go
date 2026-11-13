@@ -1,6 +1,14 @@
-// Package cli implements argument parsing and mode orchestration for agbox.
-// Pure parsing and validation functions are separated from side-effecting VM
-// and filesystem operations, which run through injected dependencies on App.
+// Package cli parses CLI arguments and runs agbox modes.
+//
+// Security properties:
+//   - Rejects root execution by default unless --allow-root or AGBOX_ALLOW_ROOT=1 is set.
+//   - Fails closed across setup, create-base, edit-base, run, and resume whenever
+//     a prerequisite, FUSE filter, network rule, or secret transfer fails.
+//   - Enforces MaskStrict FUSE VCS filtering and default-deny public-only egress
+//     by default on every run.
+//   - Binds --serve web interfaces strictly to host loopback (127.0.0.1).
+//   - Streams host API keys over stdin into the disposable microVM and cleans up
+//     sandboxes and FUSE mounts on exit or termination signals.
 package cli
 
 import (
@@ -31,10 +39,96 @@ import (
 // ErrHelp indicates that `-h` or `--help` was requested.
 var ErrHelp = errors.New("help requested")
 
+// GlobalOpts holds top-level CLI flags that precede the mode name.
+type GlobalOpts struct {
+	AllowRoot bool
+	Mode      string
+	Rest      []string
+}
+
+// ParseGlobalArgs parses global flags and separates the mode name from mode arguments.
+func ParseGlobalArgs(args []string) (GlobalOpts, error) {
+	var opts GlobalOpts
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--allow-root":
+			opts.AllowRoot = true
+		case "-h", "--help", "help":
+			return opts, ErrHelp
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return GlobalOpts{}, fmt.Errorf("unknown option %q (run 'agbox --help')", args[i])
+			}
+			opts.Mode = args[i]
+			opts.Rest = args[i+1:]
+			return opts, nil
+		}
+	}
+	return opts, ErrHelp
+}
+
+// CheckRootExecution checks whether agbox may run with effective user ID euid.
+// It returns the active override name ("--allow-root" or "AGBOX_ALLOW_ROOT=1") for root runs.
+func CheckRootExecution(euid int, envAllowRoot, flagAllowRoot bool) (string, error) {
+	if euid != 0 {
+		return "", nil
+	}
+	if flagAllowRoot {
+		return "--allow-root", nil
+	}
+	if envAllowRoot {
+		return "AGBOX_ALLOW_ROOT=1", nil
+	}
+	return "", errors.New("do not run as root. Pass --allow-root or set AGBOX_ALLOW_ROOT=1 to override")
+}
+
+// SetupOpts holds parsed arguments for `agbox setup`.
+type SetupOpts struct {
+	AllowRoot bool
+}
+
+// ParseSetupArgs parses CLI arguments for `setup`.
+func ParseSetupArgs(args []string) (SetupOpts, error) {
+	var opts SetupOpts
+	for _, a := range args {
+		switch a {
+		case "-h", "--help":
+			return SetupOpts{}, ErrHelp
+		case "--allow-root":
+			opts.AllowRoot = true
+		default:
+			return SetupOpts{}, fmt.Errorf("unknown setup option: %s (expected --allow-root)", a)
+		}
+	}
+	return opts, nil
+}
+
+// StatusOpts holds parsed arguments for `agbox status`.
+type StatusOpts struct {
+	AllowRoot bool
+}
+
+// ParseStatusArgs parses CLI arguments for `status`.
+func ParseStatusArgs(args []string) (StatusOpts, error) {
+	var opts StatusOpts
+	for _, a := range args {
+		switch a {
+		case "-h", "--help":
+			return StatusOpts{}, ErrHelp
+		case "--allow-root":
+			opts.AllowRoot = true
+		default:
+			return StatusOpts{}, fmt.Errorf("unknown status option: %s (expected --allow-root)", a)
+		}
+	}
+	return opts, nil
+}
+
 // CreateBaseOpts holds parsed arguments for `agbox create-base`.
 type CreateBaseOpts struct {
 	Agent      string
 	Force      bool
+	AllowRoot  bool
 	Categories []msb.Category
 }
 
@@ -50,6 +144,8 @@ func ParseCreateBaseArgs(args []string) (CreateBaseOpts, error) {
 			return CreateBaseOpts{}, ErrHelp
 		case "--force":
 			opts.Force = true
+		case "--allow-root":
+			opts.AllowRoot = true
 		case "--add", "--categories":
 			if i+1 >= len(args) || args[i+1] == "" {
 				return CreateBaseOpts{}, fmt.Errorf("%s requires at least one category name (%s, or all)", a, msb.CategoryNamesList())
@@ -64,13 +160,13 @@ func ParseCreateBaseArgs(args []string) (CreateBaseOpts, error) {
 		}
 	}
 	if len(pos) != 1 {
-		return CreateBaseOpts{}, errors.New("Usage: agbox create-base [--force] [--add <categories>] <opencode|antigravity|both>")
+		return CreateBaseOpts{}, errors.New("Usage: agbox create-base [--force] [--allow-root] [--add <categories>] <opencode|antigravity|both>")
 	}
 	switch pos[0] {
 	case "opencode", "antigravity", "both":
 		opts.Agent = pos[0]
 	default:
-		return CreateBaseOpts{}, errors.New("Usage: agbox create-base [--force] [--add <categories>] <opencode|antigravity|both>")
+		return CreateBaseOpts{}, errors.New("Usage: agbox create-base [--force] [--allow-root] [--add <categories>] <opencode|antigravity|both>")
 	}
 	if len(catSpecs) > 0 {
 		cats, err := msb.ResolveCategories(catSpecs)
@@ -88,6 +184,7 @@ type EditBaseOpts struct {
 	NoSnap     bool
 	Shell      bool
 	ListOnly   bool
+	AllowRoot  bool
 	Categories []msb.Category
 }
 
@@ -101,6 +198,8 @@ func ParseEditBaseArgs(args []string) (EditBaseOpts, error) {
 		switch args[i] {
 		case "-h", "--help":
 			return EditBaseOpts{}, ErrHelp
+		case "--allow-root":
+			opts.AllowRoot = true
 		case "--list", "--list-categories":
 			opts.ListOnly = true
 		case "--shell":
@@ -121,7 +220,7 @@ func ParseEditBaseArgs(args []string) (EditBaseOpts, error) {
 			opts.NoSnap = true
 		default:
 			if strings.HasPrefix(args[i], "-") {
-				return EditBaseOpts{}, fmt.Errorf("unknown edit-base option: %s (use: --add <cats> | --list | --shell | --cmd \"shell\" | --no-snap)", args[i])
+				return EditBaseOpts{}, fmt.Errorf("unknown edit-base option: %s (use: --allow-root | --add <cats> | --list | --shell | --cmd \"shell\" | --no-snap)", args[i])
 			}
 			catSpecs = append(catSpecs, args[i])
 		}
@@ -136,10 +235,111 @@ func ParseEditBaseArgs(args []string) (EditBaseOpts, error) {
 	return opts, nil
 }
 
+// SandboxPrefix precedes every agbox sandbox name.
+const SandboxPrefix = "agbox-"
+
+// ValidateRunName checks a user-supplied `--name` value for `agbox run`.
+func ValidateRunName(raw string) (string, error) {
+	if raw == "" {
+		return "", errors.New("--name requires a non-empty sandbox name")
+	}
+	if len(raw) > 63 {
+		return "", errors.New("--name must be 63 characters or fewer")
+	}
+	if raw == "base" {
+		return "", errors.New("name \"base\" is reserved for agbox-base")
+	}
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 {
+			if !isAlphaNum {
+				return "", fmt.Errorf("invalid --name %q: must start with an ASCII letter or digit", raw)
+			}
+			continue
+		}
+		if !isAlphaNum && c != '-' && c != '_' {
+			return "", fmt.Errorf("invalid --name %q: use only ASCII letters, digits, '-' or '_'", raw)
+		}
+	}
+	return raw, nil
+}
+
+// FormatRunSandboxName returns `agbox-<name>` when name is set, or `agbox-run-<pid>`.
+func FormatRunSandboxName(name string, pid int) string {
+	if name != "" {
+		return SandboxPrefix + name
+	}
+	return fmt.Sprintf("%s-%d", config.RunPrefix, pid)
+}
+
+// IsRunSandboxName reports whether sandbox is a valid `agbox-<name>` or `agbox-run-<pid>` name.
+func IsRunSandboxName(sandbox string) bool {
+	if sandbox == config.BaseSandbox || !strings.HasPrefix(sandbox, SandboxPrefix) {
+		return false
+	}
+	suffix := strings.TrimPrefix(sandbox, SandboxPrefix)
+	_, err := ValidateRunName(suffix)
+	return err == nil
+}
+
+// RunDirIDFromSandbox maps a run sandbox name to its collision-free directory name under `$DATA_DIR/run`.
+func RunDirIDFromSandbox(sandbox string) (string, error) {
+	if !IsRunSandboxName(sandbox) {
+		return "", fmt.Errorf("invalid agbox run sandbox %q", sandbox)
+	}
+	runPIDPrefix := config.RunPrefix + "-"
+	if strings.HasPrefix(sandbox, runPIDPrefix) {
+		pidStr := strings.TrimPrefix(sandbox, runPIDPrefix)
+		if isDigits(pidStr) {
+			return pidStr, nil
+		}
+	}
+	suffix := strings.TrimPrefix(sandbox, SandboxPrefix)
+	if isDigits(suffix) {
+		return "_" + suffix, nil
+	}
+	return suffix, nil
+}
+
+// SandboxFromRunDirID maps a directory name under `$DATA_DIR/run` back to its sandbox name.
+func SandboxFromRunDirID(dirID string) (string, bool) {
+	if dirID == "" {
+		return "", false
+	}
+	if isDigits(dirID) {
+		return config.RunPrefix + "-" + dirID, true
+	}
+	if strings.HasPrefix(dirID, "_") && isDigits(dirID[1:]) {
+		return SandboxPrefix + dirID[1:], true
+	}
+	if strings.HasPrefix(dirID, "run-") && isDigits(strings.TrimPrefix(dirID, "run-")) {
+		return "", false
+	}
+	if _, err := ValidateRunName(dirID); err != nil {
+		return "", false
+	}
+	return SandboxPrefix + dirID, true
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // RunOpts holds parsed arguments for `agbox run`.
 type RunOpts struct {
+	Name          string
 	Agent         string
 	Paths         []string
+	AllowRoot     bool
 	ReadOnly      bool
 	Detach        bool
 	Serve         bool
@@ -155,11 +355,10 @@ type RunOpts struct {
 }
 
 // ParseRunArgs parses CLI arguments for `run`.
-// Options must appear before shared paths. Use `--` to pass a path that begins
-// with `-`.
+// Options must appear before shared paths. Pass `--` before paths that start with `-`.
 func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(string) bool) (RunOpts, error) {
 	if defaultMask == "" {
-		defaultMask = config.MaskAuto
+		defaultMask = config.MaskStrict
 	}
 	if pathExists == nil {
 		pathExists = func(p string) bool {
@@ -181,9 +380,17 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			opts.Paths = append(opts.Paths, args[i+1:]...)
 			break
 		}
-		// Enforce that all option flags appear before any shared paths.
 		if len(opts.Paths) > 0 && strings.HasPrefix(arg, "-") {
 			return RunOpts{}, fmt.Errorf("options must come before paths (found %s after path %q)", arg, opts.Paths[len(opts.Paths)-1])
+		}
+
+		if strings.HasPrefix(arg, "--name=") {
+			validName, nErr := ValidateRunName(strings.TrimPrefix(arg, "--name="))
+			if nErr != nil {
+				return RunOpts{}, nErr
+			}
+			opts.Name = validName
+			continue
 		}
 
 		switch arg {
@@ -193,6 +400,18 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			} else {
 				opts.Paths = append(opts.Paths, arg)
 			}
+		case "--name":
+			if i+1 >= len(args) {
+				return RunOpts{}, errors.New("--name requires a non-empty sandbox name")
+			}
+			validName, nErr := ValidateRunName(args[i+1])
+			if nErr != nil {
+				return RunOpts{}, nErr
+			}
+			opts.Name = validName
+			i++
+		case "--allow-root":
+			opts.AllowRoot = true
 		case "--ro":
 			opts.ReadOnly = true
 		case "-d", "--detach":
@@ -243,7 +462,10 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			if i+1 >= len(args) || args[i+1] == "" {
 				return RunOpts{}, errors.New("--memory requires a size value (for example, 2G or 2048M)")
 			}
-			opts.Memory = args[i+1]
+			if !isValidMemorySpec(args[i+1]) {
+				return RunOpts{}, fmt.Errorf("invalid --memory %q: expected a positive size in M or G (for example, 2G or 2048M)", args[i+1])
+			}
+			opts.Memory = strings.ToUpper(strings.TrimSpace(args[i+1]))
 			i++
 		case "--mask-vcs":
 			opts.MaskMode = config.MaskStrict
@@ -273,9 +495,7 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	return opts, nil
 }
 
-// SelectEffectiveAgent checks and resolves which agent binary to run.
-// It compares the base image's configured agent ("opencode", "antigravity", or "both")
-// with the per-run options.
+// SelectEffectiveAgent resolves which agent binary to run from the base agent and run flags.
 func SelectEffectiveAgent(baseAgent string, opts RunOpts) (string, error) {
 	if baseAgent == "" {
 		baseAgent = "both"
@@ -311,44 +531,168 @@ func SelectEffectiveAgent(baseAgent string, opts RunOpts) (string, error) {
 	return agent, nil
 }
 
+// SuspendOpts holds parsed arguments for `agbox suspend`.
+type SuspendOpts struct {
+	Sandbox   string
+	AllowRoot bool
+}
+
+// ParseSuspendArgs validates CLI arguments for `agbox suspend`.
+func ParseSuspendArgs(args []string) (SuspendOpts, error) {
+	var opts SuspendOpts
+	var pos []string
+	for _, a := range args {
+		switch a {
+		case "-h", "--help":
+			return SuspendOpts{}, ErrHelp
+		case "--allow-root":
+			opts.AllowRoot = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				return SuspendOpts{}, fmt.Errorf("unknown suspend option: %s (expected --allow-root)", a)
+			}
+			pos = append(pos, a)
+		}
+	}
+	if len(pos) != 1 {
+		return SuspendOpts{}, errors.New("Usage: agbox suspend [--allow-root] <sandbox>")
+	}
+	name, err := validateTargetRunSandbox(pos[0], "suspend")
+	if err != nil {
+		return SuspendOpts{}, err
+	}
+	opts.Sandbox = name
+	return opts, nil
+}
+
+// ResumeOpts holds parsed arguments for `agbox resume`.
+type ResumeOpts struct {
+	Sandbox   string
+	AllowRoot bool
+	Detach    bool
+}
+
+// ParseResumeArgs validates CLI arguments for `agbox resume`.
+func ParseResumeArgs(args []string) (ResumeOpts, error) {
+	var opts ResumeOpts
+	var pos []string
+	for _, a := range args {
+		switch a {
+		case "-h", "--help":
+			return ResumeOpts{}, ErrHelp
+		case "--allow-root":
+			opts.AllowRoot = true
+		case "-d", "--detach":
+			opts.Detach = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				return ResumeOpts{}, fmt.Errorf("unknown resume option: %s (expected --allow-root or --detach)", a)
+			}
+			pos = append(pos, a)
+		}
+	}
+	if len(pos) != 1 {
+		return ResumeOpts{}, errors.New("Usage: agbox resume [--allow-root] [-d|--detach] <sandbox>")
+	}
+	name, err := validateTargetRunSandbox(pos[0], "resume")
+	if err != nil {
+		return ResumeOpts{}, err
+	}
+	opts.Sandbox = name
+	return opts, nil
+}
+
 // ParseStopArgs validates the sandbox name argument for `agbox stop`.
 func ParseStopArgs(args []string) (string, error) {
-	if len(args) == 0 {
-		return "", errors.New("Usage: agbox stop <sandbox>")
+	name, _, err := parseStopOpts(args)
+	return name, err
+}
+
+func parseStopOpts(args []string) (name string, allowRoot bool, err error) {
+	var pos []string
+	for _, a := range args {
+		switch a {
+		case "-h", "--help":
+			return "", false, ErrHelp
+		case "--allow-root":
+			allowRoot = true
+		default:
+			if strings.HasPrefix(a, "-") {
+				return "", false, fmt.Errorf("unknown stop option: %s (expected --allow-root)", a)
+			}
+			pos = append(pos, a)
+		}
 	}
-	if args[0] == "-h" || args[0] == "--help" {
-		return "", ErrHelp
+	if len(pos) != 1 {
+		return "", false, errors.New("Usage: agbox stop [--allow-root] <sandbox>")
 	}
-	name := args[0]
+	validName, vErr := validateTargetRunSandbox(pos[0], "stop")
+	if vErr != nil {
+		return "", false, vErr
+	}
+	return validName, allowRoot, nil
+}
+
+func validateTargetRunSandbox(name, verb string) (string, error) {
 	if name == config.BaseSandbox {
-		return "", fmt.Errorf("refusing to discard %q: it is the persistent base sandbox (use 'msb stop %s' or 'agbox remove')", name, name)
+		return "", fmt.Errorf("refusing to %s %q: it is the base sandbox", verb, name)
 	}
-	prefix := config.RunPrefix + "-"
-	if !strings.HasPrefix(name, prefix) {
-		return "", fmt.Errorf("refusing to stop %q: not an agbox run sandbox (%s<pid>)", name, prefix)
+	if !IsRunSandboxName(name) {
+		return "", fmt.Errorf("refusing to %s %q: not an agbox run sandbox (agbox-<name>)", verb, name)
 	}
 	return name, nil
 }
 
 // ParseRemoveArgs parses CLI arguments for `agbox remove`.
 func ParseRemoveArgs(args []string) (yes bool, err error) {
+	yes, _, err = parseRemoveOpts(args)
+	return yes, err
+}
+
+func parseRemoveOpts(args []string) (yes bool, allowRoot bool, err error) {
 	for _, a := range args {
 		switch a {
 		case "-y", "--yes":
 			yes = true
+		case "--allow-root":
+			allowRoot = true
 		case "-h", "--help":
-			return false, ErrHelp
+			return false, false, ErrHelp
 		default:
-			return false, fmt.Errorf("unknown remove option: %s (expected --yes or -y)", a)
+			return false, false, fmt.Errorf("unknown remove option: %s (expected --yes, -y, or --allow-root)", a)
 		}
 	}
-	return yes, nil
+	return yes, allowRoot, nil
 }
 
 // DataDirSupportsFilter reports whether dataDir is safe to use as a FUSE
-// mountpoint parent (no whitespace or backslashes).
+// mountpoint parent (no whitespace, backslashes, or control characters).
 func DataDirSupportsFilter(dataDir string) bool {
-	return dataDir != "" && !strings.ContainsAny(dataDir, " \t\n\r\\")
+	if dataDir == "" || strings.ContainsAny(dataDir, " \t\n\r\\") {
+		return false
+	}
+	for _, r := range dataDir {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidMemorySpec(spec string) bool {
+	s := strings.ToUpper(strings.TrimSpace(spec))
+	if len(s) < 2 {
+		return false
+	}
+	unit := s[len(s)-1]
+	if unit != 'M' && unit != 'G' {
+		return false
+	}
+	num := s[:len(s)-1]
+	if num[0] == '0' {
+		return false
+	}
+	return isDigits(num)
 }
 
 // PickFreeLoopbackPort binds 127.0.0.1:0 momentarily to obtain an unused
@@ -379,6 +723,7 @@ type App struct {
 	IsTTY       func() bool
 	GetEUID     func() int
 	CheckKVM    func() error
+	CheckFUSE   func() error
 	PID         int
 	StartFilter func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error)
 	WaitServeUI func(ctx context.Context, port int, sandbox string) bool
@@ -414,6 +759,9 @@ func NewApp() (*App, error) {
 		GetEUID:  os.Geteuid,
 		CheckKVM: checkKVMAccess,
 		PID:      os.Getpid(),
+	}
+	app.CheckFUSE = func() error {
+		return vcsfuse.CheckHostSupport(app.Env.DataDir)
 	}
 	app.StartFilter = func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error) {
 		return vcsfuse.StartSubprocess(app.ExePath, srcDir, mntDir, pidFile, dieWithParent)
@@ -453,9 +801,28 @@ func (a *App) ensureMSB() error {
 	return nil
 }
 
-func (a *App) requireSetup() error {
-	if a.GetEUID != nil && a.GetEUID() == 0 {
-		return errors.New("do not run as root. agbox uses your normal user and /dev/kvm")
+func (a *App) isRoot() bool {
+	return a.GetEUID != nil && a.GetEUID() == 0
+}
+
+func (a *App) verifyUser(allowRootFlag bool) error {
+	euid := 1000
+	if a.GetEUID != nil {
+		euid = a.GetEUID()
+	}
+	warnSrc, err := CheckRootExecution(euid, a.Env.AllowRoot, allowRootFlag)
+	if err != nil {
+		return err
+	}
+	if warnSrc != "" {
+		a.warnf("Root mode is active (%s).", warnSrc)
+	}
+	return nil
+}
+
+func (a *App) requireSetup(allowRootFlag bool) error {
+	if err := a.verifyUser(allowRootFlag); err != nil {
+		return err
 	}
 	if err := a.ensureMSB(); err != nil {
 		return err
@@ -498,8 +865,8 @@ func defaultStr(v, fallback string) string {
 	return v
 }
 
-// ReapOrphanRuns deletes any `agbox-run-<pid>` microVMs whose host PID is no
-// longer active. It skips detached runs recorded in `$DATA_DIR/run/<pid>/detached`.
+// ReapOrphanRuns deletes run microVMs whose host owner PID is no longer active.
+// It skips running detached sandboxes and stopped or running suspended sandboxes.
 func (a *App) ReapOrphanRuns(ctx context.Context) {
 	if a.MSB == nil {
 		return
@@ -508,30 +875,39 @@ func (a *App) ReapOrphanRuns(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	prefix := config.RunPrefix + "-"
+	runPIDPrefix := config.RunPrefix + "-"
 	for _, sb := range msb.ParseSandboxList(res.Stdout) {
-		if !strings.HasPrefix(sb.Name, prefix) {
+		if !IsRunSandboxName(sb.Name) {
 			continue
 		}
-		pidStr := strings.TrimPrefix(sb.Name, prefix)
-		pid, err := strconv.Atoi(pidStr)
-		if err != nil || pid <= 0 || pid == a.PID {
+		dirID, dErr := RunDirIDFromSandbox(sb.Name)
+		if dErr != nil {
 			continue
 		}
-		if isPIDAlive(pid) {
+		dir := filepath.Join(a.Env.DataDir, "run", dirID)
+		if hasMarker(filepath.Join(dir, "suspended")) {
 			continue
 		}
-		detachedFile := filepath.Join(a.Env.DataDir, "run", pidStr, "detached")
-		if _, err := os.Stat(detachedFile); err == nil && sb.Running {
+		if hasMarker(filepath.Join(dir, "detached")) && sb.Running {
+			continue
+		}
+		ownerPID := 0
+		if meta, mErr := config.LoadRunMeta(filepath.Join(dir, "run.meta")); mErr == nil && meta.OwnerPID > 0 {
+			ownerPID = meta.OwnerPID
+		} else if strings.HasPrefix(sb.Name, runPIDPrefix) {
+			if pid, pErr := strconv.Atoi(strings.TrimPrefix(sb.Name, runPIDPrefix)); pErr == nil && pid > 0 {
+				ownerPID = pid
+			}
+		}
+		if ownerPID <= 0 || ownerPID == a.PID || isPIDAlive(ownerPID) {
 			continue
 		}
 		_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", sb.Name}})
 	}
 }
 
-// ReapStaleFilterDirs unmounts and deletes any `$DATA_DIR/run/<pid>` directory
-// whose host PID is no longer active. It skips directories that belong to an
-// active detached `--serve` microVM.
+// ReapStaleFilterDirs unmounts and deletes stale `$DATA_DIR/run/<id>` directories.
+// It skips active owners, running detached sandboxes, and suspended sandboxes.
 func (a *App) ReapStaleFilterDirs(ctx context.Context) {
 	runRoot := filepath.Join(a.Env.DataDir, "run")
 	entries, err := os.ReadDir(runRoot)
@@ -539,9 +915,11 @@ func (a *App) ReapStaleFilterDirs(ctx context.Context) {
 		return
 	}
 	var sandboxes []msb.SandboxInfo
+	listedSandboxes := false
 	if a.MSB != nil {
 		if res, lErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}}); lErr == nil {
 			sandboxes = msb.ParseSandboxList(res.Stdout)
+			listedSandboxes = true
 		}
 	}
 
@@ -549,21 +927,96 @@ func (a *App) ReapStaleFilterDirs(ctx context.Context) {
 		if !entry.IsDir() {
 			continue
 		}
-		pidStr := entry.Name()
-		pid, err := strconv.Atoi(pidStr)
-		if err != nil || pid == a.PID || isPIDAlive(pid) {
-			continue
+		dirID := entry.Name()
+		dir := filepath.Join(runRoot, dirID)
+
+		suspendedFile := filepath.Join(dir, "suspended")
+		if hasMarker(suspendedFile) {
+			if !listedSandboxes {
+				continue
+			}
+			sbxName := ""
+			if meta, mErr := config.LoadRunMeta(suspendedFile); mErr == nil {
+				sbxName = meta.Sandbox
+			} else if inferred, ok := SandboxFromRunDirID(dirID); ok {
+				sbxName = inferred
+			}
+			if sbxName != "" {
+				if _, ok := msb.FindSandbox(sandboxes, sbxName); ok {
+					continue
+				}
+			}
 		}
-		dir := filepath.Join(runRoot, pidStr)
+
 		detachedFile := filepath.Join(dir, "detached")
 		if raw, err := os.ReadFile(detachedFile); err == nil {
+			if !listedSandboxes {
+				continue
+			}
 			sbxName := strings.TrimSpace(string(raw))
 			if sb, ok := msb.FindSandbox(sandboxes, sbxName); ok && sb.Running {
 				continue
 			}
 		}
+
+		ownerPID := 0
+		if meta, mErr := config.LoadRunMeta(filepath.Join(dir, "run.meta")); mErr == nil && meta.OwnerPID > 0 {
+			ownerPID = meta.OwnerPID
+		} else if pid, pErr := strconv.Atoi(dirID); pErr == nil && pid > 0 {
+			ownerPID = pid
+		}
+		if ownerPID > 0 {
+			if ownerPID == a.PID || isPIDAlive(ownerPID) {
+				continue
+			}
+		} else if listedSandboxes {
+			if inferred, ok := SandboxFromRunDirID(dirID); ok {
+				if sb, found := msb.FindSandbox(sandboxes, inferred); found && sb.Running {
+					continue
+				}
+			}
+		}
 		_ = mounttab.TeardownFilterDir(dir, a.MountCtl)
 	}
+}
+
+func hasMarker(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
+func writeMarkerAtomic(path, content string) error {
+	dir := filepath.Dir(path)
+	if err := config.EnsurePrivateDir(dir); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".marker.*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 func isPIDAlive(pid int) bool {
@@ -574,16 +1027,26 @@ func isPIDAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-// Setup verifies host prerequisites (non-root user, glibc, msb, /dev/kvm,
-// msb doctor, and a microVM smoke test) and initializes DATA_DIR.
-func (a *App) Setup(ctx context.Context) error {
+// Setup checks host prerequisites (user, DATA_DIR, FUSE, msb, /dev/kvm,
+// msb doctor, and an offline microVM smoke test).
+func (a *App) Setup(ctx context.Context, args []string) error {
+	opts, err := ParseSetupArgs(args)
+	if err != nil {
+		return err
+	}
 	a.logf("Checking host...")
-	if a.GetEUID != nil && a.GetEUID() == 0 {
-		return errors.New("run this as your normal user, not as root")
+	if err := a.verifyUser(opts.AllowRoot); err != nil {
+		return err
+	}
+	if !DataDirSupportsFilter(a.Env.DataDir) {
+		return fmt.Errorf("DATA_DIR (%s) cannot contain whitespace, backslashes, or control characters", a.Env.DataDir)
+	}
+	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+		return fmt.Errorf("prepare data dir %s: %w", a.Env.DataDir, err)
 	}
 
 	if err := a.ensureMSB(); err != nil {
-		return fmt.Errorf("%w (run ./install.sh or 'curl -fsSL https://install.microsandbox.dev | sh')", err)
+		return fmt.Errorf("%w (run ./install.sh or 'curl --proto \"=https\" --tlsv1.2 -fsSL https://install.microsandbox.dev | sh')", err)
 	}
 	if verRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"--version"}}); err == nil {
 		firstLine, _, _ := strings.Cut(strings.TrimSpace(verRes.Stdout), "\n")
@@ -595,22 +1058,39 @@ func (a *App) Setup(ctx context.Context) error {
 		kvmCheck = checkKVMAccess
 	}
 	if err := kvmCheck(); err != nil {
+		if a.isRoot() {
+			return fmt.Errorf("%w\nEnsure /dev/kvm exists and load the KVM kernel module (kvm_intel or kvm_amd)", err)
+		}
 		return fmt.Errorf("%w\nGrant access with: sudo usermod -aG kvm $(id -un) (then re-login) or sudo setfacl -m u:$(id -un):rw /dev/kvm", err)
 	}
 	a.logf("/dev/kvm accessible: OK")
+
+	fuseCheck := a.CheckFUSE
+	if fuseCheck == nil {
+		fuseCheck = func() error {
+			return vcsfuse.CheckHostSupport(a.Env.DataDir)
+		}
+	}
+	if err := fuseCheck(); err != nil {
+		return fmt.Errorf("FUSE VCS filter check failed: %w", err)
+	}
+	a.logf("FUSE VCS filter accessible: OK")
 
 	a.logf("Running msb doctor...")
 	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"doctor"}, Interactive: true}); err != nil {
 		return fmt.Errorf("msb doctor reported problems: %w", err)
 	}
 
-	a.logf("Smoke test: booting an alpine microVM...")
+	a.logf("Smoke test: booting an offline alpine microVM...")
 	smoke := fmt.Sprintf("%s-%d", config.RunPrefix, a.PID)
+	smokeRemoved := false
 	defer func() {
-		_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", smoke}})
+		if !smokeRemoved {
+			_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", smoke}})
+		}
 	}()
 	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"create", "alpine", "--name", smoke, "--cpus", "1", "--memory", "256M"},
+		Args: []string{"create", "alpine", "--name", smoke, "--cpus", "1", "--memory", "256M", "--no-net"},
 	}); err != nil {
 		return fmt.Errorf("could not boot smoke-test sandbox: %w", err)
 	}
@@ -620,15 +1100,18 @@ func (a *App) Setup(ctx context.Context) error {
 	if err != nil || !strings.Contains(execRes.Stdout, "SMOKE-OK") {
 		return errors.New("smoke test failed: cannot run commands in a sandbox")
 	}
-	_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", smoke}})
+	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", smoke}}); err != nil {
+		return fmt.Errorf("delete smoke-test sandbox %s: %w", smoke, err)
+	}
+	smokeRemoved = true
 	a.logf("Smoke test: OK (guest boots, exec works, teardown clean)")
 
-	if err := os.MkdirAll(a.Env.DataDir, 0o700); err != nil {
-		return fmt.Errorf("create data dir %s: %w", a.Env.DataDir, err)
-	}
-	_ = os.Chmod(a.Env.DataDir, 0o700)
 	a.logf("Embedded FUSE VCS filter ready (single binary: %s).", a.ExePath)
-	a.logf("Setup complete. Next: agbox create-base <opencode|antigravity|both>")
+	if a.isRoot() {
+		a.logf("Setup complete. Next: agbox create-base --allow-root <opencode|antigravity|both>")
+	} else {
+		a.logf("Setup complete. Next: agbox create-base <opencode|antigravity|both>")
+	}
 	return nil
 }
 
@@ -639,8 +1122,11 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := a.requireSetup(); err != nil {
+	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
+	}
+	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+		return fmt.Errorf("prepare data dir %s: %w", a.Env.DataDir, err)
 	}
 
 	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
@@ -649,7 +1135,9 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 			_, confErr := os.Stat(a.Env.ConfigFile)
 			if opts.Force || os.IsNotExist(confErr) {
 				a.logf("Replacing existing base sandbox %q...", config.BaseSandbox)
-				_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", config.BaseSandbox}})
+				if _, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", config.BaseSandbox}}); rmErr != nil {
+					return fmt.Errorf("delete existing base sandbox %q: %w", config.BaseSandbox, rmErr)
+				}
 			} else {
 				return fmt.Errorf("base sandbox %q already exists. Edit it with 'agbox edit-base' or rebuild with 'agbox create-base --force %s'", config.BaseSandbox, opts.Agent)
 			}
@@ -671,6 +1159,7 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 		Memory:   a.Env.Memory,
 		RootDisk: a.Env.RootDisk,
 		Workdir:  msb.GuestWorkspace,
+		NetSpecs: []string{"public"},
 	})
 	if err != nil {
 		return err
@@ -720,7 +1209,7 @@ su - %q -c "opencode --version"`, config.GuestUser)
 
 	if opts.Agent == "antigravity" || opts.Agent == "both" {
 		a.logf("Installing Google Antigravity CLI (agy) from %s...", a.Env.AgyInstallerURL)
-		innerCmd := fmt.Sprintf("curl -fsSL %s | bash", msb.ShellQuote(a.Env.AgyInstallerURL))
+		innerCmd := fmt.Sprintf("curl --proto '=https' --tlsv1.2 -fsSL -- %s | bash", msb.ShellQuote(a.Env.AgyInstallerURL))
 		agyScript := fmt.Sprintf(`set -euo pipefail
 su - %s -c %s
 if [ -x /home/agent/.local/bin/agy ]; then
@@ -819,7 +1308,7 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 		fmt.Fprint(a.Stdout, msb.FormatCategoriesTable())
 		return nil
 	}
-	if err := a.requireSetup(); err != nil {
+	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
 	}
 	st, err := a.requireBase(ctx)
@@ -906,13 +1395,20 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 		}
 	}
 
-	_ = a.provisionGuestUser(ctx, config.BaseSandbox)
+	if err := a.provisionGuestUser(ctx, config.BaseSandbox); err != nil {
+		_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}})
+		return fmt.Errorf("guest user check failed: %w", err)
+	}
 
 	a.logf("Stopping base...")
-	_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}})
+	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}}); err != nil {
+		return fmt.Errorf("stop base sandbox: %w", err)
+	}
 
 	if opts.NoSnap {
-		_ = config.SaveFile(a.Env.ConfigFile, st)
+		if err := config.SaveFile(a.Env.ConfigFile, st); err != nil {
+			return fmt.Errorf("save config: %w", err)
+		}
 		a.logf("Edits live in %q but were NOT snapshotted (--no-snap).", config.BaseSandbox)
 		return nil
 	}
@@ -1000,17 +1496,15 @@ func parseSizeBytes(spec string) (int64, bool) {
 	return n * mult, true
 }
 
-// Run restores an ephemeral `agbox-run-<pid>` microVM from the base snapshot.
-// It mounts validated host paths (with FUSE VCS filtering for directories),
-// streams API keys over stdin into `/home/agent/.agbox-keys.sh`, and runs the
-// requested agent or command as `agent` (1000:1000). On exit, Run deletes the
-// microVM and unmounts all FUSE shares.
+// Run restores an ephemeral microVM from the base snapshot.
+// It validates and mounts host paths, streams API keys over stdin, and runs the agent.
+// On exit, Run deletes the microVM and unmounts all FUSE shares unless suspended or detached.
 func (a *App) Run(ctx context.Context, args []string) error {
 	opts, err := ParseRunArgs(args, a.Env.MaskVCS, nil)
 	if err != nil {
 		return err
 	}
-	if err := a.requireSetup(); err != nil {
+	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
 	}
 	baseState, err := a.requireBase(ctx)
@@ -1037,20 +1531,33 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("invalid mask mode %q", opts.MaskMode)
 	}
 	if maskStrict && !DataDirSupportsFilter(a.Env.DataDir) {
-		return fmt.Errorf("--mask-vcs requested but DATA_DIR (%s) contains whitespace or backslashes", a.Env.DataDir)
+		return fmt.Errorf("DATA_DIR (%s) cannot contain whitespace or backslashes when VCS masking is active", a.Env.DataDir)
 	}
 
 	a.ReapOrphanRuns(ctx)
 	a.ReapStaleFilterDirs(ctx)
 
-	pol := pathsec.Policy{
-		HomeReal:         a.Env.HomeReal,
-		AllowOutsideHome: a.Env.AllowOutsideHome,
-		ReadOnly:         opts.ReadOnly,
-		Blocklist:        pathsec.DefaultBlocklist(a.Env.HomeReal, a.Env.DataDir, a.Env.MSBHome),
-		VCSNames:         pathsec.DefaultVCSNames(),
+	runSandbox := FormatRunSandboxName(opts.Name, a.PID)
+	dirID, err := RunDirIDFromSandbox(runSandbox)
+	if err != nil {
+		return err
 	}
 
+	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
+	if err != nil {
+		return fmt.Errorf("list sandboxes: %w", err)
+	}
+	if existing, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), runSandbox); exists {
+		if hasMarker(filepath.Join(a.Env.DataDir, "run", dirID, "suspended")) {
+			return fmt.Errorf("sandbox %q is suspended. Run 'agbox resume %s' or 'agbox stop %s'", runSandbox, runSandbox, runSandbox)
+		}
+		if existing.Running {
+			return fmt.Errorf("sandbox %q is already running. Stop it with 'agbox stop %s'", runSandbox, runSandbox)
+		}
+		return fmt.Errorf("sandbox %q already exists. Delete it with 'agbox stop %s'", runSandbox, runSandbox)
+	}
+
+	pol := a.sharePolicy(opts.ReadOnly)
 	var validated []pathsec.ShareTarget
 	for _, rawPath := range opts.Paths {
 		if rawPath == "" {
@@ -1082,27 +1589,57 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	isDetachedRC := opts.RemoteControl && (opts.Detach || a.IsTTY == nil || !a.IsTTY())
 	if !opts.Serve && !isDetachedRC && opts.Cmd == "" {
 		if a.IsTTY == nil || !a.IsTTY() {
-			return fmt.Errorf("the %s TUI requires a TTY (or use --serve / --remote-control -d / --cmd)", effectiveAgent)
+			return fmt.Errorf("the %s TUI requires a TTY (or pass --serve, --remote-control -d, or --cmd)", effectiveAgent)
 		}
 	}
 
-	dieWithParent := !(isDetachedServe || isDetachedRC)
+	var runMode config.RunMode
+	switch {
+	case opts.Cmd != "":
+		runMode = config.RunModeCmd
+	case opts.Serve:
+		runMode = config.RunModeServe
+	case isDetachedRC:
+		runMode = config.RunModeRemoteControl
+	default:
+		runMode = config.RunModeTUI
+	}
+
+	isDetached := isDetachedServe || isDetachedRC
+	dieWithParent := !isDetached
+
+	runRootDir := filepath.Join(a.Env.DataDir, "run")
+	runFilterDir := filepath.Join(runRootDir, dirID)
+	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+		return fmt.Errorf("prepare data dir: %w", err)
+	}
+	if err := config.EnsurePrivateDir(runRootDir); err != nil {
+		return fmt.Errorf("prepare run root dir: %w", err)
+	}
+	if err := config.EnsurePrivateDir(runFilterDir); err != nil {
+		return fmt.Errorf("prepare run dir: %w", err)
+	}
 
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
-	runSandbox := fmt.Sprintf("%s-%d", config.RunPrefix, a.PID)
-	runFilterDir := ""
+	suspendedPath := filepath.Join(runFilterDir, "suspended")
+	sandboxCreated := false
 	detached := false
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
-			if !detached {
-				_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", runSandbox}})
-				if runFilterDir != "" {
-					_ = mounttab.TeardownFilterDir(runFilterDir, a.MountCtl)
-				}
+			if detached {
+				return
 			}
+			if hasMarker(suspendedPath) {
+				_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+				return
+			}
+			if sandboxCreated {
+				_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", runSandbox}})
+			}
+			_ = mounttab.TeardownFilterDir(runFilterDir, a.MountCtl)
 		})
 	}
 	defer cleanup()
@@ -1120,42 +1657,52 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	}()
 
 	var volumes []msb.VolumeSpec
+	var shareRecords []config.ShareRecord
 	maskedCount := 0
 	directCount := 0
 	for i, target := range validated {
 		guestPath := msb.GuestWorkspace + "/" + target.GuestName
-		if target.IsDir && useMask && a.StartFilter != nil {
-			if runFilterDir == "" {
-				runFilterDir = filepath.Join(a.Env.DataDir, "run", strconv.Itoa(a.PID))
-				if err := os.MkdirAll(runFilterDir, 0o700); err != nil {
-					return fmt.Errorf("create filter dir: %w", err)
+		masked := false
+		if target.IsDir && useMask {
+			if a.StartFilter == nil {
+				if maskStrict {
+					return errors.New("FUSE filter starter is not configured")
 				}
-				_ = os.Chmod(runFilterDir, 0o700)
-			}
-			mntDir := filepath.Join(runFilterDir, fmt.Sprintf("m%d", i))
-			pidFile := mntDir + ".pid"
-			if _, fErr := a.StartFilter(target.HostPath, mntDir, pidFile, dieWithParent); fErr == nil {
-				volumes = append(volumes, msb.VolumeSpec{
-					HostPath:  mntDir,
-					GuestPath: guestPath,
-					ReadOnly:  opts.ReadOnly,
-				})
-				maskedCount++
-				continue
-			} else if maskStrict {
-				return fmt.Errorf("FUSE filter failed to mount for %s: %w", target.HostPath, fErr)
 			} else {
-				a.warnf("FUSE filter failed for %s (%v). Sharing directly (VCS directory is visible to the guest).", target.HostPath, fErr)
+				mntDir := filepath.Join(runFilterDir, fmt.Sprintf("m%d", i))
+				pidFile := mntDir + ".pid"
+				if _, fErr := a.StartFilter(target.HostPath, mntDir, pidFile, dieWithParent); fErr == nil {
+					volumes = append(volumes, msb.VolumeSpec{
+						HostPath:  mntDir,
+						GuestPath: guestPath,
+						ReadOnly:  opts.ReadOnly,
+					})
+					masked = true
+					maskedCount++
+				} else if maskStrict {
+					return fmt.Errorf("mount FUSE filter for %s: %w", target.HostPath, fErr)
+				} else {
+					a.warnf("FUSE filter failed for %s (%v). Sharing directory without VCS filter.", target.HostPath, fErr)
+				}
 			}
 		}
-		volumes = append(volumes, msb.VolumeSpec{
-			HostPath:  target.HostPath,
-			GuestPath: guestPath,
-			ReadOnly:  opts.ReadOnly,
-		})
-		if target.IsDir {
-			directCount++
+		if !masked {
+			volumes = append(volumes, msb.VolumeSpec{
+				HostPath:  target.HostPath,
+				GuestPath: guestPath,
+				ReadOnly:  opts.ReadOnly,
+			})
+			if target.IsDir {
+				directCount++
+			}
 		}
+		shareRecords = append(shareRecords, config.ShareRecord{
+			Index:     i,
+			HostPath:  target.HostPath,
+			GuestName: target.GuestName,
+			IsDir:     target.IsDir,
+			Masked:    masked,
+		})
 	}
 
 	if maskedCount > 0 {
@@ -1164,6 +1711,23 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			extra = fmt.Sprintf(" (%d direct)", directCount)
 		}
 		a.logf("VCS filter: %d share(s) masked%s.", maskedCount, extra)
+	}
+
+	meta := config.RunMeta{
+		Sandbox:       runSandbox,
+		OwnerPID:      a.PID,
+		Agent:         effectiveAgent,
+		Mode:          runMode,
+		Detached:      isDetached,
+		RemoteControl: opts.RemoteControl,
+		Port:          port,
+		Cmd:           opts.Cmd,
+		ReadOnly:      opts.ReadOnly,
+		MaskMode:      opts.MaskMode,
+		Shares:        shareRecords,
+	}
+	if err := config.SaveRunMeta(filepath.Join(runFilterDir, "run.meta"), meta); err != nil {
+		return fmt.Errorf("save run metadata: %w", err)
 	}
 
 	restoreArgs, err := msb.BuildRestoreArgs(msb.RestoreOpts{
@@ -1181,26 +1745,333 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	a.logf("Booting ephemeral VM %s from %s (nothing here persists to the base)...", runSandbox, baseState.Snapshot)
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: restoreArgs}); err != nil {
+	a.logf("Booting ephemeral microVM %s from %s (changes do not persist to the base)...", runSandbox, baseState.Snapshot)
+	sandboxCreated = true
+	if _, err := a.MSB.Run(runCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
 		return fmt.Errorf("snapshot restore failed: %w", err)
 	}
 
-	// Verify the non-root guest user exists inside the restored VM.
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", "-u", config.GuestUser, runSandbox, "--", "true"},
-	}); err != nil {
-		if pErr := a.provisionGuestUser(ctx, runSandbox); pErr != nil {
-			return fmt.Errorf("could not initialize guest user %q: %w", config.GuestUser, pErr)
+	if err := a.ensureGuestUser(runCtx, runSandbox); err != nil {
+		return err
+	}
+	if err := a.pushKeys(runCtx, runSandbox); err != nil {
+		return err
+	}
+
+	return a.execSession(runCtx, meta, runFilterDir, opts.Probe, &detached)
+}
+
+// Suspend halts a run microVM, saves its metadata, and unmounts host FUSE shares.
+func (a *App) Suspend(ctx context.Context, args []string) error {
+	opts, err := ParseSuspendArgs(args)
+	if err != nil {
+		return err
+	}
+	if err := a.requireSetup(opts.AllowRoot); err != nil {
+		return err
+	}
+	dirID, err := RunDirIDFromSandbox(opts.Sandbox)
+	if err != nil {
+		return err
+	}
+	runRootDir := filepath.Join(a.Env.DataDir, "run")
+	runFilterDir := filepath.Join(runRootDir, dirID)
+	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+		return fmt.Errorf("prepare data dir: %w", err)
+	}
+	if err := config.EnsurePrivateDir(runRootDir); err != nil {
+		return fmt.Errorf("prepare run root dir: %w", err)
+	}
+
+	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
+	if err != nil {
+		return fmt.Errorf("list sandboxes: %w", err)
+	}
+	sb, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), opts.Sandbox)
+	if !exists {
+		return fmt.Errorf("sandbox %q does not exist", opts.Sandbox)
+	}
+
+	suspendedPath := filepath.Join(runFilterDir, "suspended")
+	wasSuspended := hasMarker(suspendedPath)
+	meta, err := config.LoadRunMeta(filepath.Join(runFilterDir, "run.meta"))
+	if err != nil {
+		meta, err = config.LoadRunMeta(suspendedPath)
+	}
+	if err != nil {
+		return fmt.Errorf("load run metadata for %q: %w", opts.Sandbox, err)
+	}
+
+	// Write the suspended marker before calling `msb stop` so a concurrent foreground
+	// session observes the marker during exit cleanup and skips `msb rm -f`.
+	if err := config.SaveRunMeta(suspendedPath, meta); err != nil {
+		return fmt.Errorf("save suspended metadata: %w", err)
+	}
+
+	if sb.Running {
+		a.logf("Stopping microVM %s...", opts.Sandbox)
+		if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", opts.Sandbox}}); err != nil {
+			if !wasSuspended {
+				_ = os.Remove(suspendedPath)
+			}
+			return fmt.Errorf("stop sandbox %s: %w", opts.Sandbox, err)
 		}
 	}
 
-	a.pushKeys(ctx, runSandbox)
+	if rErr := os.Remove(filepath.Join(runFilterDir, "detached")); rErr != nil && !os.IsNotExist(rErr) {
+		return fmt.Errorf("remove detached marker: %w", rErr)
+	}
 
+	if err := mounttab.UnmountFilterDir(runFilterDir, a.MountCtl); err != nil {
+		return fmt.Errorf("unmount FUSE shares for %s: %w", opts.Sandbox, err)
+	}
+
+	a.logf("Suspended %s. Resume with: agbox resume %s", opts.Sandbox, opts.Sandbox)
+	return nil
+}
+
+// Resume validates recorded shares, remounts FUSE filters, boots a suspended microVM, and restarts its agent.
+func (a *App) Resume(ctx context.Context, args []string) error {
+	opts, err := ParseResumeArgs(args)
+	if err != nil {
+		return err
+	}
+	if err := a.requireSetup(opts.AllowRoot); err != nil {
+		return err
+	}
+	dirID, err := RunDirIDFromSandbox(opts.Sandbox)
+	if err != nil {
+		return err
+	}
+	runRootDir := filepath.Join(a.Env.DataDir, "run")
+	runFilterDir := filepath.Join(runRootDir, dirID)
+	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+		return fmt.Errorf("prepare data dir: %w", err)
+	}
+	if err := config.EnsurePrivateDir(runRootDir); err != nil {
+		return fmt.Errorf("prepare run root dir: %w", err)
+	}
+	if err := config.EnsurePrivateDir(runFilterDir); err != nil {
+		return fmt.Errorf("prepare run dir: %w", err)
+	}
+	suspendedPath := filepath.Join(runFilterDir, "suspended")
+
+	meta, err := config.LoadRunMeta(suspendedPath)
+	if err != nil {
+		return fmt.Errorf("sandbox %q is not suspended: %w", opts.Sandbox, err)
+	}
+	if meta.Sandbox != "" && meta.Sandbox != opts.Sandbox {
+		return fmt.Errorf("suspended metadata sandbox mismatch: got %q, want %q", meta.Sandbox, opts.Sandbox)
+	}
+	maskMode := meta.MaskMode
+	if maskMode == "" {
+		maskMode = config.MaskStrict
+	}
+	switch maskMode {
+	case config.MaskStrict, config.MaskAuto, config.MaskOff:
+	default:
+		return fmt.Errorf("invalid recorded mask mode %q", maskMode)
+	}
+	meta.MaskMode = maskMode
+
+	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
+	if err != nil {
+		return fmt.Errorf("list sandboxes: %w", err)
+	}
+	sb, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), opts.Sandbox)
+	if !exists {
+		return fmt.Errorf("suspended sandbox %q does not exist in msb", opts.Sandbox)
+	}
+	if sb.Running {
+		return fmt.Errorf("sandbox %q is already running", opts.Sandbox)
+	}
+
+	effectiveMode := meta.Mode
+	var isDetached bool
+	if opts.Detach {
+		if effectiveMode == config.RunModeTUI && meta.RemoteControl {
+			effectiveMode = config.RunModeRemoteControl
+		}
+		if effectiveMode != config.RunModeServe && effectiveMode != config.RunModeRemoteControl {
+			return errors.New("--detach (-d) requires a --serve or --remote-control sandbox")
+		}
+		isDetached = true
+	} else {
+		switch effectiveMode {
+		case config.RunModeServe:
+			isDetached = meta.Detached || a.IsTTY == nil || !a.IsTTY()
+		case config.RunModeRemoteControl:
+			isDetached = true
+		case config.RunModeTUI:
+			isDetached = false
+			if a.IsTTY == nil || !a.IsTTY() {
+				return fmt.Errorf("the %s TUI requires a TTY", meta.Agent)
+			}
+		case config.RunModeCmd:
+			isDetached = false
+		default:
+			return fmt.Errorf("unsupported run mode %q", effectiveMode)
+		}
+	}
+
+	pol := a.sharePolicy(meta.ReadOnly)
+	needsMask := false
+	seenIndex := make(map[int]bool, len(meta.Shares))
+	seenGuest := make(map[string]bool, len(meta.Shares))
+	for _, sh := range meta.Shares {
+		if seenIndex[sh.Index] {
+			return fmt.Errorf("duplicate share index %d in suspended metadata", sh.Index)
+		}
+		seenIndex[sh.Index] = true
+		if !isSafeGuestShareName(sh.GuestName) {
+			return fmt.Errorf("invalid guest share name %q in suspended metadata", sh.GuestName)
+		}
+		if seenGuest[sh.GuestName] {
+			return fmt.Errorf("duplicate guest share name %q in suspended metadata", sh.GuestName)
+		}
+		seenGuest[sh.GuestName] = true
+		target, vErr := pathsec.ValidateShare(sh.HostPath, pol)
+		if vErr != nil {
+			return fmt.Errorf("validate share %s: %w", sh.HostPath, vErr)
+		}
+		if target.IsDir != sh.IsDir {
+			return fmt.Errorf("share type changed for %s", sh.HostPath)
+		}
+		if maskMode == config.MaskStrict && sh.IsDir && !sh.Masked {
+			return fmt.Errorf("directory share %s must use the FUSE VCS filter in strict mode", sh.HostPath)
+		}
+		if sh.Masked {
+			if !sh.IsDir {
+				return fmt.Errorf("file share %s cannot use the directory FUSE filter", sh.HostPath)
+			}
+			needsMask = true
+		}
+	}
+
+	if needsMask {
+		if !DataDirSupportsFilter(a.Env.DataDir) {
+			return fmt.Errorf("DATA_DIR (%s) cannot contain whitespace or backslashes when VCS masking is active", a.Env.DataDir)
+		}
+		if a.StartFilter == nil {
+			return errors.New("FUSE filter starter is not configured")
+		}
+	}
+
+	dieWithParent := !isDetached
+	for _, sh := range meta.Shares {
+		if !sh.Masked {
+			continue
+		}
+		mntDir := filepath.Join(runFilterDir, fmt.Sprintf("m%d", sh.Index))
+		pidFile := mntDir + ".pid"
+		if _, fErr := a.StartFilter(sh.HostPath, mntDir, pidFile, dieWithParent); fErr != nil {
+			_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+			return fmt.Errorf("mount FUSE filter for %s: %w", sh.HostPath, fErr)
+		}
+	}
+
+	a.logf("Starting suspended microVM %s...", opts.Sandbox)
+	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"start", opts.Sandbox}}); err != nil {
+		_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+		return fmt.Errorf("start sandbox %s: %w", opts.Sandbox, err)
+	}
+
+	meta.Sandbox = opts.Sandbox
+	meta.OwnerPID = a.PID
+	meta.Mode = effectiveMode
+	meta.Detached = isDetached
+	if err := config.SaveRunMeta(filepath.Join(runFilterDir, "run.meta"), meta); err != nil {
+		_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"stop", opts.Sandbox}})
+		_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+		return fmt.Errorf("save run metadata: %w", err)
+	}
+	if err := os.Remove(suspendedPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove suspended marker: %w", err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
+	detached := false
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if detached {
+				return
+			}
+			if hasMarker(suspendedPath) {
+				_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+				return
+			}
+			_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", opts.Sandbox}})
+			_ = mounttab.TeardownFilterDir(runFilterDir, a.MountCtl)
+		})
+	}
+	defer cleanup()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			cancelRun()
+			cleanup()
+		case <-runCtx.Done():
+		}
+	}()
+
+	if err := a.ensureGuestUser(runCtx, opts.Sandbox); err != nil {
+		return err
+	}
+	if err := a.pushKeys(runCtx, opts.Sandbox); err != nil {
+		return err
+	}
+
+	return a.execSession(runCtx, meta, runFilterDir, false, &detached)
+}
+
+func (a *App) sharePolicy(readOnly bool) pathsec.Policy {
+	return pathsec.Policy{
+		HomeReal:         a.Env.HomeReal,
+		AllowOutsideHome: a.Env.AllowOutsideHome,
+		ReadOnly:         readOnly,
+		Blocklist:        pathsec.DefaultBlocklist(a.Env.HomeReal, a.Env.DataDir, a.Env.MSBHome),
+		VCSNames:         pathsec.DefaultVCSNames(),
+	}
+}
+
+func isSafeGuestShareName(name string) bool {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/:,\\") {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) ensureGuestUser(ctx context.Context, sandbox string) error {
+	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args: []string{"exec", "-u", config.GuestUser, sandbox, "--", "true"},
+	}); err != nil {
+		if pErr := a.provisionGuestUser(ctx, sandbox); pErr != nil {
+			return fmt.Errorf("initialize guest user %q: %w", config.GuestUser, pErr)
+		}
+	}
+	return nil
+}
+
+func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir string, probe bool, detached *bool) error {
+	runSandbox := meta.Sandbox
+	suspendedPath := filepath.Join(runFilterDir, "suspended")
 	guestEnv := msb.GuestEnvFlags()
 
-	if opts.Cmd != "" {
-		a.logf("Running one-shot command in %s as %s (passwordless sudo available)...", runSandbox, config.GuestUser)
+	switch meta.Mode {
+	case config.RunModeCmd:
+		a.logf("Running command in %s as %s (passwordless sudo available)...", runSandbox, config.GuestUser)
 		execArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: runSandbox,
 			Stream:  true,
@@ -1209,17 +2080,20 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			Command: []string{
 				"sh", "-c",
 				msb.KeyLoaderPrefix + " cd /workspace && exec sh -c \"$1\"",
-				"--", opts.Cmd,
+				"--", meta.Cmd,
 			},
 		})
 		_, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        execArgs,
 			Interactive: true,
 		})
+		if err != nil && hasMarker(suspendedPath) {
+			a.logf("Session %s suspended.", runSandbox)
+			return nil
+		}
 		return err
-	}
 
-	if opts.Serve {
+	case config.RunModeServe:
 		a.logf("Starting 'opencode serve' on guest:%d as %s...", config.GuestPort, config.GuestUser)
 		serveCmd := fmt.Sprintf("%s cd /workspace && exec opencode serve --hostname 0.0.0.0 --port %d",
 			msb.KeyLoaderPrefix, config.GuestPort)
@@ -1231,57 +2105,61 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			Command:  []string{"sh", "-c", serveCmd},
 		})
 		if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: serveArgs}); err != nil {
-			return fmt.Errorf("could not start opencode serve: %w", err)
+			return fmt.Errorf("start opencode serve: %w", err)
 		}
 
 		up := false
 		if a.WaitServeUI != nil {
-			up = a.WaitServeUI(ctx, port, runSandbox)
+			up = a.WaitServeUI(ctx, meta.Port, runSandbox)
 		}
 		if !up {
-			a.warnf("OpenCode UI did not answer on 127.0.0.1:%d within 90s. Guest log tail:", port)
+			a.warnf("OpenCode UI did not answer on 127.0.0.1:%d within 90s. Guest log tail:", meta.Port)
 			if logRes, lErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"logs", runSandbox}}); lErr == nil {
 				fmt.Fprintln(a.Stderr, tailLines(logRes.Stdout, 20))
 			}
-			return fmt.Errorf("opencode serve did not become ready on 127.0.0.1:%d", port)
+			return fmt.Errorf("opencode serve did not become ready on 127.0.0.1:%d", meta.Port)
 		}
 
-		a.logf("OpenCode web UI: http://127.0.0.1:%d", port)
-		a.warnf("Loopback TCP (127.0.0.1:%d) is reachable by local host processes. Set OPENCODE_SERVER_PASSWORD for HTTP basic auth. Provider keys stay inside the disposable microVM.", port)
+		a.logf("OpenCode web UI: http://127.0.0.1:%d", meta.Port)
+		a.warnf("Loopback TCP (127.0.0.1:%d) is reachable by local host processes. Set OPENCODE_SERVER_PASSWORD for HTTP basic auth. Provider keys stay inside the disposable microVM.", meta.Port)
 
-		if opts.Probe {
+		if probe {
 			a.logf("--probe: UI verified. Stopping now.")
 			return nil
 		}
 
-		if isDetachedServe {
-			if runFilterDir == "" {
-				runFilterDir = filepath.Join(a.Env.DataDir, "run", strconv.Itoa(a.PID))
-				_ = os.MkdirAll(runFilterDir, 0o700)
+		if meta.Detached {
+			if err := writeMarkerAtomic(filepath.Join(runFilterDir, "detached"), runSandbox+"\n"); err != nil {
+				return fmt.Errorf("write detached marker: %w", err)
 			}
-			_ = os.WriteFile(filepath.Join(runFilterDir, "detached"), []byte(runSandbox+"\n"), 0o600)
-			detached = true
-			a.logf("Non-interactive: keeping %s and its share filters running. Stop later with: agbox stop %s", runSandbox, runSandbox)
+			*detached = true
+			a.logf("Detached session %s is running. Stop it with: agbox stop %s", runSandbox, runSandbox)
 			return nil
 		}
 
-		fmt.Fprintln(a.Stdout, "Press Ctrl-C to stop the microVM and discard all guest changes.")
+		fmt.Fprintln(a.Stdout, "Press Ctrl-C to stop the microVM and delete all guest changes.")
 		for {
 			select {
 			case <-ctx.Done():
 				return nil
 			case <-time.After(2 * time.Second):
+				if hasMarker(suspendedPath) {
+					a.logf("Session %s suspended.", runSandbox)
+					return nil
+				}
 				if _, pErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ping", runSandbox}}); pErr != nil {
+					if hasMarker(suspendedPath) {
+						a.logf("Session %s suspended.", runSandbox)
+					}
 					return nil
 				}
 			}
 		}
-	}
 
-	if isDetachedRC {
+	case config.RunModeRemoteControl:
 		guestWorkDir := msb.GuestWorkspace
-		if len(validated) == 1 && validated[0].IsDir {
-			guestWorkDir = msb.GuestWorkspace + "/" + validated[0].GuestName
+		if len(meta.Shares) == 1 && meta.Shares[0].IsDir {
+			guestWorkDir = msb.GuestWorkspace + "/" + meta.Shares[0].GuestName
 		}
 		startDaemonCmd := fmt.Sprintf("%s cd %s && agy remote-control start --name %s",
 			msb.KeyLoaderPrefix, msb.ShellQuote(guestWorkDir), msb.ShellQuote(runSandbox))
@@ -1293,7 +2171,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		})
 		res, startErr := a.MSB.Run(ctx, msb.CommandRequest{Args: startArgs})
 		if startErr != nil && a.IsTTY != nil && a.IsTTY() {
-			a.logf("Authenticating agy in %s. Open the printed URL in your browser, paste the verification code, and then run /exit to detach into the background...", runSandbox)
+			a.logf("Authenticating agy in %s. Open the printed URL, paste the verification code, and run /exit to detach.", runSandbox)
 			authArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 				Sandbox: runSandbox,
 				TTY:     true,
@@ -1325,67 +2203,70 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			fmt.Fprintln(a.Stdout, strings.TrimSpace(stRes.Stdout))
 		}
 
-		if runFilterDir == "" {
-			runFilterDir = filepath.Join(a.Env.DataDir, "run", strconv.Itoa(a.PID))
-			_ = os.MkdirAll(runFilterDir, 0o700)
+		if err := writeMarkerAtomic(filepath.Join(runFilterDir, "detached"), runSandbox+"\n"); err != nil {
+			return fmt.Errorf("write detached marker: %w", err)
 		}
-		_ = os.WriteFile(filepath.Join(runFilterDir, "detached"), []byte(runSandbox+"\n"), 0o600)
-		detached = true
+		*detached = true
 		a.logf("Detached Remote Control microVM: %s (instance: %s)", runSandbox, runSandbox)
 		a.logf("Open https://antigravity.google.com and select %q in the instance switcher.", runSandbox)
-		a.logf("Stop and discard with: agbox stop %s", runSandbox)
+		a.logf("Stop and delete it with: agbox stop %s", runSandbox)
 		return nil
-	}
 
-	bin := effectiveAgent
-	switch effectiveAgent {
-	case "opencode":
-		bin = "opencode"
-	case "antigravity":
-		bin = "agy"
-		if opts.RemoteControl {
-			bin = "agy --remote-control"
+	default:
+		bin := meta.Agent
+		switch meta.Agent {
+		case "opencode":
+			bin = "opencode"
+		case "antigravity":
+			bin = "agy"
+			if meta.RemoteControl {
+				bin = "agy --remote-control"
+			}
 		}
-	}
-	modeStr := "rw"
-	if opts.ReadOnly {
-		modeStr = "ro"
-	}
-	a.logf("Launching %s (%s) in %s as %s (passwordless sudo available). All VM changes are discarded on exit.",
-		effectiveAgent, bin, runSandbox, config.GuestUser)
-	a.logf("Shared: %d path(s) under /workspace (%s). Egress: public internet only.", len(validated), modeStr)
+		modeStr := "rw"
+		if meta.ReadOnly {
+			modeStr = "ro"
+		}
+		a.logf("Starting %s (%s) in %s as %s (passwordless sudo available).",
+			meta.Agent, bin, runSandbox, config.GuestUser)
+		a.logf("Shared: %d path(s) under /workspace (%s).", len(meta.Shares), modeStr)
 
-	tuiArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
-		Sandbox: runSandbox,
-		TTY:     true,
-		User:    config.GuestUser,
-		Env:     guestEnv,
-		Command: []string{"sh", "-c", fmt.Sprintf("%s cd /workspace && exec %s", msb.KeyLoaderPrefix, bin)},
-	})
-	_, err = a.MSB.Run(ctx, msb.CommandRequest{
-		Args:        tuiArgs,
-		Interactive: true,
-	})
-	return err
+		tuiArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
+			Sandbox: runSandbox,
+			TTY:     true,
+			User:    config.GuestUser,
+			Env:     guestEnv,
+			Command: []string{"sh", "-c", fmt.Sprintf("%s cd /workspace && exec %s", msb.KeyLoaderPrefix, bin)},
+		})
+		_, err := a.MSB.Run(ctx, msb.CommandRequest{
+			Args:        tuiArgs,
+			Interactive: true,
+		})
+		if err != nil && hasMarker(suspendedPath) {
+			a.logf("Session %s suspended.", runSandbox)
+			return nil
+		}
+		return err
+	}
 }
 
-func (a *App) pushKeys(ctx context.Context, sandbox string) {
+func (a *App) pushKeys(ctx context.Context, sandbox string) error {
 	if a.Getenv == nil {
-		return
+		return nil
 	}
 	script, count := msb.FormatEnvExports(a.Getenv, msb.DefaultPassthroughEnvVars)
 	if count == 0 {
-		return
+		return nil
 	}
 	_, err := a.MSB.Run(ctx, msb.CommandRequest{
 		Args:  []string{"exec", "-u", config.GuestUser, sandbox, "--", "sh", "-c", "umask 077; cat > " + config.GuestKeysFile},
 		Stdin: strings.NewReader(script),
 	})
 	if err != nil {
-		a.warnf("Could not push provider keys into the guest (agent will prompt for auth itself).")
-		return
+		return fmt.Errorf("stream environment secrets into %s: %w", sandbox, err)
 	}
 	a.logf("Streamed %d environment secret(s) from host env into the disposable guest.", count)
+	return nil
 }
 
 func (a *App) defaultWaitServeUI(ctx context.Context, port int, sandbox string) bool {
@@ -1436,40 +2317,49 @@ func tailLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
-// Stop destroys a running `agbox-run-<pid>` sandbox and tears down its FUSE
-// filter directory.
+// Stop deletes a running or suspended run sandbox and unmounts its FUSE shares.
 func (a *App) Stop(ctx context.Context, args []string) error {
-	name, err := ParseStopArgs(args)
+	name, allowRoot, err := parseStopOpts(args)
 	if err != nil {
+		return err
+	}
+	if err := a.verifyUser(allowRoot); err != nil {
 		return err
 	}
 	if err := a.ensureMSB(); err != nil {
 		return err
 	}
-	_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", name}})
-	pidStr := strings.TrimPrefix(name, config.RunPrefix+"-")
-	if _, pErr := strconv.Atoi(pidStr); pErr == nil {
-		filterDir := filepath.Join(a.Env.DataDir, "run", pidStr)
+	_, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", name}})
+	var tdErr error
+	if dirID, dErr := RunDirIDFromSandbox(name); dErr == nil {
+		filterDir := filepath.Join(a.Env.DataDir, "run", dirID)
 		if _, sErr := os.Stat(filterDir); sErr == nil {
-			_ = mounttab.TeardownFilterDir(filterDir, a.MountCtl)
+			tdErr = mounttab.TeardownFilterDir(filterDir, a.MountCtl)
 		}
 	}
-	a.logf("Discarded %s.", name)
+	if rmErr != nil {
+		return fmt.Errorf("delete sandbox %s: %w", name, rmErr)
+	}
+	if tdErr != nil {
+		return tdErr
+	}
+	a.logf("Deleted %s.", name)
 	return nil
 }
 
-// Remove deletes all agbox sandboxes (`agbox-base`, `agbox-run-*`), snapshots
-// (`agbox:v*`), unused cached OCI images, FUSE filter daemons/mounts, and
-// `$DATA_DIR`.
+// Remove deletes all agbox sandboxes, snapshots, unused cached images, FUSE mounts, and `$DATA_DIR`.
 func (a *App) Remove(ctx context.Context, args []string) error {
-	yes, err := ParseRemoveArgs(args)
+	yes, allowRoot, err := parseRemoveOpts(args)
 	if err != nil {
 		return err
 	}
+	if err := a.verifyUser(allowRoot); err != nil {
+		return err
+	}
 	if !yes {
-		fmt.Fprintf(a.Stdout, "This removes: agbox sandboxes (%s, %s-*), snapshots (%s), unused cached images, and %s.\n",
-			config.BaseSandbox, config.RunPrefix, config.SnapGroup, a.Env.DataDir)
-		fmt.Fprintln(a.Stdout, "It does NOT touch the msb install, your other sandboxes/volumes, or any host files you shared.")
+		fmt.Fprintf(a.Stdout, "This deletes: agbox sandboxes (%s, agbox-*), snapshots (%s), unused cached images, and %s.\n",
+			config.BaseSandbox, config.SnapGroup, a.Env.DataDir)
+		fmt.Fprintln(a.Stdout, "It does NOT modify the msb binary, your other sandboxes, or any shared host files.")
 		fmt.Fprintln(a.Stdout, "Type 'y' to confirm:")
 		sc := bufio.NewScanner(a.Stdin)
 		if !sc.Scan() || strings.TrimSpace(sc.Text()) != "y" {
@@ -1542,13 +2432,12 @@ func (a *App) Remove(ctx context.Context, args []string) error {
 		return err
 	}
 
-	a.logf("Removed all agbox state.")
+	a.logf("Deleted all agbox state.")
 	return nil
 }
 
 func isAgboxSandboxName(name string) bool {
-	return name == config.BaseSandbox ||
-		strings.HasPrefix(name, config.RunPrefix+"-")
+	return name == config.BaseSandbox || IsRunSandboxName(name)
 }
 
 func isAgboxSnapshotName(name string) bool {
@@ -1570,8 +2459,12 @@ func containsStr(list []string, target string) bool {
 }
 
 // Status prints the current base configuration, sandboxes, snapshots, and disk usage.
-func (a *App) Status(ctx context.Context) error {
-	if err := a.requireSetup(); err != nil {
+func (a *App) Status(ctx context.Context, args []string) error {
+	opts, err := ParseStatusArgs(args)
+	if err != nil {
+		return err
+	}
+	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
 	}
 	fmt.Fprintln(a.Stdout, "== agbox base config ==")
@@ -1602,25 +2495,31 @@ func (a *App) Status(ctx context.Context) error {
 func UsageText() string {
 	return `agbox — Run OpenCode or Google Antigravity CLI inside an isolated microVM.
 
-Modes:
-  agbox setup
-      Check host prerequisites (glibc, msb, /dev/kvm, smoke test).
+Global options:
+  --allow-root
+      Allow agbox to run as the root user (or set AGBOX_ALLOW_ROOT=1).
 
-  agbox create-base [--force] [--add <categories>] <opencode|antigravity|both>
+Modes:
+  agbox setup [--allow-root]
+      Check host prerequisites (msb, /dev/kvm, FUSE, and microVM smoke test).
+
+  agbox create-base [--force] [--allow-root] [--add <categories>] <opencode|antigravity|both>
       Create the base microVM and save snapshot agbox:vN.
 
-  agbox edit-base [--add <categories>] [--list] [--shell] [--cmd "shell"] [--no-snap]
-      Start the base microVM, install developer categories (core, go, rust,
-      esphome, embedded-rust, chrome, hugo, caddy, or all) or run custom
-      updates, and save snapshot agbox:v<N+1>.
+  agbox edit-base [--allow-root] [--add <categories>] [--list] [--shell] [--cmd "shell"] [--no-snap]
+      Start the base microVM and install categories or run custom updates.
+      Save snapshot agbox:v<N+1> unless you pass --no-snap.
 
   agbox run [options] [opencode|antigravity] [paths...]
-      Restore an ephemeral microVM from the base snapshot and mount paths.
+      Restore an ephemeral microVM and mask VCS files and directories.
+      Block local, private, multicast, and cloud-config IPs by default.
       Delete the microVM and unmount FUSE shares on exit.
       Options (must precede paths):
+        --name NAME          Name the sandbox agbox-NAME instead of agbox-run-PID
+        --allow-root         Allow agbox to run as the root user
         --ro                 Mount shared paths read-only
-        --mask-vcs           Require the FUSE filter for directory shares
-        --no-mask            Disable the FUSE filter (.git is visible to guest)
+        --mask-vcs           Require the FUSE VCS filter for directory shares (default)
+        --no-mask            Disable the FUSE VCS filter (.git is visible to guest)
         --serve              Run 'opencode serve' and bind the web UI on 127.0.0.1
         --port N             Use fixed loopback TCP port N for --serve
         --probe              With --serve: wait for the web UI, then exit
@@ -1632,13 +2531,19 @@ Modes:
         --cpus N             Override vCPU count for this run
         --memory SIZE        Override RAM size for this run (for example, 4G)
 
-  agbox stop <agbox-run-pid>
-      Stop a detached --serve microVM and unmount its FUSE shares.
+  agbox suspend [--allow-root] <sandbox>
+      Stop a run microVM, keep its root disk, and unmount host FUSE shares.
 
-  agbox remove [--yes]
+  agbox resume [--allow-root] [-d|--detach] <sandbox>
+      Validate shares, mount FUSE filters, start a suspended microVM, and restart its agent.
+
+  agbox stop [--allow-root] <sandbox>
+      Delete a running or suspended run microVM and unmount its FUSE shares.
+
+  agbox remove [--allow-root] [--yes]
       Delete all agbox microVMs, snapshots, FUSE mounts, and ~/.local/share/agbox.
 
-  agbox status
+  agbox status [--allow-root]
       Show base configuration, microVMs, snapshots, and disk usage.
 `
 }
@@ -1647,9 +2552,11 @@ Modes:
 func RunUsageText() string {
 	return `Usage: agbox run [options] [agent] [path...]
 
+  --name NAME      name the sandbox agbox-NAME instead of agbox-run-PID
+  --allow-root     allow agbox to run as the root user
   --ro             mount shared paths read-only
-  --mask-vcs       require the FUSE filter for directory shares
-  --no-mask        disable the FUSE filter (.git is visible to guest)
+  --mask-vcs       require the FUSE VCS filter for directory shares (default)
+  --no-mask        disable the FUSE VCS filter (.git is visible to guest)
   --serve          run 'opencode serve' and bind the web UI on 127.0.0.1
   --port N         use fixed loopback port N for --serve (default: random)
   --probe          with --serve: wait for the web UI, then exit
@@ -1666,20 +2573,26 @@ func RunUsageText() string {
 
 // Dispatch executes the requested top-level subcommand on App.
 func (a *App) Dispatch(ctx context.Context, args []string) int {
-	if len(args) == 0 {
-		fmt.Fprint(a.Stdout, UsageText())
-		return 0
+	globalOpts, gErr := ParseGlobalArgs(args)
+	if gErr != nil {
+		if errors.Is(gErr, ErrHelp) {
+			fmt.Fprint(a.Stdout, UsageText())
+			return 0
+		}
+		fmt.Fprintf(a.Stderr, "[agbox] ERROR: %v\n", gErr)
+		return 1
 	}
-	mode := args[0]
-	rest := args[1:]
+
+	mode := globalOpts.Mode
+	rest := globalOpts.Rest
+	if globalOpts.AllowRoot {
+		rest = append([]string{"--allow-root"}, rest...)
+	}
 
 	var err error
 	switch mode {
-	case "-h", "--help", "help":
-		fmt.Fprint(a.Stdout, UsageText())
-		return 0
 	case "setup":
-		err = a.Setup(ctx)
+		err = a.Setup(ctx, rest)
 	case "create-base":
 		err = a.CreateBase(ctx, rest)
 	case "edit-base":
@@ -1690,14 +2603,18 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 			fmt.Fprint(a.Stdout, RunUsageText())
 			return 0
 		}
+	case "suspend":
+		err = a.Suspend(ctx, rest)
+	case "resume":
+		err = a.Resume(ctx, rest)
 	case "stop":
 		err = a.Stop(ctx, rest)
 	case "remove":
 		err = a.Remove(ctx, rest)
 	case "status":
-		err = a.Status(ctx)
+		err = a.Status(ctx, rest)
 	default:
-		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup create-base edit-base run stop remove status)\n", mode)
+		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup create-base edit-base run suspend resume stop remove status)\n", mode)
 		return 1
 	}
 
@@ -1718,9 +2635,13 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 
 // Main initializes a production App and dispatches os.Args[1:].
 func Main(args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		fmt.Print(UsageText())
-		return 0
+	if _, err := ParseGlobalArgs(args); err != nil {
+		if errors.Is(err, ErrHelp) {
+			fmt.Print(UsageText())
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "[agbox] ERROR: %v\n", err)
+		return 1
 	}
 	app, err := NewApp()
 	if err != nil {

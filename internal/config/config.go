@@ -1,10 +1,16 @@
-// Package config manages environment settings and base-image metadata for agbox.
-// Parsing, formatting, and version calculation functions are pure.
-// File I/O occurs only in LoadFile and SaveFile.
+// Package config manages environment settings and metadata files for agbox.
+//
+// Security properties:
+//   - ParseMaskMode defaults empty AGBOX_MASK_VCS values to MaskStrict.
+//   - FromLookup validates CPU counts, memory and disk sizes, package versions,
+//     and HTTPS installer URLs before any command runs.
+//   - EnsurePrivateDir rejects symlinks via Lstat and enforces mode 0700.
+//   - SaveFile and SaveRunMeta write state files atomically with mode 0600.
 package config
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -40,18 +46,18 @@ const (
 	MaskOff    MaskMode = "off"
 )
 
-// ParseMaskMode normalizes a string (from AGBOX_MASK_VCS or CLI flags) into a
-// validated MaskMode.
+// ParseMaskMode converts a string (from AGBOX_MASK_VCS or CLI flags) into a
+// validated MaskMode. Empty input defaults to MaskStrict.
 func ParseMaskMode(raw string) (MaskMode, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", "auto":
-		return MaskAuto, nil
-	case "strict", "1", "true", "yes":
+	case "", "strict", "1", "true", "yes":
 		return MaskStrict, nil
+	case "auto":
+		return MaskAuto, nil
 	case "off", "0", "false", "no":
 		return MaskOff, nil
 	default:
-		return "", fmt.Errorf("invalid mask mode %q (expected: auto, strict, or off)", raw)
+		return "", fmt.Errorf("invalid mask mode %q (expected: strict, auto, or off)", raw)
 	}
 }
 
@@ -68,6 +74,7 @@ type Env struct {
 	AgyInstallerURL  string
 	MaskVCS          MaskMode
 	AllowOutsideHome bool
+	AllowRoot        bool
 }
 
 // FromLookup constructs an Env using the provided environment lookup function
@@ -100,18 +107,44 @@ func FromLookup(homeReal string, getenv func(string) string) (Env, error) {
 		return Env{}, err
 	}
 
+	cpus := defaultIfEmpty(getenv("AGBOX_CPUS"), DefaultCPUs)
+	if n, err := strconv.Atoi(cpus); err != nil || n < 1 {
+		return Env{}, fmt.Errorf("invalid AGBOX_CPUS %q: must be a positive integer", cpus)
+	}
+
+	memory := defaultIfEmpty(getenv("AGBOX_MEMORY"), DefaultMemory)
+	if !isValidSizeSpec(memory) {
+		return Env{}, fmt.Errorf("invalid AGBOX_MEMORY %q: expected size such as 2G or 2048M", memory)
+	}
+
+	rootDisk := defaultIfEmpty(getenv("AGBOX_ROOT_DISK"), DefaultRootDisk)
+	if !isValidSizeSpec(rootDisk) {
+		return Env{}, fmt.Errorf("invalid AGBOX_ROOT_DISK %q: expected size such as 50G or 8192M", rootDisk)
+	}
+
+	openCodeVer := defaultIfEmpty(getenv("AGBOX_OPENCODE_VERSION"), DefaultOpenCodeVersion)
+	if hasUnsafeTokenChars(openCodeVer) {
+		return Env{}, fmt.Errorf("invalid AGBOX_OPENCODE_VERSION %q: whitespace and control characters are forbidden", openCodeVer)
+	}
+
+	agyURL := defaultIfEmpty(getenv("AGBOX_AGY_INSTALLER_URL"), DefaultAgyInstallerURL)
+	if !strings.HasPrefix(agyURL, "https://") || hasUnsafeTokenChars(agyURL) {
+		return Env{}, fmt.Errorf("invalid AGBOX_AGY_INSTALLER_URL %q: must be an https:// URL without whitespace", agyURL)
+	}
+
 	return Env{
 		HomeReal:         cleanHome,
 		DataDir:          dataDir,
 		ConfigFile:       filepath.Join(dataDir, "config"),
 		MSBHome:          msbHome,
-		CPUs:             defaultIfEmpty(getenv("AGBOX_CPUS"), DefaultCPUs),
-		Memory:           defaultIfEmpty(getenv("AGBOX_MEMORY"), DefaultMemory),
-		RootDisk:         defaultIfEmpty(getenv("AGBOX_ROOT_DISK"), DefaultRootDisk),
-		OpenCodeVersion:  defaultIfEmpty(getenv("AGBOX_OPENCODE_VERSION"), DefaultOpenCodeVersion),
-		AgyInstallerURL:  defaultIfEmpty(getenv("AGBOX_AGY_INSTALLER_URL"), DefaultAgyInstallerURL),
+		CPUs:             cpus,
+		Memory:           memory,
+		RootDisk:         rootDisk,
+		OpenCodeVersion:  openCodeVer,
+		AgyInstallerURL:  agyURL,
 		MaskVCS:          maskMode,
 		AllowOutsideHome: strings.TrimSpace(getenv("AGBOX_ALLOW_OUTSIDE_HOME")) == "1",
+		AllowRoot:        strings.TrimSpace(getenv("AGBOX_ALLOW_ROOT")) == "1",
 	}, nil
 }
 
@@ -206,12 +239,122 @@ func LoadFile(path string) (State, error) {
 
 // SaveFile atomically writes State to path (creating parent directories with mode 0700).
 func SaveFile(path string, st State) error {
-	dir := filepath.Dir(path)
+	return saveBytesAtomic(path, []byte(Format(st)))
+}
+
+// RunMode identifies the execution mode of an active or suspended sandbox.
+type RunMode string
+
+const (
+	RunModeTUI           RunMode = "tui"
+	RunModeServe         RunMode = "serve"
+	RunModeRemoteControl RunMode = "remote-control"
+	RunModeCmd           RunMode = "cmd"
+)
+
+// ShareRecord records one validated host share attached to a run sandbox.
+type ShareRecord struct {
+	Index     int    `json:"index"`
+	HostPath  string `json:"host_path"`
+	GuestName string `json:"guest_name"`
+	IsDir     bool   `json:"is_dir"`
+	Masked    bool   `json:"masked"`
+}
+
+// RunMeta stores per-run metadata in $DATA_DIR/run/<id>/run.meta and suspended.
+type RunMeta struct {
+	Sandbox       string        `json:"sandbox"`
+	OwnerPID      int           `json:"owner_pid"`
+	Agent         string        `json:"agent"`
+	Mode          RunMode       `json:"mode"`
+	Detached      bool          `json:"detached"`
+	RemoteControl bool          `json:"remote_control"`
+	Port          int           `json:"port,omitempty"`
+	Cmd           string        `json:"cmd,omitempty"`
+	ReadOnly      bool          `json:"read_only"`
+	MaskMode      MaskMode      `json:"mask_mode"`
+	Shares        []ShareRecord `json:"shares,omitempty"`
+}
+
+// FormatRunMeta serializes RunMeta as indented JSON bytes.
+func FormatRunMeta(meta RunMeta) ([]byte, error) {
+	raw, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(raw, '\n'), nil
+}
+
+// ParseRunMeta decodes RunMeta JSON from r.
+func ParseRunMeta(r io.Reader) (RunMeta, error) {
+	var meta RunMeta
+	dec := json.NewDecoder(r)
+	if err := dec.Decode(&meta); err != nil {
+		return RunMeta{}, fmt.Errorf("parse run metadata: %w", err)
+	}
+	if meta.Sandbox == "" {
+		return RunMeta{}, fmt.Errorf("parse run metadata: missing sandbox name")
+	}
+	for _, sh := range meta.Shares {
+		if sh.Index < 0 {
+			return RunMeta{}, fmt.Errorf("parse run metadata: negative share index %d", sh.Index)
+		}
+	}
+	return meta, nil
+}
+
+// LoadRunMeta reads a RunMeta JSON file from disk.
+func LoadRunMeta(path string) (RunMeta, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return RunMeta{}, err
+	}
+	defer f.Close()
+	return ParseRunMeta(f)
+}
+
+// SaveRunMeta atomically writes RunMeta JSON to path with mode 0600.
+func SaveRunMeta(path string, meta RunMeta) error {
+	raw, err := FormatRunMeta(meta)
+	if err != nil {
+		return err
+	}
+	return saveBytesAtomic(path, raw)
+}
+
+// EnsurePrivateDir creates dir with mode 0700 and rejects symlinks or non-directories.
+func EnsurePrivateDir(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("private directory path must not be empty")
+	}
+	if info, err := os.Lstat(dir); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlinked directory %q", dir)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("path %q is not a directory", dir)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
+		return fmt.Errorf("create dir %q: %w", dir, err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("stat dir %q: %w", dir, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("refusing non-directory %q", dir)
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
-		return fmt.Errorf("chmod config dir: %w", err)
+		return fmt.Errorf("chmod dir %q: %w", dir, err)
+	}
+	return nil
+}
+
+func saveBytesAtomic(path string, content []byte) error {
+	dir := filepath.Dir(path)
+	if err := EnsurePrivateDir(dir); err != nil {
+		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".conf.*")
 	if err != nil {
@@ -229,7 +372,7 @@ func SaveFile(path string, st State) error {
 		_ = tmp.Close()
 		return err
 	}
-	if _, err := io.WriteString(tmp, Format(st)); err != nil {
+	if _, err := tmp.Write(content); err != nil {
 		_ = tmp.Close()
 		return err
 	}
@@ -263,6 +406,31 @@ func NextSnapshotMember(recordedCount int, existingRefs []string, group string) 
 	}
 	next := maxN + 1
 	return next, fmt.Sprintf("%s:v%d", group, next)
+}
+
+func isValidSizeSpec(spec string) bool {
+	s := strings.ToUpper(strings.TrimSpace(spec))
+	if len(s) < 2 {
+		return false
+	}
+	unit := s[len(s)-1]
+	if unit != 'M' && unit != 'G' {
+		return false
+	}
+	n, err := strconv.Atoi(s[:len(s)-1])
+	return err == nil && n > 0
+}
+
+func hasUnsafeTokenChars(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, r := range s {
+		if r <= 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultIfEmpty(val, fallback string) string {

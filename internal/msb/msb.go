@@ -1,5 +1,13 @@
-// Package msb provides pure argument builders, output parsers, and an execution
-// interface for interacting with the microsandbox (`msb`) CLI.
+// Package msb provides argument builders, output parsers, and a Runner interface
+// for the microsandbox (msb) CLI.
+//
+// Security properties:
+//   - BuildNetArgs defaults to default-deny egress (--net-default deny). It places
+//     deny rules for host, loopback, private, link-local, multicast, and cloud-config
+//     endpoints before any allow rule under msb first-match-wins evaluation.
+//   - validateNetRuleToken rejects whitespace, control characters, and malformed rules.
+//   - FormatEnvExports and ShellQuote build POSIX-quoted secret scripts for stdin
+//     delivery so secrets never appear in CLI arguments or host files.
 package msb
 
 import (
@@ -68,30 +76,215 @@ var DefaultPassthroughEnvVars = []string{
 	"COLORTERM",
 }
 
-// TranslateNetSpec converts a network profile name ("public", "none", "private",
-// "host", "all") or an msb rule token ("allow@...") into flags for 'msb snap restore'.
+// DefaultBlockedCIDRRules lists local, broadcast, link-local, and cloud-config
+// CIDR rules evaluated before any allow rule:
+//   - 0.0.0.0/8: "this host" local network (RFC 1122).
+//   - 100.100.100.200/32: Alibaba Cloud IMDS (resides inside CGNAT 100.64.0.0/10).
+//   - 168.63.129.16/32: Microsoft Azure WireServer/IMDS (resides in public IPv4).
+//   - 169.254.0.0/16: IPv4 link-local and AWS/GCP/Azure/OpenStack IMDS (169.254.169.254).
+//   - 240.0.0.0/4: IPv4 reserved space and limited broadcast (255.255.255.255).
+//   - fe80::/10: IPv6 link-local range.
+//   - fd00:ec2::254/128: AWS IPv6 IMDS (resides inside IPv6 ULA fc00::/7).
+var DefaultBlockedCIDRRules = []string{
+	"deny@0.0.0.0/8",
+	"deny@100.100.100.200/32",
+	"deny@168.63.129.16/32",
+	"deny@169.254.0.0/16",
+	"deny@240.0.0.0/4",
+	"deny@fe80::/10",
+	"deny@fd00:ec2::254/128",
+}
+
+// TranslateNetSpec converts one network profile name or msb rule into CLI flags.
 //
-// 'msb snap restore' accepts --no-net, --net-default <allow|deny>, and
-// --net-rule <rule>. It does not accept --net <profile>.
+// The default "public" profile enforces default-deny egress. It blocks host,
+// loopback, private, link-local, multicast, and cloud-config endpoints before
+// allowing public internet destinations.
 func TranslateNetSpec(spec string) ([]string, error) {
-	s := strings.TrimSpace(spec)
-	switch s {
-	case "", "public", "public-only":
-		return []string{"--net-default", "deny", "--net-rule", "allow@public"}, nil
-	case "none", "deny":
+	return BuildNetArgs(false, []string{spec})
+}
+
+// BuildNetArgs compiles network flags from noNet and one or more --net specs.
+// Because microsandbox evaluates --net-rule flags with first-match-wins,
+// BuildNetArgs places deny rules before allow rules.
+func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
+	if noNet {
 		return []string{"--no-net"}, nil
-	case "private":
-		return []string{"--net-default", "deny", "--net-rule", "allow@public,allow@private"}, nil
-	case "host":
-		return []string{"--net-default", "deny", "--net-rule", "allow@public,allow@host"}, nil
-	case "all", "allow":
-		return []string{"--net-default", "allow"}, nil
-	default:
-		if strings.Contains(s, "@") {
-			return []string{"--net-default", "deny", "--net-rule", s}, nil
-		}
-		return nil, fmt.Errorf("unsupported --net value %q (use: public, none, private, host, all, or an msb rule like 'allow@example.com:tcp:443')", spec)
 	}
+	if len(specs) == 0 {
+		specs = []string{"public"}
+	}
+
+	allowAll := false
+	hasRestrictiveProfile := false
+	allowHost := false
+	allowLoopback := false
+	allowPrivate := false
+	allowLinkLocal := false
+	allowMulticast := false
+	allowMetadata := false
+
+	var userDenies []string
+	var userAllows []string
+
+	for _, rawSpec := range specs {
+		s := strings.TrimSpace(rawSpec)
+		switch s {
+		case "", "public", "public-only":
+			hasRestrictiveProfile = true
+			userAllows = appendUnique(userAllows, "allow@public")
+		case "none", "deny":
+			return []string{"--no-net"}, nil
+		case "private":
+			hasRestrictiveProfile = true
+			allowPrivate = true
+			userAllows = appendUnique(userAllows, "allow@public")
+			userAllows = appendUnique(userAllows, "allow@private")
+		case "host":
+			hasRestrictiveProfile = true
+			allowHost = true
+			userAllows = appendUnique(userAllows, "allow@public")
+		case "all", "allow":
+			allowAll = true
+		default:
+			if !strings.Contains(s, "@") {
+				return nil, fmt.Errorf("unsupported --net value %q (use: public, none, private, host, all, or an msb rule like 'allow@example.com:tcp:443')", rawSpec)
+			}
+			for _, tok := range strings.Split(s, ",") {
+				rule := strings.TrimSpace(tok)
+				if err := validateNetRuleToken(rule); err != nil {
+					return nil, err
+				}
+				lower := strings.ToLower(rule)
+				if strings.HasPrefix(lower, "deny@") {
+					userDenies = appendUnique(userDenies, rule)
+					continue
+				}
+				hasRestrictiveProfile = true
+				switch lower {
+				case "allow@host":
+					allowHost = true
+				case "allow@loopback":
+					allowLoopback = true
+				case "allow@private":
+					allowPrivate = true
+				case "allow@link-local":
+					allowLinkLocal = true
+				case "allow@multicast":
+					allowMulticast = true
+				case "allow@metadata":
+					allowMetadata = true
+				default:
+					if strings.HasPrefix(lower, "allow@host:") {
+						// Port-scoped host rule still goes before deny@private.
+						userAllows = appendUnique(userAllows, rule)
+						continue
+					}
+				}
+				if lower != "allow@host" {
+					userAllows = appendUnique(userAllows, rule)
+				}
+			}
+		}
+	}
+
+	if allowAll && !hasRestrictiveProfile {
+		args := []string{"--net-default", "allow"}
+		for _, d := range userDenies {
+			args = append(args, "--net-rule", d)
+		}
+		return args, nil
+	}
+
+	args := []string{"--net-default", "deny"}
+	if allowHost {
+		args = append(args, "--net-rule", "allow@host")
+	}
+	for _, r := range userAllows {
+		if strings.HasPrefix(strings.ToLower(r), "allow@host:") {
+			args = append(args, "--net-rule", r)
+		}
+	}
+
+	var denies []string
+	if !allowHost {
+		denies = appendUnique(denies, "deny@host")
+	}
+	if !allowLoopback {
+		denies = appendUnique(denies, "deny@loopback")
+	}
+	if !allowPrivate {
+		denies = appendUnique(denies, "deny@private")
+	}
+	if !allowLinkLocal {
+		denies = appendUnique(denies, "deny@link-local")
+	}
+	if !allowMulticast {
+		denies = appendUnique(denies, "deny@multicast")
+	}
+	if !allowMetadata {
+		denies = appendUnique(denies, "deny@metadata")
+	}
+	if !allowLoopback {
+		denies = appendUnique(denies, "deny@0.0.0.0/8")
+	}
+	if !allowMetadata {
+		denies = appendUnique(denies, "deny@100.100.100.200/32")
+		denies = appendUnique(denies, "deny@168.63.129.16/32")
+		if !allowLinkLocal {
+			denies = appendUnique(denies, "deny@169.254.0.0/16")
+		}
+	}
+	if !allowMulticast {
+		denies = appendUnique(denies, "deny@240.0.0.0/4")
+	}
+	if !allowLinkLocal {
+		denies = appendUnique(denies, "deny@fe80::/10")
+	}
+	if !allowMetadata {
+		denies = appendUnique(denies, "deny@fd00:ec2::254/128")
+	}
+	for _, d := range userDenies {
+		denies = appendUnique(denies, d)
+	}
+
+	for _, d := range denies {
+		args = append(args, "--net-rule", d)
+	}
+	for _, a := range userAllows {
+		if strings.HasPrefix(strings.ToLower(a), "allow@host:") {
+			continue
+		}
+		args = append(args, "--net-rule", a)
+	}
+	return args, nil
+}
+
+func validateNetRuleToken(rule string) error {
+	if rule == "" {
+		return errors.New("empty --net-rule token")
+	}
+	for _, r := range rule {
+		if r <= 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid --net-rule %q: whitespace and control characters are forbidden", rule)
+		}
+	}
+	lower := strings.ToLower(rule)
+	if !strings.HasPrefix(lower, "allow@") && !strings.HasPrefix(lower, "deny@") {
+		return fmt.Errorf("invalid --net-rule %q: rule must start with allow@ or deny@", rule)
+	}
+	_, target, _ := strings.Cut(rule, "@")
+	if target == "" {
+		return fmt.Errorf("invalid --net-rule %q: missing target after '@'", rule)
+	}
+	return nil
+}
+
+func appendUnique(list []string, item string) []string {
+	if slices.Contains(list, item) {
+		return list
+	}
+	return append(list, item)
 }
 
 // ShellQuote wraps s in POSIX single quotes, escaping any embedded single quote
@@ -151,6 +344,8 @@ type CreateOpts struct {
 	Memory   string
 	RootDisk string
 	Workdir  string
+	NoNet    bool
+	NetSpecs []string
 }
 
 // BuildCreateArgs constructs the CLI argument list for `msb create`.
@@ -180,6 +375,13 @@ func BuildCreateArgs(opts CreateOpts) ([]string, error) {
 	}
 	if opts.Workdir != "" {
 		args = append(args, "--workdir", opts.Workdir, "--mkdir", opts.Workdir)
+	}
+	if opts.NoNet || len(opts.NetSpecs) > 0 {
+		netArgs, err := BuildNetArgs(opts.NoNet, opts.NetSpecs)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, netArgs...)
 	}
 	return args, nil
 }
@@ -226,17 +428,11 @@ func BuildRestoreArgs(opts RestoreOpts) ([]string, error) {
 	for _, p := range opts.Ports {
 		args = append(args, "-p", p)
 	}
-	if opts.NoNet {
-		args = append(args, "--no-net")
-	} else if len(opts.NetSpecs) > 0 {
-		for _, spec := range opts.NetSpecs {
-			netFlags, err := TranslateNetSpec(spec)
-			if err != nil {
-				return nil, err
-			}
-			args = append(args, netFlags...)
-		}
+	netArgs, err := BuildNetArgs(opts.NoNet, opts.NetSpecs)
+	if err != nil {
+		return nil, err
 	}
+	args = append(args, netArgs...)
 	return args, nil
 }
 
@@ -442,22 +638,35 @@ type ExecRunner struct {
 	BinaryPath string
 }
 
-// ResolveBinary finds the `msb` executable from an explicit path, $PATH, or
-// `$HOME/.local/bin/msb`.
+// ResolveBinary locates the msb executable from explicit, PATH, ~/.local/bin, or /usr/local/bin.
 func ResolveBinary(explicit string) (string, error) {
+	home, _ := os.UserHomeDir()
+	return resolveBinaryWith(explicit, exec.LookPath, home, []string{"/usr/local/bin/msb"})
+}
+
+func resolveBinaryWith(explicit string, lookPath func(string) (string, error), home string, extraPaths []string) (string, error) {
 	if explicit != "" {
 		if st, err := os.Stat(explicit); err == nil && !st.IsDir() {
 			return explicit, nil
 		}
 		return "", fmt.Errorf("msb binary not found at %q", explicit)
 	}
-	if p, err := exec.LookPath("msb"); err == nil {
-		return p, nil
+	if lookPath != nil {
+		if p, err := lookPath("msb"); err == nil {
+			return p, nil
+		}
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
+	if home != "" {
 		fallback := filepath.Join(home, ".local", "bin", "msb")
 		if st, err := os.Stat(fallback); err == nil && !st.IsDir() {
 			return fallback, nil
+		}
+	}
+	for _, candidate := range extraPaths {
+		if candidate != "" {
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				return candidate, nil
+			}
 		}
 	}
 	return "", errors.New("msb binary not found on PATH or ~/.local/bin/msb (run install.sh or install microsandbox)")

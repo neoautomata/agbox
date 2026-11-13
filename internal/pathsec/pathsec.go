@@ -1,5 +1,14 @@
-// Package pathsec validates host paths before sharing them into a microVM and
-// computes collision-free guest mount specifications.
+// Package pathsec validates host paths before agbox shares them into a microVM.
+//
+// Security properties:
+//   - ValidateShare resolves all symlinks and rejects missing or dangling paths.
+//   - ValidateShare rejects control characters, ':', ',', and unsafe basenames.
+//   - ValidateShare restricts shares to $HOME unless AllowOutsideHome is true.
+//   - DefaultBlocklist blocks credentials, agent state, VCS configs, shell startup
+//     files, system paths, parent directories of blocked paths, and symlink targets.
+//   - ContainsVCSComponent blocks direct shares of any VCS directory, subdirectory,
+//     or working-tree control file (case-insensitive).
+//   - ValidateShare rejects non-regular files and writable files with st_nlink != 1.
 package pathsec
 
 import (
@@ -10,10 +19,33 @@ import (
 	"syscall"
 )
 
-// DefaultVCSNames returns the version-control directory names that agbox blocks
-// from direct sharing. The FUSE filter hides these names inside directory shares.
+// DefaultVCSNames returns the version-control directory and control file names
+// that agbox blocks from direct sharing and masks inside directory shares.
 func DefaultVCSNames() []string {
-	return []string{".git", ".jj", ".svn", ".hg", ".bzr"}
+	return []string{
+		".git",
+		".gitignore",
+		".gitattributes",
+		".gitmodules",
+		".mailmap",
+		".jj",
+		".sl",
+		".svn",
+		".hg",
+		".hgignore",
+		".hgsub",
+		".hgsubstate",
+		".hgtags",
+		".hgeol",
+		".bzr",
+		".bzrignore",
+		"_darcs",
+		".pijul",
+		".fossil-settings",
+		".fslckout",
+		"_fossil_",
+		".cvsignore",
+	}
 }
 
 // DefaultBlocklist returns the host paths that agbox never shares into a guest.
@@ -72,7 +104,19 @@ func DefaultBlocklist(homeReal, dataDir, msbHome string) []string {
 		filepath.Join(h, ".config", "zsh"),
 		filepath.Join(h, ".config", "fish"),
 		filepath.Join(h, ".gitconfig"),
+		filepath.Join(h, ".gitattributes"),
+		filepath.Join(h, ".gitignore"),
+		filepath.Join(h, ".gitignore_global"),
 		filepath.Join(h, ".config", "git"),
+		filepath.Join(h, ".jjconfig.toml"),
+		filepath.Join(h, ".config", "jj"),
+		filepath.Join(h, ".hgrc"),
+		filepath.Join(h, ".subversion"),
+		filepath.Join(h, ".bazaar"),
+		filepath.Join(h, ".config", "hub"),
+		filepath.Join(h, ".config", "glab"),
+		filepath.Join(h, ".envrc"),
+		filepath.Join(h, ".config", "direnv"),
 		filepath.Join(h, ".inputrc"),
 		filepath.Join(h, ".curlrc"),
 		filepath.Join(h, ".wgetrc"),
@@ -96,9 +140,15 @@ func DefaultBlocklist(homeReal, dataDir, msbHome string) []string {
 		filepath.Join(h, ".config", "environment.d"),
 		filepath.Join(h, ".microsandbox"),
 		filepath.Join(h, ".local", "share", "agbox"),
-		"/etc", "/proc", "/sys", "/dev", "/boot", "/root",
+		"/etc", "/proc", "/sys", "/dev", "/boot",
 		"/run", "/var/run", "/usr", "/bin", "/sbin", "/lib", "/lib64",
 		"/var/run/docker.sock", "/run/docker.sock",
+	}
+	// Block /root when homeReal is not /root.
+	// When homeReal is /root, the dotfile entries block /root and sensitive subdirectories.
+	// Project directories such as /root/myapp remain valid shares.
+	if h != "/root" {
+		list = append(list, "/root")
 	}
 	if dataDir != "" {
 		list = append(list, filepath.Clean(dataDir))
@@ -124,21 +174,32 @@ func IsSubpath(candidate, root string) bool {
 }
 
 // ContainsVCSComponent reports whether any path component of p matches one of
-// the VCS directory names in vcsNames.
+// the VCS names in vcsNames (case-insensitive).
 func ContainsVCSComponent(p string, vcsNames []string) (string, bool) {
 	vcsSet := make(map[string]struct{}, len(vcsNames))
 	for _, v := range vcsNames {
-		vcsSet[v] = struct{}{}
+		if v != "" {
+			vcsSet[strings.ToLower(v)] = struct{}{}
+		}
 	}
 	for _, part := range strings.Split(filepath.Clean(p), "/") {
 		if part == "" {
 			continue
 		}
-		if _, ok := vcsSet[part]; ok {
+		if _, ok := vcsSet[strings.ToLower(part)]; ok {
 			return part, true
 		}
 	}
 	return "", false
+}
+
+func hasControlChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // Policy defines the security rules applied by ValidateShare.
@@ -165,8 +226,8 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 	if rawPath == "" {
 		return ShareTarget{}, fmt.Errorf("share path must not be empty")
 	}
-	if strings.ContainsRune(rawPath, '\n') {
-		return ShareTarget{}, fmt.Errorf("refusing path containing newline: %q", rawPath)
+	if hasControlChar(rawPath) {
+		return ShareTarget{}, fmt.Errorf("refusing path containing control character: %q", rawPath)
 	}
 
 	resolved, err := filepath.EvalSymlinks(rawPath)
@@ -175,6 +236,9 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 	}
 	resolved = filepath.Clean(resolved)
 	base := filepath.Base(resolved)
+	if resolved == "/" || base == "." || base == ".." || hasControlChar(resolved) {
+		return ShareTarget{}, fmt.Errorf("refusing unsafe share path: %q", resolved)
+	}
 
 	if strings.ContainsAny(resolved, ":,") || strings.ContainsAny(base, ":,") {
 		return ShareTarget{}, fmt.Errorf("refusing to share path containing ':' or ',' (conflicts with msb volume syntax): %s", resolved)
@@ -214,12 +278,11 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 		vcsNames = DefaultVCSNames()
 	}
 
+	if vcs, bad := ContainsVCSComponent(resolved, vcsNames); bad {
+		return ShareTarget{}, fmt.Errorf("refusing to share %s: path has VCS component %s. Share the project root instead", resolved, vcs)
+	}
+
 	if info.IsDir() {
-		for _, v := range vcsNames {
-			if base == v {
-				return ShareTarget{}, fmt.Errorf("refusing to share %s directly (it is a %s control dir). Share the project root instead", resolved, base)
-			}
-		}
 		return ShareTarget{
 			HostPath:  resolved,
 			BaseName:  base,
@@ -230,10 +293,6 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 
 	if !info.Mode().IsRegular() {
 		return ShareTarget{}, fmt.Errorf("refusing to share non-regular file: %s", resolved)
-	}
-
-	if vcs, bad := ContainsVCSComponent(resolved, vcsNames); bad {
-		return ShareTarget{}, fmt.Errorf("refusing to share %s: path has a %s component. Share the project dir instead", resolved, vcs)
 	}
 
 	if !pol.ReadOnly {

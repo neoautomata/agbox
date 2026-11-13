@@ -1,10 +1,17 @@
 // Package mounttab parses /proc/self/mountinfo and unmounts FUSE filter directories.
-// It checks the kernel mount table before deleting directories so os.RemoveAll
-// never traverses an active mount.
+//
+// Security properties:
+//   - ReadCurrent inspects /proc/self/mountinfo instead of os.Stat because a
+//     crashed FUSE daemon returns ENOTCONN while its mount remains active.
+//   - OSController.SignalPID checks /proc/<pid>/cmdline for argv[1] == "__filter"
+//     before sending SIGTERM or SIGKILL, preventing PID-reuse kills on the host.
+//   - TeardownFilterDir refuses to run os.RemoveAll if any mount remains active.
 package mounttab
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -151,8 +158,18 @@ type Controller interface {
 	Sleep(d time.Duration)
 }
 
+// IsFilterCmdline reports whether raw /proc/<pid>/cmdline bytes belong to an
+// `agbox __filter` daemon process (argv[1] == "__filter").
+func IsFilterCmdline(cmdline []byte) bool {
+	if len(cmdline) == 0 {
+		return false
+	}
+	parts := bytes.Split(cmdline, []byte{0})
+	return len(parts) >= 2 && len(parts[0]) > 0 && string(parts[1]) == "__filter"
+}
+
 // OSController is the production Controller backed by /proc/self/mountinfo,
-// kill(2), and fusermount3/umount.
+// kill(2), and fusermount3/fusermount/umount.
 type OSController struct{}
 
 func (OSController) ListMounts() ([]Entry, error) {
@@ -163,8 +180,18 @@ func (OSController) SignalPID(pid int, sig syscall.Signal) error {
 	if pid <= 0 {
 		return nil
 	}
-	err := syscall.Kill(pid, sig)
-	if err == syscall.ESRCH {
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	if !IsFilterCmdline(cmdline) {
+		return nil
+	}
+	err = syscall.Kill(pid, sig)
+	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
 	return err
@@ -175,9 +202,15 @@ func (OSController) Unmount(mountpoint string, lazy bool) error {
 		if err := exec.Command("fusermount3", "-u", mountpoint).Run(); err == nil {
 			return nil
 		}
+		if err := exec.Command("fusermount", "-u", mountpoint).Run(); err == nil {
+			return nil
+		}
 		return syscall.Unmount(mountpoint, 0)
 	}
 	if err := exec.Command("fusermount3", "-u", "-z", mountpoint).Run(); err == nil {
+		return nil
+	}
+	if err := exec.Command("fusermount", "-u", "-z", mountpoint).Run(); err == nil {
 		return nil
 	}
 	return syscall.Unmount(mountpoint, syscall.MNT_DETACH)
@@ -187,13 +220,12 @@ func (OSController) Sleep(d time.Duration) {
 	time.Sleep(d)
 }
 
-// TeardownFilterDir stops FUSE filter daemons recorded in dir/m*.pid and
-// unmounts all mountpoints under dir. It deletes dir only after it verifies
-// that zero mounts remain under dir in /proc/self/mountinfo.
-func TeardownFilterDir(dir string, ctl Controller) error {
+// UnmountFilterDir stops FUSE filter daemons recorded in dir/m*.pid and
+// unmounts all mountpoints under dir while keeping dir and its metadata files.
+func UnmountFilterDir(dir string, ctl Controller) error {
 	cleanDir := filepath.Clean(dir)
 	if cleanDir == "" || cleanDir == "/" || cleanDir == "." {
-		return fmt.Errorf("refusing to remove unsafe directory %q", dir)
+		return fmt.Errorf("refusing to unmount unsafe directory %q", dir)
 	}
 	if ctl == nil {
 		ctl = OSController{}
@@ -238,19 +270,43 @@ func TeardownFilterDir(dir string, ctl Controller) error {
 		}
 	}
 
-	// Final safety barrier: NEVER os.RemoveAll through a live FUSE mount.
 	finalEntries, err := ctl.ListMounts()
 	if err != nil {
-		return fmt.Errorf("verify mount table before removal: %w", err)
+		return fmt.Errorf("verify mount table after unmount: %w", err)
 	}
 	if remaining := MountsUnder(finalEntries, cleanDir); len(remaining) > 0 {
-		return fmt.Errorf("refusing to remove %s: %d mount(s) still active (%s)", cleanDir, len(remaining), strings.Join(remaining, ", "))
+		return fmt.Errorf("%d mount(s) still active under %s (%s)", len(remaining), cleanDir, strings.Join(remaining, ", "))
 	}
 
+	removePIDFiles(cleanDir)
+	return nil
+}
+
+// TeardownFilterDir stops FUSE filter daemons recorded in dir/m*.pid and
+// unmounts all mountpoints under dir. It deletes dir only after it verifies
+// that zero mounts remain under dir in /proc/self/mountinfo.
+func TeardownFilterDir(dir string, ctl Controller) error {
+	cleanDir := filepath.Clean(dir)
+	if cleanDir == "" || cleanDir == "/" || cleanDir == "." {
+		return fmt.Errorf("refusing to remove unsafe directory %q", dir)
+	}
+	if err := UnmountFilterDir(cleanDir, ctl); err != nil {
+		return fmt.Errorf("refusing to remove %s: %w", cleanDir, err)
+	}
 	if err := os.RemoveAll(cleanDir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove filter dir %s: %w", cleanDir, err)
 	}
 	return nil
+}
+
+func removePIDFiles(dir string) {
+	matches, err := filepath.Glob(filepath.Join(dir, "m*.pid"))
+	if err != nil {
+		return
+	}
+	for _, pf := range matches {
+		_ = os.Remove(pf)
+	}
 }
 
 func signalRecordedPIDs(dir string, sig syscall.Signal, ctl Controller) {

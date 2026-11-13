@@ -282,9 +282,9 @@ apt-get install -y -qq --no-install-recommends \
 if [ ! -x /usr/local/go/bin/go ]; then
   echo '[agbox]   -> Downloading upstream Go toolchain...'
   arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-  go_ver="$(curl -fsSL 'https://go.dev/VERSION?m=text' 2>/dev/null | head -1 || true)"
+  go_ver="$(curl --proto '=https' --tlsv1.2 -fsSL 'https://go.dev/VERSION?m=text' 2>/dev/null | head -1 || true)"
   if [ -n "${go_ver}" ]; then
-    if curl -fsSL "https://go.dev/dl/${go_ver}.linux-${arch}.tar.gz" -o /tmp/go.tgz; then
+    if curl --proto '=https' --tlsv1.2 -fsSL "https://go.dev/dl/${go_ver}.linux-${arch}.tar.gz" -o /tmp/go.tgz; then
       rm -rf /usr/local/go
       tar -C /usr/local -xzf /tmp/go.tgz
       rm -f /tmp/go.tgz
@@ -301,7 +301,7 @@ su - agent -c '
   export TMPDIR=/var/tmp
   mkdir -p /home/agent/go/bin
   echo "[agbox]   -> Installing golangci-lint..."
-  if ! curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /home/agent/go/bin; then
+  if ! curl --proto "=https" --tlsv1.2 -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /home/agent/go/bin; then
     go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
   fi
   for pkg in \
@@ -406,8 +406,8 @@ apt-get install -y -qq --no-install-recommends \
   build-essential ca-certificates curl git >/dev/null
 
 arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-hugo_ver="$(curl -fsSL https://api.github.com/repos/gohugoio/hugo/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[^"]+"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/' || true)"
-if [ -n "${hugo_ver}" ] && curl -fsSL "https://github.com/gohugoio/hugo/releases/download/v${hugo_ver}/hugo_extended_${hugo_ver}_linux-${arch}.tar.gz" -o /tmp/hugo.tgz; then
+hugo_ver="$(curl --proto '=https' --tlsv1.2 -fsSL https://api.github.com/repos/gohugoio/hugo/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[^"]+"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/' || true)"
+if [ -n "${hugo_ver}" ] && curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/gohugoio/hugo/releases/download/v${hugo_ver}/hugo_extended_${hugo_ver}_linux-${arch}.tar.gz" -o /tmp/hugo.tgz; then
   tar -C /usr/local/bin -xzf /tmp/hugo.tgz hugo
   chmod 0755 /usr/local/bin/hugo
   rm -f /tmp/hugo.tgz

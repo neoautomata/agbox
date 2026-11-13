@@ -9,6 +9,9 @@ import (
 	"slices"
 	"syscall"
 	"testing"
+
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 func TestIsProtectedXattr(t *testing.T) {
@@ -20,15 +23,442 @@ func TestIsProtectedXattr(t *testing.T) {
 		{"security.selinux", true},
 		{"system.posix_acl_access", true},
 		{"system.posix_acl_default", true},
+		{"trusted.overlay.opaque", true},
+		{"user.", true},
+		{"", true},
 		{"user.comment", false},
-		{"trusted.overlay.opaque", false},
-		{"", false},
+		{"user.agbox.tag", false},
 	}
 
 	for _, tc := range tests {
 		if got := IsProtectedXattr(tc.attr); got != tc.want {
 			t.Errorf("IsProtectedXattr(%q) = %v, want %v", tc.attr, got, tc.want)
 		}
+	}
+}
+
+func TestValidateSymlinkTarget(t *testing.T) {
+	hidden := buildHiddenSet(DefaultHiddenEntries)
+	cases := []struct {
+		parent string
+		name   string
+		target string
+		want   syscall.Errno
+	}{
+		{"", "link.go", "main.go", 0},
+		{"", "link_sub", "pkg/lib.go", 0},
+		{"pkg", "up_ok", "../main.go", 0},
+		{"pkg/deep", "up2_ok", "../../main.go", 0},
+		{"", "github_ok", ".github/workflows/ci.yml", 0},
+		{"", "abs_bad", "/etc/passwd", syscall.EPERM},
+		{"", "escape_root", "../secret.txt", syscall.EPERM},
+		{"pkg", "escape_sub", "../../secret.txt", syscall.EPERM},
+		{"", "git_target", ".git/config", syscall.EPERM},
+		{"pkg", "jj_upper", "../.JJ/repo", syscall.EPERM},
+		{"", "gitignore_target", ".gitignore", syscall.EPERM},
+		{"", ".git", "main.go", syscall.EPERM},
+		{"", ".GITIGNORE", "main.go", syscall.EPERM},
+		{"", "empty_target", "", syscall.EINVAL},
+		{"", "nul_target", "a\x00b", syscall.EINVAL},
+		{"", "../badname", "main.go", syscall.EINVAL},
+	}
+	for _, tc := range cases {
+		if got := ValidateSymlinkTarget(tc.parent, tc.name, tc.target, hidden); got != tc.want {
+			t.Errorf("ValidateSymlinkTarget(%q, %q, %q) = %v, want %v", tc.parent, tc.name, tc.target, got, tc.want)
+		}
+	}
+}
+
+func newTestFilteredRoot(t *testing.T) (srcDir string, root *FilteredNode) {
+	t.Helper()
+	srcDir = filepath.Join(t.TempDir(), "share")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pr, st, err := newPinnedRoot(srcDir)
+	if err != nil {
+		t.Fatalf("newPinnedRoot: %v", err)
+	}
+	t.Cleanup(pr.Close)
+
+	hidden := buildHiddenSet(DefaultHiddenEntries)
+	rootData := &fs.LoopbackRoot{
+		Path: srcDir,
+		Dev:  uint64(st.Dev),
+	}
+	root = &FilteredNode{
+		LoopbackNode: &fs.LoopbackNode{RootData: rootData},
+		root:         pr,
+		hidden:       hidden,
+		isRoot:       true,
+	}
+	rootData.RootNode = root
+	_ = fs.NewNodeFS(root, &fs.Options{})
+	return srcDir, root
+}
+
+func TestFilteredNodeKernelSyscallsAndSecurityBoundaries(t *testing.T) {
+	ctx := context.Background()
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "host-secret.txt")
+	if err := os.WriteFile(outsideFile, []byte("DO-NOT-TOUCH"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srcDir, root := newTestFilteredRoot(t)
+
+	// Seed VCS directories/files (including uppercase .GIT), .github, regular files, and host symlinks.
+	for _, dir := range []string{".git", ".GIT", ".jj", ".github", "pkg"} {
+		if err := os.MkdirAll(filepath.Join(srcDir, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, ".git", "config"), []byte("git-secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, ".gitignore"), []byte("*.key\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, ".gitmodules"), []byte("[submodule]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(srcDir, "escape_link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(".git/config", filepath.Join(srcDir, "vcs_link")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Readdir hides .git, .GIT, .jj, .gitignore, .gitmodules while keeping .github, main.go, pkg, and symlinks.
+	stream, errno := root.Readdir(ctx)
+	if errno != 0 {
+		t.Fatalf("Readdir: %v", errno)
+	}
+	var gotNames []string
+	for stream.HasNext() {
+		de, dErrno := stream.Next()
+		if dErrno != 0 {
+			t.Fatalf("stream.Next: %v", dErrno)
+		}
+		if de.Name == "." || de.Name == ".." {
+			continue
+		}
+		gotNames = append(gotNames, de.Name)
+	}
+	stream.Close()
+	slices.Sort(gotNames)
+	wantNames := []string{".github", "escape_link", "main.go", "pkg", "vcs_link"}
+	if !slices.Equal(gotNames, wantNames) {
+		t.Fatalf("Readdir names = %v, want %v", gotNames, wantNames)
+	}
+
+	// 2. Lookup blocks all VCS entries case-insensitively with ENOENT, while allowing .github.
+	for _, hiddenName := range []string{".git", ".GIT", ".jj", ".JJ", ".gitignore", ".GITIGNORE", ".gitmodules"} {
+		var out fuse.EntryOut
+		if _, lErrno := root.Lookup(ctx, hiddenName, &out); lErrno != syscall.ENOENT {
+			t.Errorf("Lookup(%q) = %v, want ENOENT", hiddenName, lErrno)
+		}
+	}
+	var ghOut fuse.EntryOut
+	if _, lErrno := root.Lookup(ctx, ".github", &ghOut); lErrno != 0 {
+		t.Fatalf("Lookup(.github) failed: %v", lErrno)
+	}
+
+	// 3. Write operations onto VCS names fail with EPERM.
+	var entryOut fuse.EntryOut
+	if _, _, _, cErrno := root.Create(ctx, ".gitignore", syscall.O_CREAT|syscall.O_WRONLY, 0o644, &entryOut); cErrno != syscall.EPERM {
+		t.Errorf("Create(.gitignore) = %v, want EPERM", cErrno)
+	}
+	if _, mErrno := root.Mkdir(ctx, ".GIT", 0o755, &entryOut); mErrno != syscall.EPERM {
+		t.Errorf("Mkdir(.GIT) = %v, want EPERM", mErrno)
+	}
+	if rErrno := root.Unlink(ctx, ".gitignore"); rErrno != syscall.EPERM {
+		t.Errorf("Unlink(.gitignore) = %v, want EPERM", rErrno)
+	}
+	if rErrno := root.Rmdir(ctx, ".git"); rErrno != syscall.EPERM {
+		t.Errorf("Rmdir(.git) = %v, want EPERM", rErrno)
+	}
+
+	// 4. Pre-existing unsafe host symlinks cannot be read, overwritten via Create, or chmod/truncated via Setattr.
+	escapeIno, lErrno := root.Lookup(ctx, "escape_link", &entryOut)
+	if lErrno != 0 {
+		t.Fatalf("Lookup(escape_link): %v", lErrno)
+	}
+	// Verify an unattached/unlinked child node fails closed with ENOENT before attachment.
+	if _, rlErrno := escapeIno.Operations().(*FilteredNode).Readlink(ctx); rlErrno != syscall.ENOENT {
+		t.Errorf("unattached child Readlink = %v, want ENOENT", rlErrno)
+	}
+	root.AddChild("escape_link", escapeIno, true)
+	escapeNode := escapeIno.Operations().(*FilteredNode)
+	if _, rlErrno := escapeNode.Readlink(ctx); rlErrno != syscall.EPERM {
+		t.Errorf("Readlink(escape_link) = %v, want EPERM", rlErrno)
+	}
+	vcsLinkIno, lErrno := root.Lookup(ctx, "vcs_link", &entryOut)
+	if lErrno != 0 {
+		t.Fatalf("Lookup(vcs_link): %v", lErrno)
+	}
+	root.AddChild("vcs_link", vcsLinkIno, true)
+	if _, rlErrno := vcsLinkIno.Operations().(*FilteredNode).Readlink(ctx); rlErrno != syscall.EPERM {
+		t.Errorf("Readlink(vcs_link) = %v, want EPERM", rlErrno)
+	}
+	if _, _, _, cErrno := root.Create(ctx, "escape_link", syscall.O_WRONLY|syscall.O_TRUNC, 0o644, &entryOut); cErrno == 0 {
+		t.Fatal("Create(escape_link) unexpectedly succeeded and followed symlink")
+	}
+	var attrOut fuse.AttrOut
+	setIn := fuse.SetAttrIn{}
+	setIn.Valid = fuse.FATTR_MODE | fuse.FATTR_SIZE
+	setIn.Mode = 0o777
+	setIn.Size = 0
+	if sErrno := escapeNode.Setattr(ctx, nil, &setIn, &attrOut); sErrno == 0 {
+		t.Fatal("Setattr on symlink unexpectedly succeeded")
+	}
+	// Verify outsideFile content and mode were untouched.
+	outsideBytes, err := os.ReadFile(outsideFile)
+	if err != nil || string(outsideBytes) != "DO-NOT-TOUCH" {
+		t.Fatalf("outside host file modified: %q (%v)", string(outsideBytes), err)
+	}
+
+	// 5. Symlink allows safe relative intra-share links and rejects unsafe targets.
+	safeIno, sErrno := root.Symlink(ctx, "main.go", "safe_link", &entryOut)
+	if sErrno != 0 {
+		t.Fatalf("Symlink(safe_link -> main.go) failed: %v", sErrno)
+	}
+	root.AddChild("safe_link", safeIno, true)
+	if target, rlErrno := safeIno.Operations().(*FilteredNode).Readlink(ctx); rlErrno != 0 || string(target) != "main.go" {
+		t.Errorf("Readlink(safe_link) = (%q, %v), want (main.go, 0)", string(target), rlErrno)
+	}
+	for _, badTarget := range []string{"/etc/passwd", "../outside", ".git/config", ".gitignore"} {
+		if _, bErrno := root.Symlink(ctx, badTarget, "bad_sym", &entryOut); bErrno != syscall.EPERM {
+			t.Errorf("Symlink(target=%q) = %v, want EPERM", badTarget, bErrno)
+		}
+	}
+
+	// 6. Mknod blocks FIFOs and device nodes with EPERM, and allows regular files while stripping setuid/setgid.
+	for _, badMode := range []uint32{
+		syscall.S_IFIFO | 0o600,
+		syscall.S_IFSOCK | 0o600,
+		syscall.S_IFCHR | 0o600,
+		syscall.S_IFBLK | 0o600,
+	} {
+		if _, mkErrno := root.Mknod(ctx, "special", badMode, 0, &entryOut); mkErrno != syscall.EPERM {
+			t.Errorf("Mknod(mode=%#o) = %v, want EPERM", badMode, mkErrno)
+		}
+	}
+	if _, mkErrno := root.Mknod(ctx, "mknod_reg.txt", syscall.S_IFREG|syscall.S_ISUID|syscall.S_ISGID|0o644, 0, &entryOut); mkErrno != 0 {
+		t.Fatalf("Mknod(S_IFREG) failed: %v", mkErrno)
+	}
+	stReg, err := os.Lstat(filepath.Join(srcDir, "mknod_reg.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stReg.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
+		t.Errorf("expected setuid/setgid bits to be stripped on Mknod, got mode %v", stReg.Mode())
+	}
+
+	// 7. Create strips setuid/setgid, wraps handle in safeFile (no PassthroughFd or Ioctl),
+	// rejects setuid/chown in Setattr, and supports chmod on mode 0000 regular files.
+	createdIno, fh, _, cErrno := root.Create(ctx, "created.txt", syscall.O_CREAT|syscall.O_RDWR, syscall.S_ISUID|syscall.S_ISGID|0o600, &entryOut)
+	if cErrno != 0 {
+		t.Fatalf("Create(created.txt): %v", cErrno)
+	}
+	if _, ok := fh.(fs.FilePassthroughFder); ok {
+		t.Error("safeFile must not expose FilePassthroughFder")
+	}
+	if _, ok := fh.(fs.FileIoctler); ok {
+		t.Error("safeFile must not expose FileIoctler")
+	}
+	if relCaller, ok := fh.(fs.FileReleaser); ok {
+		_ = relCaller.Release(ctx)
+	}
+	root.AddChild("created.txt", createdIno, true)
+	createdNode := createdIno.Operations().(*FilteredNode)
+
+	// Setattr with setuid must fail with EPERM.
+	suidIn := fuse.SetAttrIn{}
+	suidIn.Valid = fuse.FATTR_MODE
+	suidIn.Mode = syscall.S_ISUID | 0o755
+	if errNo := createdNode.Setattr(ctx, nil, &suidIn, &attrOut); errNo != syscall.EPERM {
+		t.Errorf("Setattr(S_ISUID) = %v, want EPERM", errNo)
+	}
+	// Setattr with cross-UID chown must fail with EPERM.
+	chownIn := fuse.SetAttrIn{}
+	chownIn.Valid = fuse.FATTR_UID
+	chownIn.Uid = uint32(os.Geteuid() + 1)
+	if errNo := createdNode.Setattr(ctx, nil, &chownIn, &attrOut); errNo != syscall.EPERM {
+		t.Errorf("Setattr(cross-UID) = %v, want EPERM", errNo)
+	}
+	// Chmod to 0000 and back to 0644 on a regular file must succeed via /proc/self/fd/<fd>.
+	zeroIn := fuse.SetAttrIn{}
+	zeroIn.Valid = fuse.FATTR_MODE
+	zeroIn.Mode = 0
+	if errNo := createdNode.Setattr(ctx, nil, &zeroIn, &attrOut); errNo != 0 {
+		t.Fatalf("Setattr(0000) failed: %v", errNo)
+	}
+	restoreIn := fuse.SetAttrIn{}
+	restoreIn.Valid = fuse.FATTR_MODE
+	restoreIn.Mode = 0o644
+	if errNo := createdNode.Setattr(ctx, nil, &restoreIn, &attrOut); errNo != 0 {
+		t.Fatalf("Setattr(0644 on 0000 file) failed: %v", errNo)
+	}
+
+	// 8. Non-user xattrs fail with EPERM on Setxattr, Getxattr, and Removexattr.
+	for _, blockedAttr := range []string{"security.capability", "system.posix_acl_access", "trusted.overlay.opaque", "user."} {
+		if xErrno := createdNode.Setxattr(ctx, blockedAttr, []byte("v"), 0); xErrno != syscall.EPERM {
+			t.Errorf("Setxattr(%q) = %v, want EPERM", blockedAttr, xErrno)
+		}
+		if xErrno := createdNode.Removexattr(ctx, blockedAttr); xErrno != syscall.EPERM {
+			t.Errorf("Removexattr(%q) = %v, want EPERM", blockedAttr, xErrno)
+		}
+		if _, xErrno := createdNode.Getxattr(ctx, blockedAttr, make([]byte, 16)); xErrno != syscall.ENODATA {
+			t.Errorf("Getxattr(%q) = %v, want ENODATA", blockedAttr, xErrno)
+		}
+	}
+
+	// 9. Exhaustive check across all 22 DefaultHiddenEntries, OpendirHandle, Open/Link/Rename escapes, FIFOs, and safeFile.Setattr.
+	pkgIno, lErrno := root.Lookup(ctx, "pkg", &entryOut)
+	if lErrno != 0 {
+		t.Fatalf("Lookup(pkg): %v", lErrno)
+	}
+	root.AddChild("pkg", pkgIno, true)
+	pkgNode := pkgIno.Operations().(*FilteredNode)
+
+	mainIno, lErrno := root.Lookup(ctx, "main.go", &entryOut)
+	if lErrno != 0 {
+		t.Fatalf("Lookup(main.go): %v", lErrno)
+	}
+	root.AddChild("main.go", mainIno, true)
+	mainNode := mainIno.Operations().(*FilteredNode)
+
+	for _, vcsName := range DefaultHiddenEntries {
+		for _, cand := range []string{vcsName, filepath.Base(vcsName)} {
+			if _, errNo := root.Lookup(ctx, cand, &entryOut); errNo != syscall.ENOENT {
+				t.Errorf("Lookup(%q) = %v, want ENOENT", cand, errNo)
+			}
+			if _, _, _, errNo := pkgNode.Create(ctx, cand, syscall.O_CREAT|syscall.O_WRONLY, 0o644, &entryOut); errNo != syscall.EPERM {
+				t.Errorf("nested Create(%q) = %v, want EPERM", cand, errNo)
+			}
+			if _, errNo := pkgNode.Mkdir(ctx, cand, 0o755, &entryOut); errNo != syscall.EPERM {
+				t.Errorf("nested Mkdir(%q) = %v, want EPERM", cand, errNo)
+			}
+			if _, errNo := pkgNode.Link(ctx, mainNode, cand, &entryOut); errNo != syscall.EPERM {
+				t.Errorf("nested Link(%q) = %v, want EPERM", cand, errNo)
+			}
+			if errNo := root.Rename(ctx, "main.go", pkgNode, cand, 0); errNo != syscall.EPERM {
+				t.Errorf("Rename(main.go -> pkg/%s) = %v, want EPERM", cand, errNo)
+			}
+			if errNo := root.Rename(ctx, cand, pkgNode, "stolen", 0); errNo != syscall.EPERM {
+				t.Errorf("Rename(%s -> pkg/stolen) = %v, want EPERM", cand, errNo)
+			}
+		}
+	}
+
+	// OpendirHandle must omit hidden entries and hide FilePassthroughFder and FileIoctler.
+	dirFH, _, odErrno := root.OpendirHandle(ctx, 0)
+	if odErrno != 0 {
+		t.Fatalf("OpendirHandle: %v", odErrno)
+	}
+	if _, ok := dirFH.(fs.FilePassthroughFder); ok {
+		t.Error("filteredDir must not expose FilePassthroughFder")
+	}
+	if _, ok := dirFH.(fs.FileIoctler); ok {
+		t.Error("filteredDir must not expose FileIoctler")
+	}
+	if rde, ok := dirFH.(fs.FileReaddirenter); ok {
+		for {
+			de, rErrno := rde.Readdirent(ctx)
+			if rErrno != 0 {
+				t.Fatalf("Readdirent: %v", rErrno)
+			}
+			if de == nil {
+				break
+			}
+			if isHiddenEntry(de.Name, root.hidden) {
+				t.Errorf("OpendirHandle leaked hidden VCS entry %q", de.Name)
+			}
+		}
+	}
+	if relDir, ok := dirFH.(fs.FileReleasedirer); ok {
+		relDir.Releasedir(ctx, 0)
+	}
+
+	// Open on pre-existing host symlink and pre-existing host FIFO must fail.
+	if _, _, oErrno := escapeNode.Open(ctx, syscall.O_RDONLY); oErrno == 0 {
+		t.Error("Open(escape_link) unexpectedly succeeded")
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(srcDir, "escape_dir")); err != nil {
+		t.Fatal(err)
+	}
+	escDirIno, lErrno := root.Lookup(ctx, "escape_dir", &entryOut)
+	if lErrno != 0 {
+		t.Fatalf("Lookup(escape_dir): %v", lErrno)
+	}
+	root.AddChild("escape_dir", escDirIno, true)
+	if _, travErrno := escDirIno.Operations().(*FilteredNode).Lookup(ctx, "host-secret.txt", &entryOut); travErrno == 0 {
+		t.Fatal("Lookup through symlinked host directory unexpectedly succeeded")
+	}
+
+	// Link on a symlink must fail with EPERM, and cross-root Link/Rename must fail with EXDEV.
+	if _, lkErrno := root.Link(ctx, escapeNode, "hardlinked_sym", &entryOut); lkErrno != syscall.EPERM {
+		t.Errorf("Link(escape_link) = %v, want EPERM", lkErrno)
+	}
+	_, otherRoot := newTestFilteredRoot(t)
+	if _, lkErrno := otherRoot.Link(ctx, mainNode, "cross_link", &entryOut); lkErrno != syscall.EXDEV {
+		t.Errorf("cross-root Link = %v, want EXDEV", lkErrno)
+	}
+	if rnErrno := root.Rename(ctx, "main.go", otherRoot, "cross_rename", 0); rnErrno != syscall.EXDEV {
+		t.Errorf("cross-root Rename = %v, want EXDEV", rnErrno)
+	}
+
+	// Pre-existing host FIFO cannot be opened through FilteredNode.Open.
+	hostFIFO := filepath.Join(srcDir, "host.fifo")
+	if err := syscall.Mkfifo(hostFIFO, 0o600); err == nil {
+		fifoIno, fErrno := root.Lookup(ctx, "host.fifo", &entryOut)
+		if fErrno != 0 {
+			t.Fatalf("Lookup(host.fifo): %v", fErrno)
+		}
+		root.AddChild("host.fifo", fifoIno, true)
+		if _, _, openErr := fifoIno.Operations().(*FilteredNode).Open(ctx, syscall.O_RDONLY|syscall.O_NONBLOCK); openErr != syscall.EPERM {
+			t.Errorf("Open(host.fifo) = %v, want EPERM", openErr)
+		}
+	}
+
+	// Mkdir strips S_ISUID and S_ISGID, and open-handle safeFile.Setattr blocks S_ISUID and cross-UID chown.
+	if _, mkErrno := root.Mkdir(ctx, "suid_dir", syscall.S_ISUID|syscall.S_ISGID|0o755, &entryOut); mkErrno != 0 {
+		t.Fatalf("Mkdir(suid_dir): %v", mkErrno)
+	}
+	stDir, err := os.Lstat(filepath.Join(srcDir, "suid_dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stDir.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
+		t.Errorf("expected Mkdir to strip setuid/setgid, got %v", stDir.Mode())
+	}
+
+	openFH, _, oErrno := createdNode.Open(ctx, syscall.O_RDWR)
+	if oErrno != 0 {
+		t.Fatalf("Open(created.txt): %v", oErrno)
+	}
+	sfAttr := openFH.(fs.FileSetattrer)
+	if errNo := sfAttr.Setattr(ctx, &suidIn, &attrOut); errNo != syscall.EPERM {
+		t.Errorf("safeFile.Setattr(S_ISUID) = %v, want EPERM", errNo)
+	}
+	if errNo := sfAttr.Setattr(ctx, &chownIn, &attrOut); errNo != syscall.EPERM {
+		t.Errorf("safeFile.Setattr(cross-UID) = %v, want EPERM", errNo)
+	}
+	if relCaller, ok := openFH.(fs.FileReleaser); ok {
+		_ = relCaller.Release(ctx)
+	}
+
+	// Symlink nodes reject xattr operations and return 0 bytes for Listxattr.
+	safeNode := safeIno.Operations().(*FilteredNode)
+	if xErr := safeNode.Setxattr(ctx, "user.tag", []byte("1"), 0); xErr != syscall.EPERM {
+		t.Errorf("Setxattr on symlink = %v, want EPERM", xErr)
+	}
+	if sz, xErr := safeNode.Listxattr(ctx, nil); xErr != 0 || sz != 0 {
+		t.Errorf("Listxattr on symlink = (%d, %v), want (0, 0)", sz, xErr)
 	}
 }
 
@@ -337,10 +767,17 @@ func TestRunMainValidationAndStartSubprocess(t *testing.T) {
 		t.Errorf("RunMain(nonexistent) = %d, want 1", rc)
 	}
 
-	// Test StartSubprocess failure when binary exits immediately.
+	// Test StartSubprocess failure when binary exits immediately or mountpoint is a symlink.
 	base := t.TempDir()
 	pidFile := filepath.Join(base, "m0.pid")
 	if _, err := StartSubprocess("/bin/false", base, filepath.Join(base, "m0"), pidFile, true); err == nil {
 		t.Error("expected error when filter subprocess exits before mounting")
+	}
+	symMnt := filepath.Join(base, "sym-mnt")
+	if err := os.Symlink(base, symMnt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartSubprocess("/bin/false", base, symMnt, pidFile, true); err == nil {
+		t.Error("expected StartSubprocess to reject symlinked mountpoint")
 	}
 }

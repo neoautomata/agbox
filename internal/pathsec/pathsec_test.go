@@ -34,6 +34,15 @@ func TestContainsVCSComponent(t *testing.T) {
 	if name, ok := ContainsVCSComponent("/home/u/proj/.git/config", vcs); !ok || name != ".git" {
 		t.Errorf("expected .git match, got (%q, %v)", name, ok)
 	}
+	if name, ok := ContainsVCSComponent("/home/u/proj/.GIT/hooks", vcs); !ok || strings.ToLower(name) != ".git" {
+		t.Errorf("expected case-insensitive .GIT match, got (%q, %v)", name, ok)
+	}
+	if name, ok := ContainsVCSComponent("/home/u/proj/.jj/repo/store", vcs); !ok || name != ".jj" {
+		t.Errorf("expected .jj match, got (%q, %v)", name, ok)
+	}
+	if name, ok := ContainsVCSComponent("/home/u/proj/.gitignore", vcs); !ok || name != ".gitignore" {
+		t.Errorf("expected .gitignore match, got (%q, %v)", name, ok)
+	}
 	if name, ok := ContainsVCSComponent("/home/u/proj/.github/workflows/ci.yml", vcs); ok {
 		t.Errorf("unexpected match on .github: %q", name)
 	}
@@ -143,16 +152,45 @@ func TestValidateShareHappyAndBoundaryConditions(t *testing.T) {
 		t.Errorf("expected parent of symlinked ~/.bashrc target (~/dotfiles) to be blocked")
 	}
 
-	// 8. Reject sharing .git directly or a single file inside .git.
+	// 8. Reject sharing VCS directories, subdirectories inside VCS dirs, case-folded VCS names, and VCS control files.
 	gitDir := filepath.Join(projDir, ".git")
-	_ = os.MkdirAll(gitDir, 0o700)
+	gitHooksDir := filepath.Join(gitDir, "hooks")
+	_ = os.MkdirAll(gitHooksDir, 0o700)
 	gitCfg := filepath.Join(gitDir, "config")
 	_ = os.WriteFile(gitCfg, []byte("[core]\n"), 0o600)
-	if _, err := ValidateShare(gitDir, pol); err == nil {
-		t.Errorf("expected sharing .git dir directly to fail")
+	jjRepoDir := filepath.Join(projDir, ".jj", "repo")
+	_ = os.MkdirAll(jjRepoDir, 0o700)
+	upperGitDir := filepath.Join(projDir, ".GIT")
+	_ = os.MkdirAll(upperGitDir, 0o700)
+	gitignoreFile := filepath.Join(projDir, ".gitignore")
+	_ = os.WriteFile(gitignoreFile, []byte("*.secret\n"), 0o600)
+	gitmodulesFile := filepath.Join(projDir, ".gitmodules")
+	_ = os.WriteFile(gitmodulesFile, []byte("[submodule]\n"), 0o600)
+	for _, blockedVCSPath := range []string{gitDir, gitHooksDir, gitCfg, jjRepoDir, upperGitDir, gitignoreFile, gitmodulesFile} {
+		if _, err := ValidateShare(blockedVCSPath, pol); err == nil {
+			t.Errorf("expected sharing VCS path %s to fail", blockedVCSPath)
+		}
 	}
-	if _, err := ValidateShare(gitCfg, pol); err == nil {
-		t.Errorf("expected sharing single file under .git to fail")
+	// .github directory is allowed (CI workflows, not git repository storage).
+	githubDir := filepath.Join(projDir, ".github")
+	_ = os.MkdirAll(githubDir, 0o700)
+	if _, err := ValidateShare(githubDir, pol); err != nil {
+		t.Errorf("expected .github directory to be allowed, got %v", err)
+	}
+	// ~/.config/jj and ~/.jjconfig.toml must be blocked via DefaultBlocklist.
+	jjCfgDir := filepath.Join(home, ".config", "jj")
+	_ = os.MkdirAll(jjCfgDir, 0o700)
+	if _, err := ValidateShare(jjCfgDir, pol); err == nil {
+		t.Errorf("expected ~/.config/jj to be blocked")
+	}
+	jjToml := filepath.Join(home, ".jjconfig.toml")
+	_ = os.WriteFile(jjToml, []byte("[user]\n"), 0o600)
+	if _, err := ValidateShare(jjToml, pol); err == nil {
+		t.Errorf("expected ~/.jjconfig.toml to be blocked")
+	}
+	// Control characters in paths must be rejected.
+	if _, err := ValidateShare(projDir+"\x07", pol); err == nil {
+		t.Errorf("expected control character in path to be rejected")
 	}
 
 	// 9. Reject writable single file with nlink > 1, but allow when ReadOnly=true.
@@ -201,5 +239,150 @@ func TestAssignGuestNamesAndFormatVolumeSpec(t *testing.T) {
 	roSpec := FormatVolumeSpec("/home/u/a/app", "app-2", true, 1000, 1000)
 	if roSpec != "/home/u/a/app:/workspace/app-2:ro,uid=1000,gid=1000" {
 		t.Errorf("roSpec = %q", roSpec)
+	}
+}
+
+func TestDefaultBlocklistForRootAndNonRootHomes(t *testing.T) {
+	nonRootList := DefaultBlocklist("/home/alice", "/home/alice/.local/share/agbox", "/home/alice/.microsandbox")
+	foundBlanketRoot := false
+	for _, entry := range nonRootList {
+		if entry == "/root" {
+			foundBlanketRoot = true
+			break
+		}
+	}
+	if !foundBlanketRoot {
+		t.Error("expected /root in blocklist when homeReal is /home/alice")
+	}
+
+	rootList := DefaultBlocklist("/root", "/root/.local/share/agbox", "/root/.microsandbox")
+	for _, entry := range rootList {
+		if entry == "/root" {
+			t.Fatal("did not expect blanket /root entry when homeReal is /root")
+		}
+		if IsSubpath("/root/myapp", entry) {
+			t.Errorf("expected /root/myapp not to match blocklist entry %q when homeReal is /root", entry)
+		}
+	}
+
+	// Sensitive subpaths and /root itself (parent of /root/.ssh) remain blocked.
+	foundRootSSH := false
+	foundParentOfBlocked := false
+	for _, entry := range rootList {
+		if entry == "/root/.ssh" {
+			foundRootSSH = true
+		}
+		if IsSubpath(entry, "/root") && entry != "/root" {
+			foundParentOfBlocked = true
+		}
+	}
+	if !foundRootSSH || !foundParentOfBlocked {
+		t.Errorf("expected /root/.ssh and child entries under /root in blocklist: ssh=%v parent=%v", foundRootSSH, foundParentOfBlocked)
+	}
+}
+
+func TestAllDefaultVCSNamesAndBlocklistCategories(t *testing.T) {
+	root := t.TempDir()
+	home, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(home, ".local", "share", "agbox")
+	msbHome := filepath.Join(home, ".microsandbox")
+	pol := Policy{
+		HomeReal:  home,
+		Blocklist: DefaultBlocklist(home, dataDir, msbHome),
+		VCSNames:  DefaultVCSNames(),
+	}
+
+	projDir := filepath.Join(home, "workspace-repo")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify every DefaultVCSNames entry (exact and uppercase) is rejected as a file, directory, and subdirectory.
+	for i, vcs := range DefaultVCSNames() {
+		caseVariants := []string{vcs, strings.ToUpper(vcs)}
+		for j, variant := range caseVariants {
+			parent := filepath.Join(projDir, "c"+string(rune('a'+i%20)), "v"+string(rune('0'+j)))
+			if err := os.MkdirAll(parent, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			asFile := filepath.Join(parent, variant)
+			if err := os.WriteFile(asFile, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ValidateShare(asFile, pol); err == nil {
+				t.Errorf("expected VCS file %q to be rejected", asFile)
+			}
+			_ = os.Remove(asFile)
+
+			asDir := filepath.Join(parent, variant)
+			subDir := filepath.Join(asDir, "nested")
+			if err := os.MkdirAll(subDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ValidateShare(asDir, pol); err == nil {
+				t.Errorf("expected VCS directory %q to be rejected", asDir)
+			}
+			if _, err := ValidateShare(subDir, pol); err == nil {
+				t.Errorf("expected VCS subdirectory %q to be rejected", subDir)
+			}
+		}
+	}
+
+	// Verify representative paths from every DefaultBlocklist security category are rejected.
+	blockedDirs := []string{
+		filepath.Join(home, ".ssh"),
+		filepath.Join(home, ".gnupg"),
+		filepath.Join(home, ".aws"),
+		filepath.Join(home, ".kube"),
+		filepath.Join(home, ".config", "gcloud"),
+		filepath.Join(home, ".config", "gh"),
+		filepath.Join(home, ".gemini"),
+		filepath.Join(home, ".antigravity"),
+		filepath.Join(home, ".claude"),
+		filepath.Join(home, ".config", "opencode"),
+		filepath.Join(home, ".config", "git"),
+		filepath.Join(home, ".config", "jj"),
+		filepath.Join(home, ".subversion"),
+		filepath.Join(home, ".bazaar"),
+		filepath.Join(home, ".config", "direnv"),
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(home, "bin"),
+		dataDir,
+		msbHome,
+	}
+	for _, bd := range blockedDirs {
+		if err := os.MkdirAll(bd, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ValidateShare(bd, pol); err == nil {
+			t.Errorf("expected blocklisted dir %q to fail ValidateShare", bd)
+		}
+	}
+
+	blockedFiles := []string{
+		filepath.Join(home, ".git-credentials"),
+		filepath.Join(home, ".gitconfig"),
+		filepath.Join(home, ".jjconfig.toml"),
+		filepath.Join(home, ".hgrc"),
+		filepath.Join(home, ".bashrc"),
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".profile"),
+		filepath.Join(home, ".envrc"),
+		filepath.Join(home, ".npmrc"),
+		filepath.Join(home, ".netrc"),
+	}
+	for _, bf := range blockedFiles {
+		if err := os.MkdirAll(filepath.Dir(bf), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(bf, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ValidateShare(bf, pol); err == nil {
+			t.Errorf("expected blocklisted file %q to fail ValidateShare", bf)
+		}
 	}
 }

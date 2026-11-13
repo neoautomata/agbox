@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -13,7 +14,7 @@ func TestParseMaskMode(t *testing.T) {
 		want    MaskMode
 		wantErr bool
 	}{
-		{"", MaskAuto, false},
+		{"", MaskStrict, false},
 		{"auto", MaskAuto, false},
 		{"AUTO", MaskAuto, false},
 		{"strict", MaskStrict, false},
@@ -51,8 +52,8 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 	if env.CPUs != DefaultCPUs || env.Memory != DefaultMemory || env.RootDisk != DefaultRootDisk {
 		t.Errorf("unexpected defaults: %+v", env)
 	}
-	if env.MaskVCS != MaskAuto || env.AllowOutsideHome {
-		t.Errorf("unexpected mask/outside defaults: %+v", env)
+	if env.MaskVCS != MaskStrict || env.AllowOutsideHome || env.AllowRoot {
+		t.Errorf("unexpected security defaults: %+v", env)
 	}
 
 	overrides := map[string]string{
@@ -63,8 +64,9 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 		"AGBOX_ROOT_DISK":          "16G",
 		"AGBOX_OPENCODE_VERSION":   "1.19.5",
 		"AGBOX_AGY_INSTALLER_URL":  "https://example.com/install.sh",
-		"AGBOX_MASK_VCS":           "strict",
+		"AGBOX_MASK_VCS":           "auto",
 		"AGBOX_ALLOW_OUTSIDE_HOME": "1",
+		"AGBOX_ALLOW_ROOT":         "1",
 	}
 	env2, err := FromLookup("/home/alice", func(k string) string { return overrides[k] })
 	if err != nil {
@@ -76,7 +78,7 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 	if env2.CPUs != "4" || env2.Memory != "8G" || env2.RootDisk != "16G" {
 		t.Errorf("resource overrides failed: %+v", env2)
 	}
-	if env2.MaskVCS != MaskStrict || !env2.AllowOutsideHome {
+	if env2.MaskVCS != MaskAuto || !env2.AllowOutsideHome || !env2.AllowRoot {
 		t.Errorf("policy overrides failed: %+v", env2)
 	}
 
@@ -90,6 +92,28 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 		return ""
 	}); err == nil {
 		t.Errorf("expected error for invalid AGBOX_MASK_VCS")
+	}
+
+	invalidEnvCases := []map[string]string{
+		{"AGBOX_CPUS": "0"},
+		{"AGBOX_CPUS": "-2"},
+		{"AGBOX_CPUS": "abc"},
+		{"AGBOX_MEMORY": "0G"},
+		{"AGBOX_MEMORY": "4096"},
+		{"AGBOX_MEMORY": "-v /:/mnt"},
+		{"AGBOX_ROOT_DISK": "0M"},
+		{"AGBOX_ROOT_DISK": "bad"},
+		{"AGBOX_OPENCODE_VERSION": "latest; id"},
+		{"AGBOX_OPENCODE_VERSION": "1.0\nrm"},
+		{"AGBOX_AGY_INSTALLER_URL": "http://example.com/install.sh"},
+		{"AGBOX_AGY_INSTALLER_URL": "file:///etc/passwd"},
+		{"AGBOX_AGY_INSTALLER_URL": "https://example.com/a b"},
+		{"AGBOX_AGY_INSTALLER_URL": "-K /tmp/curlrc"},
+	}
+	for _, badMap := range invalidEnvCases {
+		if _, err := FromLookup("/home/alice", func(k string) string { return badMap[k] }); err == nil {
+			t.Errorf("expected error for invalid env override %v", badMap)
+		}
 	}
 }
 
@@ -149,5 +173,77 @@ func TestNextSnapshotMember(t *testing.T) {
 	n3, ref3 := NextSnapshotMember(6, []string{"agbox:v2"}, "agbox")
 	if n3 != 7 || ref3 != "agbox:v7" {
 		t.Errorf("got (%d, %q), want (7, agbox:v7)", n3, ref3)
+	}
+}
+
+func TestRunMetaRoundTripAndValidation(t *testing.T) {
+	orig := RunMeta{
+		Sandbox:       "agbox-feat1",
+		OwnerPID:      4242,
+		Agent:         "opencode",
+		Mode:          RunModeServe,
+		Detached:      true,
+		RemoteControl: false,
+		Port:          4096,
+		ReadOnly:      true,
+		MaskMode:      MaskStrict,
+		Shares: []ShareRecord{
+			{Index: 0, HostPath: "/home/alice/proj", GuestName: "proj", IsDir: true, Masked: true},
+			{Index: 1, HostPath: "/home/alice/notes.md", GuestName: "notes.md", IsDir: false, Masked: false},
+		},
+	}
+
+	tmpDir := t.TempDir()
+	metaPath := filepath.Join(tmpDir, "run", "feat1", "suspended")
+	if err := SaveRunMeta(metaPath, orig); err != nil {
+		t.Fatalf("SaveRunMeta: %v", err)
+	}
+	info, err := os.Stat(metaPath)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("meta file mode = %o, want 0600", info.Mode().Perm())
+	}
+
+	loaded, err := LoadRunMeta(metaPath)
+	if err != nil {
+		t.Fatalf("LoadRunMeta: %v", err)
+	}
+	if !reflect.DeepEqual(loaded, orig) {
+		t.Errorf("LoadRunMeta = %+v, want %+v", loaded, orig)
+	}
+
+	if _, err := ParseRunMeta(strings.NewReader(`{"owner_pid": 1}`)); err == nil {
+		t.Error("expected error when sandbox name is missing")
+	}
+	if _, err := ParseRunMeta(strings.NewReader(`{"sandbox":"agbox-a","shares":[{"index":-1,"host_path":"/a","guest_name":"a"}]}`)); err == nil {
+		t.Error("expected error when share index is negative")
+	}
+	if _, err := ParseRunMeta(strings.NewReader(`{invalid`)); err == nil {
+		t.Error("expected error on invalid JSON")
+	}
+
+	// EnsurePrivateDir must reject symlinks and non-directory files.
+	realTarget := filepath.Join(tmpDir, "real-dir")
+	if err := os.MkdirAll(realTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkDir := filepath.Join(tmpDir, "symlink-dir")
+	if err := os.Symlink(realTarget, symlinkDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePrivateDir(symlinkDir); err == nil {
+		t.Error("expected EnsurePrivateDir to reject symlinked directory")
+	}
+	if err := SaveFile(filepath.Join(symlinkDir, "config"), State{Snapshot: "agbox:v1"}); err == nil {
+		t.Error("expected SaveFile to reject symlinked parent directory")
+	}
+	regularFile := filepath.Join(tmpDir, "not-a-dir")
+	if err := os.WriteFile(regularFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePrivateDir(regularFile); err == nil {
+		t.Error("expected EnsurePrivateDir to reject regular file")
 	}
 }
