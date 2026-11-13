@@ -357,3 +357,132 @@ func TestProfileLockMetadataAndSessionIDValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestGlobalRulesInstallInspectStageAndSecurity(t *testing.T) {
+	base := t.TempDir()
+	rulesDir := filepath.Join(base, "data", "rules")
+	srcDir := filepath.Join(base, "src")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-existent rulesDir returns nil, nil.
+	if names, err := InspectRulesDir(rulesDir); err != nil || len(names) != 0 {
+		t.Fatalf("InspectRulesDir(missing) = (%v, %v), want (nil, nil)", names, err)
+	}
+
+	// Install AGENTS.md, an always-on frontmatter rule, and a glob-triggered agy rule.
+	agentsSrc := filepath.Join(srcDir, "AGENTS.md")
+	alwaysSrc := filepath.Join(srcDir, "testing.md")
+	globSrc := filepath.Join(srcDir, "go-style.md")
+	if err := os.WriteFile(agentsSrc, []byte("# Core Standards\nRun gofmt.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(alwaysSrc, []byte("---\ntrigger: always_on\n---\n# Testing\nRun go test -race.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(globSrc, []byte("---\ntrigger: glob\nglobs: [\"*.go\"]\n---\n# Go Glob Rule\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if name, sz, err := InstallRule(rulesDir, agentsSrc, "", false); err != nil || name != "AGENTS" || sz == 0 {
+		t.Fatalf("InstallRule(AGENTS.md) = (%q, %d, %v)", name, sz, err)
+	}
+	if _, _, err := InstallRule(rulesDir, agentsSrc, "", false); err == nil {
+		t.Fatal("expected duplicate InstallRule without force to fail")
+	}
+	if _, _, err := InstallRule(rulesDir, agentsSrc, "", true); err != nil {
+		t.Fatalf("InstallRule(force=true) failed: %v", err)
+	}
+	if name, _, err := InstallRule(rulesDir, alwaysSrc, "", false); err != nil || name != "testing" {
+		t.Fatalf("InstallRule(testing.md) = (%q, %v)", name, err)
+	}
+	if name, _, err := InstallRule(rulesDir, globSrc, "go-style.md", false); err != nil || name != "go-style" {
+		t.Fatalf("InstallRule(go-style.md) = (%q, %v)", name, err)
+	}
+
+	names, err := InspectRulesDir(rulesDir)
+	if err != nil || !slices.Equal(names, []string{"AGENTS", "go-style", "testing"}) {
+		t.Fatalf("InspectRulesDir = (%v, %v)", names, err)
+	}
+	rawAgents, err := ReadRule(rulesDir, "AGENTS.md")
+	if err != nil || !strings.Contains(string(rawAgents), "Core Standards") {
+		t.Fatalf("ReadRule(AGENTS.md) = (%q, %v)", string(rawAgents), err)
+	}
+
+	// Execute BuildGuestRulesStageScript via real /bin/sh and verify combined AGENTS.md + modular rules/*.md.
+	stageDir := filepath.Join(base, "staged")
+	stageCmd := exec.Command("/bin/sh", "-c", BuildGuestRulesStageScript(rulesDir, stageDir))
+	if out, sErr := stageCmd.CombinedOutput(); sErr != nil {
+		t.Fatalf("BuildGuestRulesStageScript failed: %v (%s)", sErr, string(out))
+	}
+	combined, err := os.ReadFile(filepath.Join(stageDir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read staged AGENTS.md: %v", err)
+	}
+	combinedStr := string(combined)
+	if !strings.Contains(combinedStr, "# Core Standards") || !strings.Contains(combinedStr, "# Testing") {
+		t.Errorf("staged AGENTS.md missing expected content: %q", combinedStr)
+	}
+	if strings.Contains(combinedStr, "trigger: always_on") || strings.Contains(combinedStr, "Go Glob Rule") {
+		t.Errorf("staged AGENTS.md leaked frontmatter or glob rule: %q", combinedStr)
+	}
+	if strings.Index(combinedStr, "# Core Standards") > strings.Index(combinedStr, "# Testing") {
+		t.Errorf("expected AGENTS.md priority content before testing.md: %q", combinedStr)
+	}
+	globStaged, err := os.ReadFile(filepath.Join(stageDir, "rules", "go-style.md"))
+	if err != nil || !strings.Contains(string(globStaged), "trigger: glob") {
+		t.Errorf("staged modular rule = (%q, %v)", string(globStaged), err)
+	}
+
+	// Verify BuildGuestRulesMountScript binds read-only onto both agy and opencode paths.
+	mntScript := BuildGuestRulesMountScript()
+	for _, want := range []string{
+		"/home/agent/.gemini/config/AGENTS.md",
+		"/home/agent/.config/opencode/AGENTS.md",
+		"/home/agent/.gemini/config/rules",
+		"remount,ro,bind",
+	} {
+		if !strings.Contains(mntScript, want) {
+			t.Errorf("BuildGuestRulesMountScript missing %q", want)
+		}
+	}
+
+	// Boundary and security rejections: empty, binary NUL, oversize, non-.md without --name, symlink inside rulesDir.
+	emptySrc := filepath.Join(srcDir, "empty.md")
+	nulSrc := filepath.Join(srcDir, "nul.md")
+	bigSrc := filepath.Join(srcDir, "big.md")
+	txtSrc := filepath.Join(srcDir, "plain.txt")
+	_ = os.WriteFile(emptySrc, []byte("  \n"), 0o644)
+	_ = os.WriteFile(nulSrc, []byte("bad\x00rule"), 0o644)
+	_ = os.WriteFile(bigSrc, bytes.Repeat([]byte("a"), MaxRuleFileBytes+1), 0o644)
+	_ = os.WriteFile(txtSrc, []byte("# Plain\n"), 0o644)
+	for _, badFile := range []string{emptySrc, nulSrc, bigSrc, txtSrc} {
+		if _, _, bErr := InstallRule(rulesDir, badFile, "", true); bErr == nil {
+			t.Errorf("expected InstallRule(%s) to fail", badFile)
+		}
+	}
+	// Passing --name allows importing a .txt file as <name>.md.
+	if name, _, nErr := InstallRule(rulesDir, txtSrc, "from-txt", false); nErr != nil || name != "from-txt" {
+		t.Errorf("InstallRule(plain.txt --name from-txt) = (%q, %v)", name, nErr)
+	}
+
+	symRule := filepath.Join(rulesDir, "evil.md")
+	if err := os.Symlink("/etc/passwd", symRule); err != nil {
+		t.Fatal(err)
+	}
+	if _, sErr := InspectRulesDir(rulesDir); sErr == nil {
+		t.Fatal("expected InspectRulesDir to reject symlink inside rulesDir")
+	}
+	_ = os.Remove(symRule)
+
+	if err := RemoveRule(rulesDir, "from-txt"); err != nil {
+		t.Fatalf("RemoveRule: %v", err)
+	}
+	if err := RemoveAllRules(rulesDir); err != nil {
+		t.Fatalf("RemoveAllRules: %v", err)
+	}
+	if left, err := InspectRulesDir(rulesDir); err != nil || len(left) != 0 {
+		t.Fatalf("InspectRulesDir after RemoveAllRules = (%v, %v)", left, err)
+	}
+}

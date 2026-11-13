@@ -1,11 +1,11 @@
-// Package persist manages persistent sandbox authentication, global skills, and profile metadata.
+// Package persist manages persistent sandbox authentication, global skills, global rules, and profile metadata.
 //
 // Security properties:
 //   - Stores sandbox credentials in $DATA_DIR/auth with directory mode 0700 and file mode 0600.
-//   - Rejects symlinks via Lstat across $DATA_DIR/auth, $DATA_DIR/skills, and $DATA_DIR/profiles.
+//   - Rejects symlinks via Lstat across $DATA_DIR/auth, $DATA_DIR/skills, $DATA_DIR/rules, and $DATA_DIR/profiles.
 //   - Captures and restores only allowlisted credential files within a 64 KiB size limit.
 //   - Streams credential restore scripts over stdin so tokens never appear in CLI arguments.
-//   - Rejects symlinks, special files, and unsafe path delimiters in $DATA_DIR/skills.
+//   - Rejects symlinks, special files, and unsafe path delimiters in $DATA_DIR/skills and $DATA_DIR/rules.
 //   - Enforces exclusive host flock locking per conversation profile to prevent concurrent ext4 mounts.
 package persist
 
@@ -34,6 +34,12 @@ const (
 
 	// MaxSkillFileBytes caps each global skill file at 10 MiB.
 	MaxSkillFileBytes = 10 * 1024 * 1024
+
+	// MaxRuleFileBytes caps each global rule Markdown file at 64 KiB.
+	MaxRuleFileBytes = 64 * 1024
+
+	// AgyRuleWarnBytes is Antigravity's per-rule-file inline truncation limit (24,000 bytes).
+	AgyRuleWarnBytes = 24000
 
 	// ProfileVolumePrefix precedes every msb disk volume created for --profile.
 	ProfileVolumePrefix = "agbox-profile-"
@@ -694,9 +700,311 @@ if ! grep -qs ' /home/agent/.gemini/config/skills ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-skills /home/agent/.gemini/config/skills
   mount -o remount,ro,bind /home/agent/.gemini/config/skills 2>/dev/null || true
 fi
-if ! grep -qs ' /home/agent/.config/opencode/skills ' /proc/self/mountinfo; then
-  mount --bind /home/agent/.agbox-skills /home/agent/.config/opencode/skills
-  mount -o remount,ro,bind /home/agent/.config/opencode/skills 2>/dev/null || true
+	if ! grep -qs ' /home/agent/.config/opencode/skills ' /proc/self/mountinfo; then
+	  mount --bind /home/agent/.agbox-skills /home/agent/.config/opencode/skills
+	  mount -o remount,ro,bind /home/agent/.config/opencode/skills 2>/dev/null || true
+	fi
+`
+}
+
+// ValidateRuleName normalizes and validates a global rule name (stripping an optional .md suffix).
+func ValidateRuleName(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) > 3 && strings.EqualFold(trimmed[len(trimmed)-3:], ".md") {
+		trimmed = trimmed[:len(trimmed)-3]
+	}
+	if trimmed == "" {
+		return "", errors.New("rule name must not be empty")
+	}
+	if len(trimmed) > 63 {
+		return "", errors.New("rule name must be 63 characters or fewer")
+	}
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 {
+			if !isAlphaNum {
+				return "", fmt.Errorf("invalid rule name %q: must start with an ASCII letter or digit", raw)
+			}
+			continue
+		}
+		if !isAlphaNum && c != '-' && c != '_' && c != '.' {
+			return "", fmt.Errorf("invalid rule name %q: only ASCII letters, digits, '.', '-', and '_' are allowed", raw)
+		}
+	}
+	return trimmed, nil
+}
+
+// InspectRulesDir validates rulesDir (rejecting symlinks, subdirectories, special files, and unsafe names)
+// and returns sorted rule names (without the .md extension). Returns nil, nil if rulesDir does not exist.
+func InspectRulesDir(rulesDir string) ([]string, error) {
+	if rulesDir == "" {
+		return nil, errors.New("rules directory path must not be empty")
+	}
+	if strings.ContainsAny(rulesDir, ":,") {
+		return nil, fmt.Errorf("rules directory %q cannot contain ':' or ','", rulesDir)
+	}
+	for _, r := range rulesDir {
+		if r < 0x20 || r == 0x7f {
+			return nil, fmt.Errorf("rules directory %q contains control characters", rulesDir)
+		}
+	}
+	if err := verifyOptionalPrivateDir(rulesDir); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(rulesDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read rules dir %s: %w", rulesDir, err)
+	}
+
+	var names []string
+	for _, entry := range entries {
+		entryPath := filepath.Join(rulesDir, entry.Name())
+		info, sErr := os.Lstat(entryPath)
+		if sErr != nil {
+			return nil, fmt.Errorf("stat %s: %w", entryPath, sErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing symlink inside rules directory: %s", entryPath)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("refusing subdirectory inside rules directory: %s", entryPath)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("refusing non-regular file inside rules directory: %s", entryPath)
+		}
+		base := entry.Name()
+		if len(base) <= 3 || !strings.EqualFold(base[len(base)-3:], ".md") {
+			return nil, fmt.Errorf("refusing non-Markdown file inside rules directory: %s", entryPath)
+		}
+		stem, vErr := ValidateRuleName(base)
+		if vErr != nil {
+			return nil, vErr
+		}
+		if info.Size() == 0 || info.Size() > MaxRuleFileBytes {
+			return nil, fmt.Errorf("rule file %s has invalid size %d bytes (limit %d)", entryPath, info.Size(), MaxRuleFileBytes)
+		}
+		names = append(names, stem)
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+// InstallRule validates srcPath (a Markdown file) and writes it atomically to rulesDir/<name>.md.
+func InstallRule(rulesDir, srcPath, overrideName string, force bool) (string, int, error) {
+	if srcPath == "" {
+		return "", 0, errors.New("rule source path must not be empty")
+	}
+	resolved, err := filepath.EvalSymlinks(srcPath)
+	if err != nil {
+		return "", 0, fmt.Errorf("resolve rule path %s: %w", srcPath, err)
+	}
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		return "", 0, fmt.Errorf("stat rule path %s: %w", resolved, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("expected a regular Markdown file, got %s", srcPath)
+	}
+	if info.Size() == 0 {
+		return "", 0, fmt.Errorf("rule file %s is empty", srcPath)
+	}
+	if info.Size() > MaxRuleFileBytes {
+		return "", 0, fmt.Errorf("rule file %s exceeds %d bytes", srcPath, MaxRuleFileBytes)
+	}
+
+	rawName := overrideName
+	if rawName == "" {
+		base := filepath.Base(resolved)
+		if len(base) <= 3 || !strings.EqualFold(base[len(base)-3:], ".md") {
+			return "", 0, fmt.Errorf("rule file %s must end in .md (or pass --name <name>)", srcPath)
+		}
+		rawName = base
+	}
+	ruleName, err := ValidateRuleName(rawName)
+	if err != nil {
+		return "", 0, err
+	}
+
+	raw, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return "", 0, fmt.Errorf("rule file %s contains only whitespace", srcPath)
+	}
+	if bytes.IndexByte(raw, 0) >= 0 {
+		return "", 0, fmt.Errorf("rule file %s contains binary NUL bytes", srcPath)
+	}
+
+	if err := config.EnsurePrivateDir(filepath.Dir(rulesDir)); err != nil {
+		return "", 0, err
+	}
+	if err := config.EnsurePrivateDir(rulesDir); err != nil {
+		return "", 0, err
+	}
+
+	// Ensure existing rulesDir has no symlinks or invalid entries before writing.
+	if _, err := InspectRulesDir(rulesDir); err != nil {
+		return "", 0, err
+	}
+
+	dstPath := filepath.Join(rulesDir, ruleName+".md")
+	if _, statErr := os.Lstat(dstPath); statErr == nil && !force {
+		return "", 0, fmt.Errorf("rule %q already exists (pass --force to replace it)", ruleName)
+	}
+	if err := writeModeFileAtomic(dstPath, raw, 0o644); err != nil {
+		return "", 0, fmt.Errorf("write rule %q: %w", ruleName, err)
+	}
+	return ruleName, len(raw), nil
+}
+
+// ReadRule reads rulesDir/<name>.md after validating rulesDir.
+func ReadRule(rulesDir, rawName string) ([]byte, error) {
+	name, err := ValidateRuleName(rawName)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := InspectRulesDir(rulesDir); err != nil {
+		return nil, err
+	}
+	target := filepath.Join(rulesDir, name+".md")
+	raw, ok, err := readSafeRegularFile(target, MaxRuleFileBytes)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("rule %q does not exist", name)
+	}
+	return raw, nil
+}
+
+// RemoveRule deletes rulesDir/<name>.md.
+func RemoveRule(rulesDir, rawName string) error {
+	name, err := ValidateRuleName(rawName)
+	if err != nil {
+		return err
+	}
+	if err := verifyOptionalPrivateDir(rulesDir); err != nil {
+		return err
+	}
+	target := filepath.Join(rulesDir, name+".md")
+	info, err := os.Lstat(target)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("rule %q does not exist", name)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlinked rule entry %q", target)
+	}
+	return os.Remove(target)
+}
+
+// RemoveAllRules deletes every .md rule file inside rulesDir.
+func RemoveAllRules(rulesDir string) error {
+	names, err := InspectRulesDir(rulesDir)
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		if err := RemoveRule(rulesDir, n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BuildGuestRulesStageScript returns a POSIX sh script that compiles rule files from
+// srcMount into stageRoot/AGENTS.md (always-on rules) and stageRoot/rules/*.md (conditional agy rules).
+func BuildGuestRulesStageScript(srcMount, stageRoot string) string {
+	qSrc := msb.ShellQuote(srcMount)
+	qStage := msb.ShellQuote(stageRoot)
+	return fmt.Sprintf(`set -eu
+src=%s
+stage=%s
+rm -rf "$stage"
+mkdir -p "$stage/rules"
+chmod 0755 "$stage" "$stage/rules"
+
+process_rule() {
+  f="$1"
+  [ -f "$f" ] || return 0
+  [ ! -L "$f" ] || exit 1
+  first_line=$(sed -n '1p' "$f" | tr -d '\r')
+  if [ "$first_line" = "---" ]; then
+    fm=$(awk 'NR==1{next} /^---\r?$/{exit} {print}' "$f")
+    if printf '%%s\n' "$fm" | grep -Eq '^[[:space:]]*trigger:[[:space:]]*(glob|model_decision|manual)([[:space:]]|$)'; then
+      cp "$f" "$stage/rules/$(basename "$f")"
+      chmod 0444 "$stage/rules/$(basename "$f")"
+      return 0
+    fi
+    body=$(awk 'NR==1{in_fm=1; next} in_fm && /^---\r?$/{in_fm=0; next} !in_fm{print}' "$f")
+    if [ -s "$stage/AGENTS.md" ]; then
+      printf '\n\n' >> "$stage/AGENTS.md"
+    fi
+    printf '%%s\n' "$body" >> "$stage/AGENTS.md"
+    return 0
+  fi
+  if [ -s "$stage/AGENTS.md" ]; then
+    printf '\n\n' >> "$stage/AGENTS.md"
+  fi
+  cat "$f" >> "$stage/AGENTS.md"
+}
+
+for prio in AGENTS.md GEMINI.md; do
+  if [ -f "$src/$prio" ]; then
+    process_rule "$src/$prio"
+  fi
+done
+for f in "$src"/*.md; do
+  [ -e "$f" ] || continue
+  b=$(basename "$f")
+  if [ "$b" = "AGENTS.md" ] || [ "$b" = "GEMINI.md" ]; then
+    continue
+  fi
+  process_rule "$f"
+done
+if [ -f "$stage/AGENTS.md" ]; then
+  chmod 0444 "$stage/AGENTS.md"
+fi
+`, qSrc, qStage)
+}
+
+// BuildGuestRulesMountScript returns an idempotent root sh script that stages
+// /home/agent/.agbox-rules and bind-mounts read-only global rules for agy and opencode.
+func BuildGuestRulesMountScript() string {
+	return `set -eu
+mkdir -p /home/agent/.gemini/config /home/agent/.config/opencode
+chown 1000:1000 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.config /home/agent/.config/opencode
+chmod 0700 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.config /home/agent/.config/opencode
+
+for mp in /home/agent/.gemini/config/AGENTS.md /home/agent/.config/opencode/AGENTS.md /home/agent/.gemini/config/rules; do
+  if grep -qs " $mp " /proc/self/mountinfo; then
+    umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+  fi
+done
+` + BuildGuestRulesStageScript(msb.GuestRulesMount, "/etc/agbox-global-rules") + `
+if [ -s /etc/agbox-global-rules/AGENTS.md ]; then
+  for dst in /home/agent/.gemini/config/AGENTS.md /home/agent/.config/opencode/AGENTS.md; do
+    rm -rf "$dst"
+    : > "$dst"
+    chown 1000:1000 "$dst"
+    chmod 0644 "$dst"
+    mount --bind /etc/agbox-global-rules/AGENTS.md "$dst"
+    mount -o remount,ro,bind "$dst" 2>/dev/null || true
+  done
+fi
+if [ -n "$(ls -A /etc/agbox-global-rules/rules 2>/dev/null)" ]; then
+  mkdir -p /home/agent/.gemini/config/rules
+  chown 1000:1000 /home/agent/.gemini/config/rules
+  chmod 0755 /home/agent/.gemini/config/rules
+  mount --bind /etc/agbox-global-rules/rules /home/agent/.gemini/config/rules
+  mount -o remount,ro,bind /home/agent/.gemini/config/rules 2>/dev/null || true
 fi
 `
 }
@@ -1021,6 +1329,10 @@ func readSafeRegularFile(path string, maxBytes int64) ([]byte, bool, error) {
 }
 
 func writePrivateFileAtomic(path string, content []byte) error {
+	return writeModeFileAtomic(path, content, 0o600)
+}
+
+func writeModeFileAtomic(path string, content []byte, mode fs.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := config.EnsurePrivateDir(dir); err != nil {
 		return err
@@ -1036,7 +1348,7 @@ func writePrivateFileAtomic(path string, content []byte) error {
 			_ = os.Remove(tmpName)
 		}
 	}()
-	if err := tmp.Chmod(0o600); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		_ = tmp.Close()
 		return err
 	}

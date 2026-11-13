@@ -359,6 +359,7 @@ type RunOpts struct {
 	ContinueSession string
 	NoAuth          bool
 	NoSkills        bool
+	NoRules         bool
 }
 
 // ParseRunArgs parses CLI arguments for `run`.
@@ -530,6 +531,8 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			opts.NoAuth = true
 		case "--no-skills":
 			opts.NoSkills = true
+		case "--no-rules":
+			opts.NoRules = true
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return RunOpts{}, fmt.Errorf("unknown run option: %s ('agbox run --help')", arg)
@@ -653,6 +656,7 @@ type ResumeOpts struct {
 	ContinueSession string
 	NoAuth          bool
 	NoSkills        bool
+	NoRules         bool
 }
 
 // ParseResumeArgs validates CLI arguments for `agbox resume`.
@@ -700,9 +704,11 @@ func ParseResumeArgs(args []string) (ResumeOpts, error) {
 			opts.NoAuth = true
 		case "--no-skills":
 			opts.NoSkills = true
+		case "--no-rules":
+			opts.NoRules = true
 		default:
 			if strings.HasPrefix(a, "-") {
-				return ResumeOpts{}, fmt.Errorf("unknown resume option: %s (expected --allow-root, --detach, --continue, --session, --no-auth, or --no-skills)", a)
+				return ResumeOpts{}, fmt.Errorf("unknown resume option: %s (expected --allow-root, --detach, --continue, --session, --no-auth, --no-skills, or --no-rules)", a)
 			}
 			pos = append(pos, a)
 		}
@@ -1697,6 +1703,20 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		}
 	}
 
+	rulesDir := filepath.Join(a.Env.DataDir, "rules")
+	var ruleNames []string
+	rulesMounted := false
+	if !opts.NoRules {
+		var rErr error
+		ruleNames, rErr = persist.InspectRulesDir(rulesDir)
+		if rErr != nil {
+			return rErr
+		}
+		if len(ruleNames) > 0 {
+			rulesMounted = true
+		}
+	}
+
 	var profLock *persist.ProfileLock
 	var namedVolumes []msb.NamedVolumeSpec
 	if opts.Profile != "" {
@@ -1881,6 +1901,13 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			ReadOnly:  true,
 		})
 	}
+	if rulesMounted {
+		volumes = append(volumes, msb.VolumeSpec{
+			HostPath:  rulesDir,
+			GuestPath: msb.GuestRulesMount,
+			ReadOnly:  true,
+		})
+	}
 
 	if maskedCount > 0 {
 		extra := ""
@@ -1908,7 +1935,9 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		ContinueSession: opts.ContinueSession,
 		NoAuth:          opts.NoAuth,
 		NoSkills:        opts.NoSkills,
+		NoRules:         opts.NoRules,
 		SkillsMounted:   skillsMounted,
+		RulesMounted:    rulesMounted,
 	}
 	if err := config.SaveRunMeta(filepath.Join(runFilterDir, "run.meta"), meta); err != nil {
 		return fmt.Errorf("save run metadata: %w", err)
@@ -1948,6 +1977,12 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			return err
 		}
 		a.logf("Global skills: %d skill(s) mounted read-only.", len(skillNames))
+	}
+	if rulesMounted {
+		if err := a.setupGuestRules(runCtx, runSandbox); err != nil {
+			return err
+		}
+		a.logf("Global rules: %d rule(s) mounted read-only.", len(ruleNames))
 	}
 	if opts.Profile != "" {
 		if err := a.setupGuestProfile(runCtx, runSandbox); err != nil {
@@ -2171,6 +2206,29 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 		}
 	}
 
+	rulesDir := filepath.Join(a.Env.DataDir, "rules")
+	skipRules := meta.NoRules || opts.NoRules
+	var ruleNames []string
+	if meta.RulesMounted {
+		var rErr error
+		ruleNames, rErr = persist.InspectRulesDir(rulesDir)
+		if rErr != nil {
+			return rErr
+		}
+		if err := config.EnsurePrivateDir(rulesDir); err != nil {
+			return fmt.Errorf("prepare rules dir: %w", err)
+		}
+	} else if !skipRules {
+		var rErr error
+		ruleNames, rErr = persist.InspectRulesDir(rulesDir)
+		if rErr != nil {
+			return rErr
+		}
+		if len(ruleNames) > 0 {
+			a.logf("Note: %s was created before global rules existed. Recreate it with 'agbox stop %s' to mount global rules.", opts.Sandbox, opts.Sandbox)
+		}
+	}
+
 	var profLock *persist.ProfileLock
 	if meta.Profile != "" {
 		var lErr error
@@ -2315,6 +2373,11 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 	}
 	if meta.SkillsMounted && !skipSkills && len(skillNames) > 0 {
 		if err := a.setupGuestSkills(runCtx, opts.Sandbox); err != nil {
+			return err
+		}
+	}
+	if meta.RulesMounted && !skipRules && len(ruleNames) > 0 {
+		if err := a.setupGuestRules(runCtx, opts.Sandbox); err != nil {
 			return err
 		}
 	}
@@ -2827,6 +2890,9 @@ Modes:
   agbox skills [--allow-root] [list|add [--force] <path>|rm <name>]
       Manage global skills mounted read-only into sandboxes from $DATA_DIR/skills.
 
+  agbox rules [--allow-root] [list|add [--force] [--name NAME] <file.md>|show [<name>]|rm <name|--all>]
+      Manage global rules mounted read-only into sandboxes from $DATA_DIR/rules.
+
   agbox profile [--allow-root] [list|create [--size SIZE] <name>|rm [--force] <name>]
       Manage ext4 disk profiles for conversation history across ephemeral runs.
 
@@ -2842,6 +2908,7 @@ Modes:
         -s, --session ID     Continue conversation ID in TUI mode (alias: --conversation)
         --no-auth            Skip saved login credentials from $DATA_DIR/auth
         --no-skills          Skip global skills from $DATA_DIR/skills
+        --no-rules           Skip global rules from $DATA_DIR/rules
         --allow-root         Allow agbox to run as the root user
         --ro                 Mount shared paths read-only
         --mask-vcs           Require the FUSE VCS filter for directory shares (default)
@@ -2885,6 +2952,7 @@ func RunUsageText() string {
   -s, --session ID continue conversation ID in TUI mode (alias: --conversation)
   --no-auth        skip saved login credentials from $DATA_DIR/auth
   --no-skills      skip global skills from $DATA_DIR/skills
+  --no-rules       skip global rules from $DATA_DIR/rules
   --allow-root     allow agbox to run as the root user
   --ro             mount shared paths read-only
   --mask-vcs       require the FUSE VCS filter for directory shares (default)
@@ -2941,6 +3009,12 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 			fmt.Fprint(a.Stdout, SkillsUsageText())
 			return 0
 		}
+	case "rules":
+		err = a.Rules(ctx, rest)
+		if errors.Is(err, ErrHelp) {
+			fmt.Fprint(a.Stdout, RulesUsageText())
+			return 0
+		}
 	case "profile":
 		err = a.Profile(ctx, rest)
 		if errors.Is(err, ErrHelp) {
@@ -2964,7 +3038,7 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 	case "status":
 		err = a.Status(ctx, rest)
 	default:
-		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup create-base edit-base auth skills profile run suspend resume stop remove status)\n", mode)
+		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup create-base edit-base auth skills rules profile run suspend resume stop remove status)\n", mode)
 		return 1
 	}
 

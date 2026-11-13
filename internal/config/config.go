@@ -288,6 +288,8 @@ type RunMeta struct {
 	NoAuth          bool          `json:"no_auth,omitempty"`
 	NoSkills        bool          `json:"no_skills,omitempty"`
 	SkillsMounted   bool          `json:"skills_mounted,omitempty"`
+	NoRules         bool          `json:"no_rules,omitempty"`
+	RulesMounted    bool          `json:"rules_mounted,omitempty"`
 	Shares          []ShareRecord `json:"shares,omitempty"`
 }
 

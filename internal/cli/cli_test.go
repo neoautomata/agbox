@@ -2028,11 +2028,12 @@ func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
 	app, runner, _, _ := newTestApp(t)
 	ctx := context.Background()
 
-	// 1. Root check enforced on auth, skills, and profile without --allow-root.
+	// 1. Root check enforced on auth, skills, rules, and profile without --allow-root.
 	app.GetEUID = func() int { return 0 }
 	for _, cmd := range [][]string{
 		{"auth", "status"},
 		{"skills", "list"},
+		{"rules", "list"},
 		{"profile", "list"},
 	} {
 		if rc := app.Dispatch(ctx, cmd); rc == 0 {
@@ -2041,7 +2042,7 @@ func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
 	}
 	app.GetEUID = func() int { return 1000 }
 
-	// 2. Symlinked DataDir rejected on auth, skills, and profile.
+	// 2. Symlinked DataDir rejected on auth, skills, rules, and profile.
 	symData := filepath.Join(t.TempDir(), "sym-data")
 	if err := os.Symlink(app.Env.DataDir, symData); err != nil {
 		t.Fatal(err)
@@ -2051,6 +2052,7 @@ func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
 	for _, cmd := range [][]string{
 		{"auth", "status"},
 		{"skills", "list"},
+		{"rules", "list"},
 		{"profile", "list"},
 	} {
 		if rc := symApp.Dispatch(ctx, cmd); rc == 0 {
@@ -2083,5 +2085,226 @@ func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
 		if rc := app.Dispatch(ctx, []string{"resume", "agbox-tamp2"}); rc == 0 {
 			t.Errorf("expected tampered Resume metadata %+v to fail closed", badMeta)
 		}
+	}
+}
+
+func TestParseRulesArgsAndNoRulesFlags(t *testing.T) {
+	if _, err := ParseRulesArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+		t.Fatalf("ParseRulesArgs(--help) = %v, want ErrHelp", err)
+	}
+	opts, err := ParseRulesArgs(nil)
+	if err != nil || opts.Action != "list" {
+		t.Fatalf("ParseRulesArgs(nil) = %+v, %v", opts, err)
+	}
+	opts, err = ParseRulesArgs([]string{"add", "--force", "--name", "eng-standards", "/tmp/rules.md"})
+	if err != nil || opts.Action != "add" || !opts.Force || opts.Name != "eng-standards" || opts.Target != "/tmp/rules.md" {
+		t.Fatalf("ParseRulesArgs(add) = %+v, %v", opts, err)
+	}
+	opts, err = ParseRulesArgs([]string{"add", "--name=AGENTS.md", "/tmp/rules.md"})
+	if err != nil || opts.Name != "AGENTS" {
+		t.Fatalf("ParseRulesArgs(add --name=) = %+v, %v", opts, err)
+	}
+	opts, err = ParseRulesArgs([]string{"show", "eng-standards"})
+	if err != nil || opts.Action != "show" || opts.Target != "eng-standards" {
+		t.Fatalf("ParseRulesArgs(show) = %+v, %v", opts, err)
+	}
+	opts, err = ParseRulesArgs([]string{"rm", "--all"})
+	if err != nil || opts.Action != "rm" || !opts.All {
+		t.Fatalf("ParseRulesArgs(rm --all) = %+v, %v", opts, err)
+	}
+
+	for _, bad := range [][]string{
+		{"--unknown"},
+		{"--name"},
+		{"--name", "../escape", "add", "a.md"},
+		{"--all"},
+		{"list", "--name", "foo"},
+		{"add", "--all", "a.md"},
+		{"show", "--force", "foo"},
+		{"rm"},
+		{"rm", "--all", "extra"},
+		{"bogus"},
+	} {
+		if _, err := ParseRulesArgs(bad); err == nil {
+			t.Errorf("ParseRulesArgs(%v) succeeded, want error", bad)
+		}
+	}
+
+	runOpts, err := ParseRunArgs([]string{"--no-rules", "opencode"}, config.MaskStrict, func(string) bool { return false })
+	if err != nil || !runOpts.NoRules {
+		t.Fatalf("ParseRunArgs(--no-rules) = %+v, %v", runOpts, err)
+	}
+	resOpts, err := ParseResumeArgs([]string{"--no-rules", "agbox-dev"})
+	if err != nil || !resOpts.NoRules || resOpts.Sandbox != "agbox-dev" {
+		t.Fatalf("ParseResumeArgs(--no-rules) = %+v, %v", resOpts, err)
+	}
+}
+
+func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "both",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Empty rules list and status check.
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"rules"}); rc != 0 || !strings.Contains(stdout.String(), "No global rules") {
+		t.Fatalf("rules empty = %d, %q", rc, stdout.String())
+	}
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "global_rules: none") {
+		t.Fatalf("status empty global_rules = %d, %q", rc, stdout.String())
+	}
+
+	// 2. Add rule with custom name, verify duplicate guard, overwrite with --force, >24KB warning, and show/status output.
+	tmpSrc := t.TempDir()
+	stdFile := filepath.Join(tmpSrc, "standards.md")
+	if err := os.WriteFile(stdFile, []byte("# Engineering Standards\nRun gofmt and tests.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rc := app.Dispatch(ctx, []string{"rules", "add", "--name", "standards", stdFile}); rc != 0 {
+		t.Fatalf("rules add standards failed: %s", stderr.String())
+	}
+	if rc := app.Dispatch(ctx, []string{"rules", "add", "--name", "standards", stdFile}); rc == 0 {
+		t.Fatal("expected duplicate rules add without --force to fail")
+	}
+	if rc := app.Dispatch(ctx, []string{"rules", "add", "--force", "--name", "standards", stdFile}); rc != 0 {
+		t.Fatalf("rules add --force failed: %s", stderr.String())
+	}
+
+	largeFile := filepath.Join(tmpSrc, "large-guide.md")
+	largeBody := "# Large Guide\n" + strings.Repeat("Always validate inputs.\n", 1100) // > 24,000 bytes, < 64 KiB
+	if err := os.WriteFile(largeFile, []byte(largeBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"rules", "add", largeFile}); rc != 0 {
+		t.Fatalf("rules add large-guide failed: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "WARN:") || !strings.Contains(stderr.String(), "24000") {
+		t.Errorf("expected >24KB Antigravity truncation warning on stderr, got %q", stderr.String())
+	}
+
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"rules", "show", "standards"}); rc != 0 || !strings.Contains(stdout.String(), "Run gofmt and tests.") {
+		t.Fatalf("rules show standards = %d, %q", rc, stdout.String())
+	}
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"rules", "show"}); rc != 0 || !strings.Contains(stdout.String(), "== standards.md ==") || !strings.Contains(stdout.String(), "== large-guide.md ==") {
+		t.Fatalf("rules show all = %d, %q", rc, stdout.String())
+	}
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "global_rules: large-guide, standards") {
+		t.Fatalf("status global_rules = %d, %q", rc, stdout.String())
+	}
+
+	// 3. Persistent run mounts $DATA_DIR/rules read-only and stages/bind-mounts guest global rules.
+	proj := filepath.Join(app.Env.HomeReal, "proj-rules")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wantRulesVol := filepath.Join(app.Env.DataDir, "rules") + ":" + msb.GuestRulesMount + ":ro,uid=1000,gid=1000"
+
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "rulesvm", "antigravity", proj}); rc != 0 {
+		t.Fatalf("run with global rules failed: %s", stderr.String())
+	}
+	foundRulesVol := false
+	foundRulesBind := false
+	for _, c := range runner.calls {
+		joined := strings.Join(c.Args, " ")
+		if strings.HasPrefix(joined, "snap restore ") && slices.Contains(c.Args, wantRulesVol) {
+			foundRulesVol = true
+		}
+		if strings.Contains(joined, "/etc/agbox-global-rules/AGENTS.md") && strings.Contains(joined, ".gemini/config/AGENTS.md") && strings.Contains(joined, ".config/opencode/AGENTS.md") {
+			foundRulesBind = true
+		}
+	}
+	if !foundRulesVol || !foundRulesBind {
+		t.Fatalf("missing global rules volume (%v) or guest bind-mount script (%v)", foundRulesVol, foundRulesBind)
+	}
+
+	// 4. Resume re-runs setupGuestRules so host rule edits take effect, while `resume --no-rules` skips it.
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rulesvm stopped\n"
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"resume", "agbox-rulesvm"}); rc != 0 {
+		t.Fatalf("resume agbox-rulesvm failed: %s", stderr.String())
+	}
+	resumedBind := false
+	for _, c := range runner.calls {
+		if strings.Contains(strings.Join(c.Args, " "), "/etc/agbox-global-rules/AGENTS.md") {
+			resumedBind = true
+		}
+	}
+	if !resumedBind {
+		t.Error("expected `agbox resume` to restage and bind-mount global rules")
+	}
+
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"resume", "--no-rules", "agbox-rulesvm"}); rc != 0 {
+		t.Fatalf("resume --no-rules agbox-rulesvm failed: %s", stderr.String())
+	}
+	for _, c := range runner.calls {
+		if strings.Contains(strings.Join(c.Args, " "), "/etc/agbox-global-rules/AGENTS.md") {
+			t.Fatal("expected `agbox resume --no-rules` to skip setupGuestRules")
+		}
+	}
+
+	// 5. `--no-rules` on `agbox run` omits the global rules volume and skips setupGuestRules.
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "--no-rules", "opencode", proj}); rc != 0 {
+		t.Fatalf("run --no-rules failed: %s", stderr.String())
+	}
+	for _, c := range runner.calls {
+		if slices.Contains(c.Args, wantRulesVol) {
+			t.Fatalf("--no-rules unexpectedly mounted global rules volume: %v", c.Args)
+		}
+		if strings.Contains(strings.Join(c.Args, " "), "/etc/agbox-global-rules/AGENTS.md") {
+			t.Fatal("--no-rules unexpectedly ran setupGuestRules")
+		}
+	}
+
+	// 6. Symlink planted inside $DATA_DIR/rules fails closed before `snap restore` on run and before `start` on resume.
+	badSym := filepath.Join(app.Env.DataDir, "rules", "leak.md")
+	if err := os.Symlink("/etc/passwd", badSym); err != nil {
+		t.Fatal(err)
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "opencode", proj}); rc == 0 {
+		t.Fatal("expected Run to fail closed when $DATA_DIR/rules contains a symlink")
+	}
+	for _, c := range runner.calls {
+		if len(c.Args) >= 2 && c.Args[0] == "snap" && c.Args[1] == "restore" {
+			t.Fatal("Run restored snapshot despite symlink inside $DATA_DIR/rules")
+		}
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"resume", "agbox-rulesvm"}); rc == 0 {
+		t.Fatal("expected Resume to fail closed when $DATA_DIR/rules contains a symlink")
+	}
+	for _, c := range runner.calls {
+		if len(c.Args) >= 1 && c.Args[0] == "start" {
+			t.Fatal("Resume started microVM despite symlink inside $DATA_DIR/rules")
+		}
+	}
+	_ = os.Remove(badSym)
+
+	// 7. Remove single rule and remove --all.
+	if rc := app.Dispatch(ctx, []string{"rules", "rm", "large-guide"}); rc != 0 {
+		t.Fatalf("rules rm large-guide failed: %s", stderr.String())
+	}
+	if rc := app.Dispatch(ctx, []string{"rules", "rm", "--all"}); rc != 0 {
+		t.Fatalf("rules rm --all failed: %s", stderr.String())
+	}
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"rules", "list"}); rc != 0 || !strings.Contains(stdout.String(), "No global rules") {
+		t.Fatalf("rules list after rm --all = %d, %q", rc, stdout.String())
 	}
 }

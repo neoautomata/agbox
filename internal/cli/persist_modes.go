@@ -401,6 +401,210 @@ func (a *App) Skills(ctx context.Context, args []string) error {
 	return nil
 }
 
+// RulesOpts holds parsed arguments for `agbox rules`.
+type RulesOpts struct {
+	Action    string // "list", "add", "show", "rm"
+	Target    string
+	Name      string
+	Force     bool
+	All       bool
+	AllowRoot bool
+}
+
+// ParseRulesArgs parses CLI arguments for `agbox rules`.
+func ParseRulesArgs(args []string) (RulesOpts, error) {
+	opts := RulesOpts{Action: "list"}
+	var pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "--name=") {
+			name, err := persist.ValidateRuleName(strings.TrimPrefix(a, "--name="))
+			if err != nil {
+				return RulesOpts{}, err
+			}
+			opts.Name = name
+			continue
+		}
+		switch a {
+		case "-h", "--help":
+			return RulesOpts{}, ErrHelp
+		case "--allow-root":
+			opts.AllowRoot = true
+		case "--force", "-f":
+			opts.Force = true
+		case "--all":
+			opts.All = true
+		case "--name":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return RulesOpts{}, errors.New("--name requires a rule name")
+			}
+			name, err := persist.ValidateRuleName(args[i+1])
+			if err != nil {
+				return RulesOpts{}, err
+			}
+			opts.Name = name
+			i++
+		default:
+			if strings.HasPrefix(a, "-") {
+				return RulesOpts{}, fmt.Errorf("unknown rules option: %s (run 'agbox rules --help')", a)
+			}
+			pos = append(pos, a)
+		}
+	}
+	if len(pos) == 0 {
+		if opts.Name != "" || opts.Force || opts.All {
+			return RulesOpts{}, errors.New("Usage: agbox rules [list|add|show|rm]")
+		}
+		return opts, nil
+	}
+	switch pos[0] {
+	case "list", "ls":
+		if len(pos) != 1 || opts.Name != "" || opts.All {
+			return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] [list]")
+		}
+		opts.Action = "list"
+		return opts, nil
+	case "add":
+		if len(pos) != 2 || opts.All {
+			return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] add [--force] [--name NAME] <file.md>")
+		}
+		opts.Action = "add"
+		opts.Target = pos[1]
+		return opts, nil
+	case "show", "cat":
+		if len(pos) > 2 || opts.Name != "" || opts.Force || opts.All {
+			return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] show [<name>]")
+		}
+		opts.Action = "show"
+		if len(pos) == 2 {
+			opts.Target = pos[1]
+		}
+		return opts, nil
+	case "rm", "remove":
+		if opts.All {
+			if len(pos) != 1 {
+				return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] rm --all")
+			}
+		} else if len(pos) != 2 {
+			return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] rm <name|--all>")
+		} else {
+			opts.Target = pos[1]
+		}
+		opts.Action = "rm"
+		return opts, nil
+	default:
+		return RulesOpts{}, fmt.Errorf("unknown rules subcommand %q (expected list, add, show, or rm)", pos[0])
+	}
+}
+
+// RulesUsageText returns the help message for `agbox rules --help`.
+func RulesUsageText() string {
+	return `Usage:
+  agbox rules [--allow-root] [list]
+      List global rules stored in $DATA_DIR/rules.
+  agbox rules [--allow-root] add [--force] [--name NAME] <file.md>
+      Validate and save a Markdown rule file in $DATA_DIR/rules/<name>.md.
+  agbox rules [--allow-root] show [<name>]
+      Print one or all global rule files from $DATA_DIR/rules.
+  agbox rules [--allow-root] rm <name|--all>
+      Delete one or all global rules from $DATA_DIR/rules.
+`
+}
+
+// Rules manages host-stored global rules mounted read-only into sandboxes.
+func (a *App) Rules(ctx context.Context, args []string) error {
+	_ = ctx
+	opts, err := ParseRulesArgs(args)
+	if err != nil {
+		return err
+	}
+	if err := a.verifyUser(opts.AllowRoot); err != nil {
+		return err
+	}
+	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+		return fmt.Errorf("prepare data dir: %w", err)
+	}
+	rulesDir := filepath.Join(a.Env.DataDir, "rules")
+
+	switch opts.Action {
+	case "list":
+		names, err := persist.InspectRulesDir(rulesDir)
+		if err != nil {
+			return err
+		}
+		if len(names) == 0 {
+			fmt.Fprintf(a.Stdout, "No global rules installed in %s.\n", rulesDir)
+			return nil
+		}
+		for _, n := range names {
+			fmt.Fprintln(a.Stdout, n)
+		}
+		return nil
+
+	case "add":
+		name, size, err := persist.InstallRule(rulesDir, opts.Target, opts.Name, opts.Force)
+		if err != nil {
+			return err
+		}
+		if size > persist.AgyRuleWarnBytes {
+			a.warnf("Rule %q is %d bytes. Antigravity truncates single rule files above %d bytes.", name, size, persist.AgyRuleWarnBytes)
+		}
+		a.logf("Installed global rule %q in %s.", name, filepath.Join(rulesDir, name+".md"))
+		return nil
+
+	case "show":
+		if opts.Target != "" {
+			raw, err := persist.ReadRule(rulesDir, opts.Target)
+			if err != nil {
+				return err
+			}
+			_, _ = a.Stdout.Write(raw)
+			if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+				fmt.Fprintln(a.Stdout)
+			}
+			return nil
+		}
+		names, err := persist.InspectRulesDir(rulesDir)
+		if err != nil {
+			return err
+		}
+		if len(names) == 0 {
+			fmt.Fprintf(a.Stdout, "No global rules installed in %s.\n", rulesDir)
+			return nil
+		}
+		for idx, n := range names {
+			raw, rErr := persist.ReadRule(rulesDir, n)
+			if rErr != nil {
+				return rErr
+			}
+			if idx > 0 {
+				fmt.Fprintln(a.Stdout)
+			}
+			fmt.Fprintf(a.Stdout, "== %s.md ==\n", n)
+			_, _ = a.Stdout.Write(raw)
+			if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+				fmt.Fprintln(a.Stdout)
+			}
+		}
+		return nil
+
+	case "rm":
+		if opts.All {
+			if err := persist.RemoveAllRules(rulesDir); err != nil {
+				return err
+			}
+			a.logf("Removed all global rules from %s.", rulesDir)
+			return nil
+		}
+		if err := persist.RemoveRule(rulesDir, opts.Target); err != nil {
+			return err
+		}
+		a.logf("Removed global rule %q.", opts.Target)
+		return nil
+	}
+	return nil
+}
+
 // ProfileOpts holds parsed arguments for `agbox profile`.
 type ProfileOpts struct {
 	Action    string // "list", "create", "rm"
@@ -705,6 +909,16 @@ func (a *App) setupGuestSkills(ctx context.Context, sandbox string) error {
 	return nil
 }
 
+func (a *App) setupGuestRules(ctx context.Context, sandbox string) error {
+	script := persist.BuildGuestRulesMountScript()
+	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args: []string{"exec", sandbox, "--", "sh", "-c", script},
+	}); err != nil {
+		return fmt.Errorf("bind-mount global rules in %s: %w", sandbox, err)
+	}
+	return nil
+}
+
 func (a *App) setupGuestProfile(ctx context.Context, sandbox string) error {
 	script := persist.BuildGuestProfileMountScript()
 	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
@@ -812,6 +1026,7 @@ func (a *App) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string
 		ContinueSession: opts.ContinueSession,
 		NoAuth:          opts.NoAuth,
 		NoSkills:        opts.NoSkills,
+		NoRules:         opts.NoRules,
 	})
 
 	if opts.Cmd != "" && origMode != config.RunModeCmd && hasMarker(suspendedPath) {
@@ -885,6 +1100,14 @@ func (a *App) printPersistenceStatus(ctx context.Context) {
 			fmt.Fprintln(a.Stdout, "global_skills: none")
 		} else {
 			fmt.Fprintf(a.Stdout, "global_skills: %s\n", strings.Join(skills, ", "))
+		}
+	}
+	rulesDir := filepath.Join(a.Env.DataDir, "rules")
+	if rules, err := persist.InspectRulesDir(rulesDir); err == nil {
+		if len(rules) == 0 {
+			fmt.Fprintln(a.Stdout, "global_rules: none")
+		} else {
+			fmt.Fprintf(a.Stdout, "global_rules: %s\n", strings.Join(rules, ", "))
 		}
 	}
 	var profNames []string

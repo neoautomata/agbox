@@ -40,6 +40,9 @@ const GuestKeysFile = "/home/agent/.agbox-keys.sh"
 // GuestSkillsMount is the read-only virtiofs mountpoint for host global skills.
 const GuestSkillsMount = "/home/agent/.agbox-skills"
 
+// GuestRulesMount is the read-only virtiofs mountpoint for host global rules.
+const GuestRulesMount = "/home/agent/.agbox-rules"
+
 // GuestProfileMount is the ext4 disk volume mountpoint for conversation profiles.
 const GuestProfileMount = "/home/agent/.agbox-profile"
 
@@ -542,8 +545,8 @@ if [[ -n "${cur_grp}" && "${cur_grp}" != "agent" ]] && ! getent group "agent" >/
   groupmod -n "agent" "${cur_grp}" || true
 fi
 usermod -s /bin/bash -d "/home/agent" -aG sudo "agent"
-mkdir -p /etc/sudoers.d "/home/agent" "/home/agent/.local/bin" "/home/agent/.agbox-skills" "/home/agent/.agbox-profile" /workspace
-chmod 0700 "/home/agent/.agbox-skills" "/home/agent/.agbox-profile"
+mkdir -p /etc/sudoers.d "/home/agent" "/home/agent/.local/bin" "/home/agent/.agbox-skills" "/home/agent/.agbox-rules" "/home/agent/.agbox-profile" /workspace
+chmod 0700 "/home/agent/.agbox-skills" "/home/agent/.agbox-rules" "/home/agent/.agbox-profile"
 printf "%s ALL=(ALL:ALL) NOPASSWD: ALL\n" "agent" > /etc/sudoers.d/agent
 chmod 0440 /etc/sudoers.d/agent
 if [[ -f /root/.local/bin/agy ]]; then

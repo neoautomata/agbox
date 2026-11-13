@@ -245,9 +245,9 @@ On every `agbox run` and `agbox resume`, `agbox` streams saved credentials over 
 
 ______________________________________________________________________
 
-## User Guide: Persistent Skills
+## User Guide: Persistent Skills and Rules
 
-`agbox` supports both global read-only skills across all projects and project-local skills inside shared directories.
+`agbox` supports global read-only skills and rules across all projects, plus project-local skills and instructions inside shared directories.
 
 ### 1. Global Skills (`agbox skills`)
 
@@ -267,11 +267,37 @@ agbox skills list
 agbox skills rm code-review
 ```
 
-When `$DATA_DIR/skills` contains one or more skills, `agbox run` mounts `$DATA_DIR/skills` read-only at `/home/agent/.agbox-skills` and bind-mounts it read-only (`ro,bind`) onto `/home/agent/.gemini/config/skills` and `/home/agent/.config/opencode/skills`. Guest processes, including guest `root`, cannot modify host files in `$DATA_DIR/skills`. Pass `--no-skills` to skip global skills for a run.
+When `$DATA_DIR/skills` contains one or more skills, `agbox run` mounts `$DATA_DIR/skills` read-only at `/home/agent/.agbox-skills` and bind-mounts it read-only (`ro,bind`) onto `/home/agent/.gemini/config/skills` and `/home/agent/.config/opencode/skills`. Guest processes, including guest `root`, cannot modify host files in `$DATA_DIR/skills`. Pass `--no-skills` to skip global skills for a run or resume.
 
-### 2. Project Skills and Instructions (`.agents/skills`)
+### 2. Global Rules (`agbox rules`)
 
-When you share one project directory, `agbox` starts the agent inside `/workspace/<name>`. Both `agy` and `opencode` discover `.agents/skills/<skill>/SKILL.md`, `.opencode/skills/<skill>/SKILL.md`, `GEMINI.md`, and `AGENTS.md` automatically through the FUSE VCS filter while `.git` and `.jj` stay masked. When you share multiple directories with `antigravity`, `agbox` passes `--add-dir /workspace/<name>` for each shared directory.
+Store standing Markdown instructions and engineering standards in `$DATA_DIR/rules` on the host:
+
+```bash
+# Install a Markdown rule file into $DATA_DIR/rules/<name>.md
+agbox rules add ~/my-rules/engineering-standards.md
+
+# Save or replace a rule under a custom name
+agbox rules add --force --name standards ~/my-rules/engineering-standards.md
+
+# List or print installed global rules
+agbox rules list
+agbox rules show standards
+
+# Delete one rule or all global rules
+agbox rules rm standards
+agbox rules rm --all
+```
+
+When `$DATA_DIR/rules` contains one or more `.md` files (maximum 64 KiB per file), `agbox run` mounts `$DATA_DIR/rules` read-only at `/home/agent/.agbox-rules`. On every `agbox run` and `agbox resume`, `agbox` stages and bind-mounts the rules read-only (`ro,bind`):
+
+- Plain Markdown files (and `trigger: always_on` files) merge in deterministic order (`AGENTS.md` and `GEMINI.md` first, then alphabetical `*.md`) into `/etc/agbox-global-rules/AGENTS.md` (`0444`). `agbox` bind-mounts that file read-only onto `/home/agent/.gemini/config/AGENTS.md` and `/home/agent/.config/opencode/AGENTS.md` so both `agy` and `opencode` enforce it on every session.
+- Conditional Antigravity rule files with YAML frontmatter (`trigger: glob`, `trigger: model_decision`, or `trigger: manual`) stage into `/etc/agbox-global-rules/rules/*.md` (`0444`) and bind-mount read-only onto `/home/agent/.gemini/config/rules`.
+- Editing `$DATA_DIR/rules` on the host takes effect automatically on the next `agbox run` or `agbox resume` without rebuilding `agbox:vN`. Pass `--no-rules` to skip global rules for a run or resume.
+
+### 3. Project Skills and Instructions (`.agents/skills` and `AGENTS.md`)
+
+When you share one project directory, `agbox` starts the agent inside `/workspace/<name>`. Both `agy` and `opencode` discover `AGENTS.md`, `GEMINI.md`, `.agents/rules/*.md`, `.agents/skills/<skill>/SKILL.md`, and `.opencode/skills/<skill>/SKILL.md` automatically through the FUSE VCS filter while `.git` and `.jj` stay masked. When you share multiple directories with `antigravity`, `agbox` passes `--add-dir /workspace/<name>` for each shared directory.
 
 ______________________________________________________________________
 
@@ -437,6 +463,9 @@ Modes:
   agbox skills [--allow-root] [list|add [--force] <path>|rm <name>]
       Manage global skills mounted read-only into sandboxes from $DATA_DIR/skills.
 
+  agbox rules [--allow-root] [list|add [--force] [--name NAME] <file.md>|show [<name>]|rm <name|--all>]
+      Manage global rules mounted read-only into sandboxes from $DATA_DIR/rules.
+
   agbox profile [--allow-root] [list|create [--size SIZE] <name>|rm [--force] <name>]
       Manage ext4 disk profiles for conversation history across ephemeral runs.
 
@@ -452,6 +481,7 @@ Modes:
         -s, --session ID     Continue conversation ID in TUI mode (alias: --conversation)
         --no-auth            Skip saved login credentials from $DATA_DIR/auth
         --no-skills          Skip global skills from $DATA_DIR/skills
+        --no-rules           Skip global rules from $DATA_DIR/rules
         --allow-root         Allow agbox to run as the root user
         --ro                 Mount shared paths read-only
         --mask-vcs           Require the FUSE VCS filter for directory shares (default)
@@ -489,7 +519,7 @@ ______________________________________________________________________
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config`, `auth`, `skills`, `profiles`, and `run/<id>`. |
+| `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config`, `auth`, `skills`, `rules`, `profiles`, and `run/<id>`. |
 | `AGBOX_INSTALL_DIR` | `~/.local/bin` (`/usr/local/bin` for `root`) | Target directory where `install.sh` installs the `agbox` binary. |
 | `AGBOX_ALLOW_ROOT` | `0` | Set to `1` to allow `install.sh` and `agbox` to run as `root`. |
 | `AGBOX_CPUS` | `4` | Default vCPU count for `create-base` and `run`. |
@@ -539,10 +569,11 @@ ______________________________________________________________________
 | Secret streaming over `stdin` | `msb.FormatEnvExports`, `cli.pushKeys` | Quotes values for POSIX `sh` and streams keys over `stdin` into `/home/agent/.agbox-keys.sh` (`0600`). Never passes secrets in CLI arguments. |
 | Allowlisted `agbox auth` credentials | `persist`, `cli.Auth`, `cli.pushAuth` | Captures only allowlisted login files (max 64 KiB, `Lstat` no-symlink check) from a zero-share microVM, stores them at `0600` in `$DATA_DIR/auth`, and streams them over `stdin`. |
 | Read-only global skills | `persist.InspectSkillsDir`, `cli` | Rejects symlinks and special files in `$DATA_DIR/skills`, mounts the volume read-only (`:ro`), and enforces `ro,bind` mounts inside the guest. |
-| Isolated `ext4` conversation profiles | `persist.LockProfile`, `cli` | Guards each `agbox-profile-<name>` disk volume with an exclusive host `flock` and bind-mounts only conversation directories while keeping global skills, hooks, plugins, and `mcp_config.json` outside the profile disk. |
+| Read-only global rules | `persist.InspectRulesDir`, `cli` | Rejects symlinks, subdirectories, non-`.md` entries, NUL bytes, and files over 64 KiB in `$DATA_DIR/rules`, mounts the volume read-only (`:ro`), and enforces `ro,bind` mounts inside the guest. |
+| Isolated `ext4` conversation profiles | `persist.LockProfile`, `cli` | Guards each `agbox-profile-<name>` disk volume with an exclusive host `flock` and bind-mounts only conversation directories while keeping global skills, rules, hooks, plugins, and `mcp_config.json` outside the profile disk. |
 | PID-reuse signal protection | `mounttab.IsFilterCmdline` | Verifies `/proc/<pid>/cmdline` has `argv[1] == "__filter"` before sending `SIGTERM` or `SIGKILL`. |
 | Mount-verified directory deletion | `mounttab.TeardownFilterDir` | Verifies zero active mounts in `/proc/self/mountinfo` before running `os.RemoveAll`. |
-| Tamper-evident `resume` & fail-closed setup | `cli` (`Setup`, `EditBase`, `Run`, `Resume`), `install.sh` | Checks FUSE, KVM, and an offline smoke microVM in `setup`, re-validates shares, skills, profiles, and strict masking on `resume`, and aborts on any error. |
+| Tamper-evident `resume` & fail-closed setup | `cli` (`Setup`, `EditBase`, `Run`, `Resume`), `install.sh` | Checks FUSE, KVM, and an offline smoke microVM in `setup`, re-validates shares, skills, rules, profiles, and strict masking on `resume`, and aborts on any error. |
 
 ______________________________________________________________________
 
@@ -557,7 +588,7 @@ agbox/
 │   ├── mounttab/      /proc/self/mountinfo parser and FUSE unmount verification
 │   ├── msb/           Argument builders, network rules, categories, and Runner interface
 │   ├── pathsec/       Host path validation, blocklist checks, and mount naming
-│   ├── persist/       Persistent login capture/streaming, read-only skills, and profile locking
+│   ├── persist/       Persistent login capture/streaming, read-only skills and rules, and profile locking
 │   └── vcsfuse/       Loopback FUSE filesystem that hides VCS directories and blocks xattrs
 ├── install.sh         Idempotent host check, build, and installation script
 └── README.md          User and security documentation
