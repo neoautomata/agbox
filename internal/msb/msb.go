@@ -37,6 +37,12 @@ const GuestHome = "/home/agent"
 // GuestKeysFile is the path inside the microVM where host API keys are written.
 const GuestKeysFile = "/home/agent/.agbox-keys.sh"
 
+// GuestSkillsMount is the read-only virtiofs mountpoint for host global skills.
+const GuestSkillsMount = "/home/agent/.agbox-skills"
+
+// GuestProfileMount is the ext4 disk volume mountpoint for conversation profiles.
+const GuestProfileMount = "/home/agent/.agbox-profile"
+
 // GuestWorkspace is the directory inside the microVM where host shares are mounted.
 const GuestWorkspace = "/workspace"
 
@@ -386,17 +392,30 @@ func BuildCreateArgs(opts CreateOpts) ([]string, error) {
 	return args, nil
 }
 
+// NamedVolumeSpec describes an msb named volume (such as a disk-backed profile volume).
+// Disk-backed ext4 volumes use block-device semantics and omit virtiofs uid/gid flags.
+type NamedVolumeSpec struct {
+	VolumeName string
+	GuestPath  string
+}
+
+// FormatFlag renders the `-v` value (`<volume>:<guest_path>`) for a named volume.
+func (v NamedVolumeSpec) FormatFlag() string {
+	return fmt.Sprintf("%s:%s", v.VolumeName, v.GuestPath)
+}
+
 // RestoreOpts holds parameters for `msb snap restore`.
 type RestoreOpts struct {
-	Snapshot string
-	Name     string
-	User     string
-	CPUs     string
-	Memory   string
-	Volumes  []VolumeSpec
-	Ports    []string // e.g. "127.0.0.1:4096:3000"
-	NoNet    bool
-	NetSpecs []string
+	Snapshot     string
+	Name         string
+	User         string
+	CPUs         string
+	Memory       string
+	NamedVolumes []NamedVolumeSpec
+	Volumes      []VolumeSpec
+	Ports        []string // e.g. "127.0.0.1:4096:3000"
+	NoNet        bool
+	NetSpecs     []string
 }
 
 // BuildRestoreArgs constructs the CLI argument list for `msb snap restore`.
@@ -421,6 +440,9 @@ func BuildRestoreArgs(opts RestoreOpts) ([]string, error) {
 	}
 	if opts.Memory != "" {
 		args = append(args, "--memory", opts.Memory)
+	}
+	for _, nv := range opts.NamedVolumes {
+		args = append(args, "-v", nv.FormatFlag())
 	}
 	for _, v := range opts.Volumes {
 		args = append(args, "-v", v.FormatFlag())
@@ -520,7 +542,8 @@ if [[ -n "${cur_grp}" && "${cur_grp}" != "agent" ]] && ! getent group "agent" >/
   groupmod -n "agent" "${cur_grp}" || true
 fi
 usermod -s /bin/bash -d "/home/agent" -aG sudo "agent"
-mkdir -p /etc/sudoers.d "/home/agent" "/home/agent/.local/bin" /workspace
+mkdir -p /etc/sudoers.d "/home/agent" "/home/agent/.local/bin" "/home/agent/.agbox-skills" "/home/agent/.agbox-profile" /workspace
+chmod 0700 "/home/agent/.agbox-skills" "/home/agent/.agbox-profile"
 printf "%s ALL=(ALL:ALL) NOPASSWD: ALL\n" "agent" > /etc/sudoers.d/agent
 chmod 0440 /etc/sudoers.d/agent
 if [[ -f /root/.local/bin/agy ]]; then
@@ -742,4 +765,40 @@ func SnapshotExists(ctx context.Context, runner Runner, target string) (bool, er
 	}
 	snaps := ParseSnapshotList(res.Stdout)
 	return slices.Contains(snaps, target), nil
+}
+
+// BuildVolumeCreateDiskArgs constructs the CLI argument list for creating an ext4 disk volume.
+func BuildVolumeCreateDiskArgs(name, size string) ([]string, error) {
+	if name == "" {
+		return nil, errors.New("volume name is required")
+	}
+	if size == "" {
+		return nil, errors.New("volume size is required")
+	}
+	return []string{"volume", "create", name, "--kind", "disk", "--size", size}, nil
+}
+
+// ParseVolumeList extracts named volume identifiers from `msb volume ls`.
+func ParseVolumeList(out string) []string {
+	var vols []string
+	for _, raw := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "NAME") || strings.HasPrefix(line, "VOLUME") || strings.HasPrefix(line, "-") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			vols = appendUnique(vols, fields[0])
+		}
+	}
+	return vols
+}
+
+// VolumeExists reports whether target is present in `msb volume ls`.
+func VolumeExists(ctx context.Context, runner Runner, target string) (bool, error) {
+	res, err := runner.Run(ctx, CommandRequest{Args: []string{"volume", "ls"}})
+	if err != nil {
+		return false, fmt.Errorf("msb volume ls: %w (%s)", err, strings.TrimSpace(res.Stderr))
+	}
+	return slices.Contains(ParseVolumeList(res.Stdout), target), nil
 }

@@ -2,13 +2,13 @@
 //
 // Security properties:
 //   - Rejects root execution by default unless --allow-root or AGBOX_ALLOW_ROOT=1 is set.
-//   - Fails closed across setup, create-base, edit-base, run, and resume whenever
-//     a prerequisite, FUSE filter, network rule, or secret transfer fails.
+//   - Fails closed across setup, create-base, edit-base, auth, skills, profile, run, and resume
+//     whenever a prerequisite, FUSE filter, network rule, or secret transfer fails.
 //   - Enforces MaskStrict FUSE VCS filtering and default-deny public-only egress
 //     by default on every run.
 //   - Binds --serve web interfaces strictly to host loopback (127.0.0.1).
-//   - Streams host API keys over stdin into the disposable microVM and cleans up
-//     sandboxes and FUSE mounts on exit or termination signals.
+//   - Streams host API keys and saved sandbox login credentials over stdin into the microVM.
+//   - Mounts global skills from $DATA_DIR/skills read-only and isolates --profile disks with flock.
 package cli
 
 import (
@@ -33,6 +33,7 @@ import (
 	"agbox/internal/mounttab"
 	"agbox/internal/msb"
 	"agbox/internal/pathsec"
+	"agbox/internal/persist"
 	"agbox/internal/vcsfuse"
 )
 
@@ -336,22 +337,28 @@ func isDigits(s string) bool {
 
 // RunOpts holds parsed arguments for `agbox run`.
 type RunOpts struct {
-	Name          string
-	Agent         string
-	Paths         []string
-	AllowRoot     bool
-	ReadOnly      bool
-	Detach        bool
-	Serve         bool
-	Probe         bool
-	Port          int
-	RemoteControl bool
-	Cmd           string
-	NoNet         bool
-	NetSpecs      []string
-	CPUs          string
-	Memory        string
-	MaskMode      config.MaskMode
+	Name            string
+	Agent           string
+	Paths           []string
+	AllowRoot       bool
+	ReadOnly        bool
+	Detach          bool
+	Serve           bool
+	Probe           bool
+	Port            int
+	RemoteControl   bool
+	Cmd             string
+	NoNet           bool
+	NetSpecs        []string
+	CPUs            string
+	Memory          string
+	MaskMode        config.MaskMode
+	Persist         bool
+	Profile         string
+	Continue        bool
+	ContinueSession string
+	NoAuth          bool
+	NoSkills        bool
 }
 
 // ParseRunArgs parses CLI arguments for `run`.
@@ -390,6 +397,30 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 				return RunOpts{}, nErr
 			}
 			opts.Name = validName
+			continue
+		}
+		if strings.HasPrefix(arg, "--profile=") {
+			profName, pErr := persist.ValidateProfileName(strings.TrimPrefix(arg, "--profile="))
+			if pErr != nil {
+				return RunOpts{}, pErr
+			}
+			opts.Profile = profName
+			continue
+		}
+		if strings.HasPrefix(arg, "--session=") {
+			sid, sErr := persist.ValidateSessionID(strings.TrimPrefix(arg, "--session="))
+			if sErr != nil {
+				return RunOpts{}, sErr
+			}
+			opts.ContinueSession = sid
+			continue
+		}
+		if strings.HasPrefix(arg, "--conversation=") {
+			sid, sErr := persist.ValidateSessionID(strings.TrimPrefix(arg, "--conversation="))
+			if sErr != nil {
+				return RunOpts{}, sErr
+			}
+			opts.ContinueSession = sid
 			continue
 		}
 
@@ -471,6 +502,34 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			opts.MaskMode = config.MaskStrict
 		case "--no-mask":
 			opts.MaskMode = config.MaskOff
+		case "--persist":
+			opts.Persist = true
+		case "--profile":
+			if i+1 >= len(args) {
+				return RunOpts{}, errors.New("--profile requires a profile name")
+			}
+			profName, pErr := persist.ValidateProfileName(args[i+1])
+			if pErr != nil {
+				return RunOpts{}, pErr
+			}
+			opts.Profile = profName
+			i++
+		case "-c", "--continue":
+			opts.Continue = true
+		case "-s", "--session", "--conversation":
+			if i+1 >= len(args) {
+				return RunOpts{}, fmt.Errorf("%s requires a session or conversation ID", arg)
+			}
+			sid, sErr := persist.ValidateSessionID(args[i+1])
+			if sErr != nil {
+				return RunOpts{}, sErr
+			}
+			opts.ContinueSession = sid
+			i++
+		case "--no-auth":
+			opts.NoAuth = true
+		case "--no-skills":
+			opts.NoSkills = true
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return RunOpts{}, fmt.Errorf("unknown run option: %s ('agbox run --help')", arg)
@@ -490,6 +549,26 @@ func ParseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	}
 	if opts.Detach && !opts.Serve && !opts.RemoteControl {
 		return RunOpts{}, errors.New("--detach (-d) requires --remote-control or --serve")
+	}
+	if opts.Persist && opts.Name == "" {
+		return RunOpts{}, errors.New("--persist requires --name <NAME>")
+	}
+	if opts.Persist && opts.Profile != "" {
+		return RunOpts{}, errors.New("--persist and --profile are mutually exclusive")
+	}
+	if opts.Persist && opts.Probe {
+		return RunOpts{}, errors.New("--persist and --probe are mutually exclusive")
+	}
+	if opts.Continue && opts.ContinueSession != "" {
+		return RunOpts{}, errors.New("--continue (-c) and --session/--conversation are mutually exclusive")
+	}
+	if opts.Continue || opts.ContinueSession != "" {
+		if opts.Serve || opts.Cmd != "" {
+			return RunOpts{}, errors.New("--continue and --session cannot be combined with --serve or --cmd")
+		}
+		if opts.RemoteControl && opts.Detach {
+			return RunOpts{}, errors.New("--continue and --session cannot be combined with detached --remote-control")
+		}
 	}
 
 	return opts, nil
@@ -567,16 +646,37 @@ func ParseSuspendArgs(args []string) (SuspendOpts, error) {
 
 // ResumeOpts holds parsed arguments for `agbox resume`.
 type ResumeOpts struct {
-	Sandbox   string
-	AllowRoot bool
-	Detach    bool
+	Sandbox         string
+	AllowRoot       bool
+	Detach          bool
+	Continue        bool
+	ContinueSession string
+	NoAuth          bool
+	NoSkills        bool
 }
 
 // ParseResumeArgs validates CLI arguments for `agbox resume`.
 func ParseResumeArgs(args []string) (ResumeOpts, error) {
 	var opts ResumeOpts
 	var pos []string
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "--session=") {
+			sid, err := persist.ValidateSessionID(strings.TrimPrefix(a, "--session="))
+			if err != nil {
+				return ResumeOpts{}, err
+			}
+			opts.ContinueSession = sid
+			continue
+		}
+		if strings.HasPrefix(a, "--conversation=") {
+			sid, err := persist.ValidateSessionID(strings.TrimPrefix(a, "--conversation="))
+			if err != nil {
+				return ResumeOpts{}, err
+			}
+			opts.ContinueSession = sid
+			continue
+		}
 		switch a {
 		case "-h", "--help":
 			return ResumeOpts{}, ErrHelp
@@ -584,15 +684,34 @@ func ParseResumeArgs(args []string) (ResumeOpts, error) {
 			opts.AllowRoot = true
 		case "-d", "--detach":
 			opts.Detach = true
+		case "-c", "--continue":
+			opts.Continue = true
+		case "-s", "--session", "--conversation":
+			if i+1 >= len(args) {
+				return ResumeOpts{}, fmt.Errorf("%s requires a session or conversation ID", a)
+			}
+			sid, err := persist.ValidateSessionID(args[i+1])
+			if err != nil {
+				return ResumeOpts{}, err
+			}
+			opts.ContinueSession = sid
+			i++
+		case "--no-auth":
+			opts.NoAuth = true
+		case "--no-skills":
+			opts.NoSkills = true
 		default:
 			if strings.HasPrefix(a, "-") {
-				return ResumeOpts{}, fmt.Errorf("unknown resume option: %s (expected --allow-root or --detach)", a)
+				return ResumeOpts{}, fmt.Errorf("unknown resume option: %s (expected --allow-root, --detach, --continue, --session, --no-auth, or --no-skills)", a)
 			}
 			pos = append(pos, a)
 		}
 	}
+	if opts.Continue && opts.ContinueSession != "" {
+		return ResumeOpts{}, errors.New("--continue (-c) and --session/--conversation are mutually exclusive")
+	}
 	if len(pos) != 1 {
-		return ResumeOpts{}, errors.New("Usage: agbox resume [--allow-root] [-d|--detach] <sandbox>")
+		return ResumeOpts{}, errors.New("Usage: agbox resume [--allow-root] [-d|--detach] [-c|--continue] [--session ID] <sandbox>")
 	}
 	name, err := validateTargetRunSandbox(pos[0], "resume")
 	if err != nil {
@@ -1496,9 +1615,9 @@ func parseSizeBytes(spec string) (int64, bool) {
 	return n * mult, true
 }
 
-// Run restores an ephemeral microVM from the base snapshot.
-// It validates and mounts host paths, streams API keys over stdin, and runs the agent.
-// On exit, Run deletes the microVM and unmounts all FUSE shares unless suspended or detached.
+// Run restores an ephemeral or persistent microVM from the base snapshot.
+// It validates and mounts host paths, streams saved login and API keys over stdin, and starts the agent.
+// On exit, Run deletes the microVM and unmounts FUSE shares unless persistent, suspended, or detached.
 func (a *App) Run(ctx context.Context, args []string) error {
 	opts, err := ParseRunArgs(args, a.Env.MaskVCS, nil)
 	if err != nil {
@@ -1506,6 +1625,9 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	}
 	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
+	}
+	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+		return fmt.Errorf("prepare data dir: %w", err)
 	}
 	baseState, err := a.requireBase(ctx)
 	if err != nil {
@@ -1547,14 +1669,55 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("list sandboxes: %w", err)
 	}
-	if existing, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), runSandbox); exists {
+	sandboxes := msb.ParseSandboxList(lsRes.Stdout)
+	if existing, exists := msb.FindSandbox(sandboxes, runSandbox); exists {
 		if hasMarker(filepath.Join(a.Env.DataDir, "run", dirID, "suspended")) {
+			if opts.Persist && !existing.Running {
+				return a.resumeFromRunPersist(ctx, runSandbox, dirID, baseState, opts, useMask)
+			}
 			return fmt.Errorf("sandbox %q is suspended. Run 'agbox resume %s' or 'agbox stop %s'", runSandbox, runSandbox, runSandbox)
 		}
 		if existing.Running {
 			return fmt.Errorf("sandbox %q is already running. Stop it with 'agbox stop %s'", runSandbox, runSandbox)
 		}
 		return fmt.Errorf("sandbox %q already exists. Delete it with 'agbox stop %s'", runSandbox, runSandbox)
+	}
+
+	skillsDir := filepath.Join(a.Env.DataDir, "skills")
+	var skillNames []string
+	skillsMounted := false
+	if !opts.NoSkills {
+		var sErr error
+		skillNames, sErr = persist.InspectSkillsDir(skillsDir)
+		if sErr != nil {
+			return sErr
+		}
+		if len(skillNames) > 0 {
+			skillsMounted = true
+		}
+	}
+
+	var profLock *persist.ProfileLock
+	var namedVolumes []msb.NamedVolumeSpec
+	if opts.Profile != "" {
+		var lErr error
+		profLock, lErr = persist.LockProfile(a.Env.DataDir, opts.Profile)
+		if lErr != nil {
+			return lErr
+		}
+		defer func() { _ = profLock.Unlock() }()
+
+		if err := a.checkProfileNotActive(opts.Profile, runSandbox, sandboxes); err != nil {
+			return err
+		}
+		volName, vErr := a.ensureProfileVolume(ctx, opts.Profile, a.Env.ProfileDisk)
+		if vErr != nil {
+			return vErr
+		}
+		namedVolumes = append(namedVolumes, msb.NamedVolumeSpec{
+			VolumeName: volName,
+			GuestPath:  msb.GuestProfileMount,
+		})
 	}
 
 	pol := a.sharePolicy(opts.ReadOnly)
@@ -1610,9 +1773,6 @@ func (a *App) Run(ctx context.Context, args []string) error {
 
 	runRootDir := filepath.Join(a.Env.DataDir, "run")
 	runFilterDir := filepath.Join(runRootDir, dirID)
-	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
-		return fmt.Errorf("prepare data dir: %w", err)
-	}
 	if err := config.EnsurePrivateDir(runRootDir); err != nil {
 		return fmt.Errorf("prepare run root dir: %w", err)
 	}
@@ -1623,8 +1783,10 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
+	var meta config.RunMeta
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
 	sandboxCreated := false
+	persistReady := false
 	detached := false
 	var cleanupOnce sync.Once
 	cleanup := func() {
@@ -1634,6 +1796,10 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			}
 			if hasMarker(suspendedPath) {
 				_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+				return
+			}
+			if persistReady && sandboxCreated {
+				a.suspendSandboxOnExit(runSandbox, runFilterDir, meta)
 				return
 			}
 			if sandboxCreated {
@@ -1652,6 +1818,9 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		case <-sigCh:
 			cancelRun()
 			cleanup()
+			if profLock != nil {
+				_ = profLock.Unlock()
+			}
 		case <-runCtx.Done():
 		}
 	}()
@@ -1705,6 +1874,14 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		})
 	}
 
+	if skillsMounted {
+		volumes = append(volumes, msb.VolumeSpec{
+			HostPath:  skillsDir,
+			GuestPath: msb.GuestSkillsMount,
+			ReadOnly:  true,
+		})
+	}
+
 	if maskedCount > 0 {
 		extra := ""
 		if directCount > 0 {
@@ -1713,39 +1890,51 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		a.logf("VCS filter: %d share(s) masked%s.", maskedCount, extra)
 	}
 
-	meta := config.RunMeta{
-		Sandbox:       runSandbox,
-		OwnerPID:      a.PID,
-		Agent:         effectiveAgent,
-		Mode:          runMode,
-		Detached:      isDetached,
-		RemoteControl: opts.RemoteControl,
-		Port:          port,
-		Cmd:           opts.Cmd,
-		ReadOnly:      opts.ReadOnly,
-		MaskMode:      opts.MaskMode,
-		Shares:        shareRecords,
+	meta = config.RunMeta{
+		Sandbox:         runSandbox,
+		OwnerPID:        a.PID,
+		Agent:           effectiveAgent,
+		Mode:            runMode,
+		Detached:        isDetached,
+		RemoteControl:   opts.RemoteControl,
+		Port:            port,
+		Cmd:             opts.Cmd,
+		ReadOnly:        opts.ReadOnly,
+		MaskMode:        opts.MaskMode,
+		Shares:          shareRecords,
+		Persist:         opts.Persist,
+		Profile:         opts.Profile,
+		Continue:        opts.Continue,
+		ContinueSession: opts.ContinueSession,
+		NoAuth:          opts.NoAuth,
+		NoSkills:        opts.NoSkills,
+		SkillsMounted:   skillsMounted,
 	}
 	if err := config.SaveRunMeta(filepath.Join(runFilterDir, "run.meta"), meta); err != nil {
 		return fmt.Errorf("save run metadata: %w", err)
 	}
 
 	restoreArgs, err := msb.BuildRestoreArgs(msb.RestoreOpts{
-		Snapshot: baseState.Snapshot,
-		Name:     runSandbox,
-		User:     config.GuestUser,
-		CPUs:     defaultStr(opts.CPUs, a.Env.CPUs),
-		Memory:   defaultStr(opts.Memory, a.Env.Memory),
-		Volumes:  volumes,
-		Ports:    portArgs,
-		NoNet:    opts.NoNet,
-		NetSpecs: opts.NetSpecs,
+		Snapshot:     baseState.Snapshot,
+		Name:         runSandbox,
+		User:         config.GuestUser,
+		CPUs:         defaultStr(opts.CPUs, a.Env.CPUs),
+		Memory:       defaultStr(opts.Memory, a.Env.Memory),
+		Volumes:      volumes,
+		NamedVolumes: namedVolumes,
+		Ports:        portArgs,
+		NoNet:        opts.NoNet,
+		NetSpecs:     opts.NetSpecs,
 	})
 	if err != nil {
 		return err
 	}
 
-	a.logf("Booting ephemeral microVM %s from %s (changes do not persist to the base)...", runSandbox, baseState.Snapshot)
+	if opts.Persist {
+		a.logf("Booting persistent microVM %s from %s (changes do not persist to the base)...", runSandbox, baseState.Snapshot)
+	} else {
+		a.logf("Booting ephemeral microVM %s from %s (changes do not persist to the base)...", runSandbox, baseState.Snapshot)
+	}
 	sandboxCreated = true
 	if _, err := a.MSB.Run(runCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
 		return fmt.Errorf("snapshot restore failed: %w", err)
@@ -1754,10 +1943,28 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	if err := a.ensureGuestUser(runCtx, runSandbox); err != nil {
 		return err
 	}
+	if skillsMounted {
+		if err := a.setupGuestSkills(runCtx, runSandbox); err != nil {
+			return err
+		}
+		a.logf("Global skills: %d skill(s) mounted read-only.", len(skillNames))
+	}
+	if opts.Profile != "" {
+		if err := a.setupGuestProfile(runCtx, runSandbox); err != nil {
+			return err
+		}
+		a.logf("Conversation profile %q mounted.", opts.Profile)
+	}
+	if !opts.NoAuth {
+		if err := a.pushAuth(runCtx, runSandbox, effectiveAgent); err != nil {
+			return err
+		}
+	}
 	if err := a.pushKeys(runCtx, runSandbox); err != nil {
 		return err
 	}
 
+	persistReady = opts.Persist
 	return a.execSession(runCtx, meta, runFilterDir, opts.Probe, &detached)
 }
 
@@ -1836,6 +2043,10 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	return a.resumeSandbox(ctx, opts)
+}
+
+func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
 	}
@@ -1863,6 +2074,16 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 	if meta.Sandbox != "" && meta.Sandbox != opts.Sandbox {
 		return fmt.Errorf("suspended metadata sandbox mismatch: got %q, want %q", meta.Sandbox, opts.Sandbox)
 	}
+	if meta.Profile != "" {
+		if _, pErr := persist.ValidateProfileName(meta.Profile); pErr != nil {
+			return fmt.Errorf("invalid profile in suspended metadata: %w", pErr)
+		}
+	}
+	if meta.ContinueSession != "" {
+		if _, sErr := persist.ValidateSessionID(meta.ContinueSession); sErr != nil {
+			return fmt.Errorf("invalid session ID in suspended metadata: %w", sErr)
+		}
+	}
 	maskMode := meta.MaskMode
 	if maskMode == "" {
 		maskMode = config.MaskStrict
@@ -1878,7 +2099,8 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("list sandboxes: %w", err)
 	}
-	sb, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), opts.Sandbox)
+	sandboxes := msb.ParseSandboxList(lsRes.Stdout)
+	sb, exists := msb.FindSandbox(sandboxes, opts.Sandbox)
 	if !exists {
 		return fmt.Errorf("suspended sandbox %q does not exist in msb", opts.Sandbox)
 	}
@@ -1911,6 +2133,63 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 			isDetached = false
 		default:
 			return fmt.Errorf("unsupported run mode %q", effectiveMode)
+		}
+	}
+
+	wantContinue := meta.Continue || opts.Continue
+	wantSession := meta.ContinueSession
+	if opts.ContinueSession != "" {
+		wantContinue = false
+		wantSession = opts.ContinueSession
+	} else if opts.Continue {
+		wantSession = ""
+	}
+	if (wantContinue || wantSession != "") && effectiveMode != config.RunModeTUI {
+		return errors.New("--continue and --session require an interactive TUI sandbox")
+	}
+
+	skillsDir := filepath.Join(a.Env.DataDir, "skills")
+	skipSkills := meta.NoSkills || opts.NoSkills
+	var skillNames []string
+	if meta.SkillsMounted {
+		var sErr error
+		skillNames, sErr = persist.InspectSkillsDir(skillsDir)
+		if sErr != nil {
+			return sErr
+		}
+		if err := config.EnsurePrivateDir(skillsDir); err != nil {
+			return fmt.Errorf("prepare skills dir: %w", err)
+		}
+	} else if !skipSkills {
+		var sErr error
+		skillNames, sErr = persist.InspectSkillsDir(skillsDir)
+		if sErr != nil {
+			return sErr
+		}
+		if len(skillNames) > 0 {
+			a.logf("Note: %s was created before global skills existed. Recreate it with 'agbox stop %s' to mount global skills.", opts.Sandbox, opts.Sandbox)
+		}
+	}
+
+	var profLock *persist.ProfileLock
+	if meta.Profile != "" {
+		var lErr error
+		profLock, lErr = persist.LockProfile(a.Env.DataDir, meta.Profile)
+		if lErr != nil {
+			return lErr
+		}
+		defer func() { _ = profLock.Unlock() }()
+
+		if err := a.checkProfileNotActive(meta.Profile, opts.Sandbox, sandboxes); err != nil {
+			return err
+		}
+		volName := persist.FormatProfileVolumeName(meta.Profile)
+		volExists, vErr := msb.VolumeExists(ctx, a.MSB, volName)
+		if vErr != nil {
+			return vErr
+		}
+		if !volExists {
+			return fmt.Errorf("profile disk volume %q does not exist", volName)
 		}
 	}
 
@@ -1980,6 +2259,8 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 	meta.OwnerPID = a.PID
 	meta.Mode = effectiveMode
 	meta.Detached = isDetached
+	meta.Continue = false
+	meta.ContinueSession = ""
 	if err := config.SaveRunMeta(filepath.Join(runFilterDir, "run.meta"), meta); err != nil {
 		_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"stop", opts.Sandbox}})
 		_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
@@ -1992,6 +2273,7 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
+	sessionStarted := false
 	detached := false
 	var cleanupOnce sync.Once
 	cleanup := func() {
@@ -2001,6 +2283,10 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 			}
 			if hasMarker(suspendedPath) {
 				_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+				return
+			}
+			if meta.Persist || !sessionStarted {
+				a.suspendSandboxOnExit(opts.Sandbox, runFilterDir, meta)
 				return
 			}
 			_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", opts.Sandbox}})
@@ -2017,6 +2303,9 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 		case <-sigCh:
 			cancelRun()
 			cleanup()
+			if profLock != nil {
+				_ = profLock.Unlock()
+			}
 		case <-runCtx.Done():
 		}
 	}()
@@ -2024,11 +2313,30 @@ func (a *App) Resume(ctx context.Context, args []string) error {
 	if err := a.ensureGuestUser(runCtx, opts.Sandbox); err != nil {
 		return err
 	}
+	if meta.SkillsMounted && !skipSkills && len(skillNames) > 0 {
+		if err := a.setupGuestSkills(runCtx, opts.Sandbox); err != nil {
+			return err
+		}
+	}
+	if meta.Profile != "" {
+		if err := a.setupGuestProfile(runCtx, opts.Sandbox); err != nil {
+			return err
+		}
+	}
+	if !meta.NoAuth && !opts.NoAuth {
+		if err := a.pushAuth(runCtx, opts.Sandbox, meta.Agent); err != nil {
+			return err
+		}
+	}
 	if err := a.pushKeys(runCtx, opts.Sandbox); err != nil {
 		return err
 	}
 
-	return a.execSession(runCtx, meta, runFilterDir, false, &detached)
+	execMeta := meta
+	execMeta.Continue = wantContinue
+	execMeta.ContinueSession = wantSession
+	sessionStarted = true
+	return a.execSession(runCtx, execMeta, runFilterDir, false, &detached)
 }
 
 func (a *App) sharePolicy(readOnly bool) pathsec.Policy {
@@ -2068,6 +2376,8 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 	runSandbox := meta.Sandbox
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
 	guestEnv := msb.GuestEnvFlags()
+	guestWorkDir := sessionWorkDir(meta.Shares)
+	quotedWorkDir := msb.ShellQuote(guestWorkDir)
 
 	switch meta.Mode {
 	case config.RunModeCmd:
@@ -2079,7 +2389,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			Env:     guestEnv,
 			Command: []string{
 				"sh", "-c",
-				msb.KeyLoaderPrefix + " cd /workspace && exec sh -c \"$1\"",
+				fmt.Sprintf("%s cd %s && exec sh -c \"$1\"", msb.KeyLoaderPrefix, quotedWorkDir),
 				"--", meta.Cmd,
 			},
 		})
@@ -2095,8 +2405,8 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 
 	case config.RunModeServe:
 		a.logf("Starting 'opencode serve' on guest:%d as %s...", config.GuestPort, config.GuestUser)
-		serveCmd := fmt.Sprintf("%s cd /workspace && exec opencode serve --hostname 0.0.0.0 --port %d",
-			msb.KeyLoaderPrefix, config.GuestPort)
+		serveCmd := fmt.Sprintf("%s cd %s && exec opencode serve --hostname 0.0.0.0 --port %d",
+			msb.KeyLoaderPrefix, quotedWorkDir, config.GuestPort)
 		serveArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox:  runSandbox,
 			Detached: true,
@@ -2137,7 +2447,11 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			return nil
 		}
 
-		fmt.Fprintln(a.Stdout, "Press Ctrl-C to stop the microVM and delete all guest changes.")
+		if meta.Persist {
+			fmt.Fprintln(a.Stdout, "Press Ctrl-C to stop the microVM and save guest changes.")
+		} else {
+			fmt.Fprintln(a.Stdout, "Press Ctrl-C to stop the microVM and delete all guest changes.")
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -2157,12 +2471,8 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 		}
 
 	case config.RunModeRemoteControl:
-		guestWorkDir := msb.GuestWorkspace
-		if len(meta.Shares) == 1 && meta.Shares[0].IsDir {
-			guestWorkDir = msb.GuestWorkspace + "/" + meta.Shares[0].GuestName
-		}
 		startDaemonCmd := fmt.Sprintf("%s cd %s && agy remote-control start --name %s",
-			msb.KeyLoaderPrefix, msb.ShellQuote(guestWorkDir), msb.ShellQuote(runSandbox))
+			msb.KeyLoaderPrefix, quotedWorkDir, msb.ShellQuote(runSandbox))
 		startArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: runSandbox,
 			User:    config.GuestUser,
@@ -2177,7 +2487,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 				TTY:     true,
 				User:    config.GuestUser,
 				Env:     guestEnv,
-				Command: []string{"sh", "-c", fmt.Sprintf("%s cd %s && exec agy", msb.KeyLoaderPrefix, msb.ShellQuote(guestWorkDir))},
+				Command: []string{"sh", "-c", fmt.Sprintf("%s cd %s && exec agy", msb.KeyLoaderPrefix, quotedWorkDir)},
 			})
 			_, _ = a.MSB.Run(ctx, msb.CommandRequest{
 				Args:        authArgs,
@@ -2213,22 +2523,13 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 		return nil
 
 	default:
-		bin := meta.Agent
-		switch meta.Agent {
-		case "opencode":
-			bin = "opencode"
-		case "antigravity":
-			bin = "agy"
-			if meta.RemoteControl {
-				bin = "agy --remote-control"
-			}
-		}
+		inv := buildTUIInvokeCommand(meta)
 		modeStr := "rw"
 		if meta.ReadOnly {
 			modeStr = "ro"
 		}
 		a.logf("Starting %s (%s) in %s as %s (passwordless sudo available).",
-			meta.Agent, bin, runSandbox, config.GuestUser)
+			meta.Agent, inv, runSandbox, config.GuestUser)
 		a.logf("Shared: %d path(s) under /workspace (%s).", len(meta.Shares), modeStr)
 
 		tuiArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
@@ -2236,7 +2537,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			TTY:     true,
 			User:    config.GuestUser,
 			Env:     guestEnv,
-			Command: []string{"sh", "-c", fmt.Sprintf("%s cd /workspace && exec %s", msb.KeyLoaderPrefix, bin)},
+			Command: []string{"sh", "-c", fmt.Sprintf("%s cd %s && exec %s", msb.KeyLoaderPrefix, quotedWorkDir, inv)},
 		})
 		_, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        tuiArgs,
@@ -2347,7 +2648,7 @@ func (a *App) Stop(ctx context.Context, args []string) error {
 	return nil
 }
 
-// Remove deletes all agbox sandboxes, snapshots, unused cached images, FUSE mounts, and `$DATA_DIR`.
+// Remove deletes all agbox sandboxes, snapshots, profile volumes, FUSE mounts, and `$DATA_DIR`.
 func (a *App) Remove(ctx context.Context, args []string) error {
 	yes, allowRoot, err := parseRemoveOpts(args)
 	if err != nil {
@@ -2357,7 +2658,7 @@ func (a *App) Remove(ctx context.Context, args []string) error {
 		return err
 	}
 	if !yes {
-		fmt.Fprintf(a.Stdout, "This deletes: agbox sandboxes (%s, agbox-*), snapshots (%s), unused cached images, and %s.\n",
+		fmt.Fprintf(a.Stdout, "This deletes: agbox sandboxes (%s, agbox-*), snapshots (%s), profile volumes (agbox-profile-*), unused cached images, and %s.\n",
 			config.BaseSandbox, config.SnapGroup, a.Env.DataDir)
 		fmt.Fprintln(a.Stdout, "It does NOT modify the msb binary, your other sandboxes, or any shared host files.")
 		fmt.Fprintln(a.Stdout, "Type 'y' to confirm:")
@@ -2372,6 +2673,14 @@ func (a *App) Remove(ctx context.Context, args []string) error {
 			for _, sb := range msb.ParseSandboxList(lsRes.Stdout) {
 				if isAgboxSandboxName(sb.Name) {
 					_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", sb.Name}})
+				}
+			}
+		}
+
+		if volRes, vErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"volume", "ls"}}); vErr == nil {
+			for _, v := range msb.ParseVolumeList(volRes.Stdout) {
+				if persist.IsProfileVolumeName(v) {
+					_, _ = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"volume", "rm", v}})
 				}
 			}
 		}
@@ -2458,7 +2767,7 @@ func containsStr(list []string, target string) bool {
 	return false
 }
 
-// Status prints the current base configuration, sandboxes, snapshots, and disk usage.
+// Status prints the current base configuration, persistence state, sandboxes, snapshots, and disk usage.
 func (a *App) Status(ctx context.Context, args []string) error {
 	opts, err := ParseStatusArgs(args)
 	if err != nil {
@@ -2473,6 +2782,8 @@ func (a *App) Status(ctx context.Context, args []string) error {
 	} else {
 		fmt.Fprintln(a.Stdout, "(none - run create-base)")
 	}
+
+	a.printPersistenceStatus(ctx)
 
 	fmt.Fprintln(a.Stdout, "\n== sandboxes ==")
 	if res, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}}); err == nil {
@@ -2510,12 +2821,27 @@ Modes:
       Start the base microVM and install categories or run custom updates.
       Save snapshot agbox:v<N+1> unless you pass --no-snap.
 
+  agbox auth [--allow-root] [antigravity|opencode|status|logout]
+      Sign in inside a disposable microVM and save credentials in $DATA_DIR/auth.
+
+  agbox skills [--allow-root] [list|add [--force] <path>|rm <name>]
+      Manage global skills mounted read-only into sandboxes from $DATA_DIR/skills.
+
+  agbox profile [--allow-root] [list|create [--size SIZE] <name>|rm [--force] <name>]
+      Manage ext4 disk profiles for conversation history across ephemeral runs.
+
   agbox run [options] [opencode|antigravity] [paths...]
-      Restore an ephemeral microVM and mask VCS files and directories.
+      Restore a microVM and mask VCS files and directories.
       Block local, private, multicast, and cloud-config IPs by default.
-      Delete the microVM and unmount FUSE shares on exit.
+      Delete the microVM on exit unless you pass --persist or suspend it.
       Options (must precede paths):
         --name NAME          Name the sandbox agbox-NAME instead of agbox-run-PID
+        --persist            Keep the named microVM on exit and resume it on repeat runs
+        --profile NAME       Mount ext4 profile volume agbox-profile-NAME for conversations
+        -c, --continue       Continue the most recent conversation in TUI mode
+        -s, --session ID     Continue conversation ID in TUI mode (alias: --conversation)
+        --no-auth            Skip saved login credentials from $DATA_DIR/auth
+        --no-skills          Skip global skills from $DATA_DIR/skills
         --allow-root         Allow agbox to run as the root user
         --ro                 Mount shared paths read-only
         --mask-vcs           Require the FUSE VCS filter for directory shares (default)
@@ -2525,7 +2851,7 @@ Modes:
         --probe              With --serve: wait for the web UI, then exit
         --remote-control     Run 'agy' with Remote Control for https://antigravity.google.com
         -d, --detach         Keep --remote-control or --serve running in the background
-        --cmd "shell"        Run one command in the ephemeral microVM and exit
+        --cmd "shell"        Run one command in the microVM and exit
         --no-net             Disable guest network access
         --net SPEC           Set network profile (public|none|private|host|all) or rule
         --cpus N             Override vCPU count for this run
@@ -2534,17 +2860,17 @@ Modes:
   agbox suspend [--allow-root] <sandbox>
       Stop a run microVM, keep its root disk, and unmount host FUSE shares.
 
-  agbox resume [--allow-root] [-d|--detach] <sandbox>
+  agbox resume [--allow-root] [-d|--detach] [-c|--continue] [--session ID] <sandbox>
       Validate shares, mount FUSE filters, start a suspended microVM, and restart its agent.
 
   agbox stop [--allow-root] <sandbox>
       Delete a running or suspended run microVM and unmount its FUSE shares.
 
   agbox remove [--allow-root] [--yes]
-      Delete all agbox microVMs, snapshots, FUSE mounts, and ~/.local/share/agbox.
+      Delete all agbox microVMs, snapshots, profile volumes, FUSE mounts, and $DATA_DIR.
 
   agbox status [--allow-root]
-      Show base configuration, microVMs, snapshots, and disk usage.
+      Show base configuration, persistence state, microVMs, snapshots, and disk usage.
 `
 }
 
@@ -2553,6 +2879,12 @@ func RunUsageText() string {
 	return `Usage: agbox run [options] [agent] [path...]
 
   --name NAME      name the sandbox agbox-NAME instead of agbox-run-PID
+  --persist        keep the named microVM on exit and resume it on repeat runs
+  --profile NAME   mount ext4 profile volume agbox-profile-NAME for conversations
+  -c, --continue   continue the most recent conversation in TUI mode
+  -s, --session ID continue conversation ID in TUI mode (alias: --conversation)
+  --no-auth        skip saved login credentials from $DATA_DIR/auth
+  --no-skills      skip global skills from $DATA_DIR/skills
   --allow-root     allow agbox to run as the root user
   --ro             mount shared paths read-only
   --mask-vcs       require the FUSE VCS filter for directory shares (default)
@@ -2562,7 +2894,7 @@ func RunUsageText() string {
   --probe          with --serve: wait for the web UI, then exit
   --remote-control run 'agy' with Remote Control for https://antigravity.google.com
   -d, --detach     keep --remote-control or --serve running in the background
-  --cmd 'shell'    run one command in the ephemeral microVM and exit
+  --cmd 'shell'    run one command in the microVM and exit
   --no-net         disable guest network access
   --net SPEC       set network profile (public|none|private|host|all) or msb rule
   --cpus N / --memory S   override vCPU count or RAM size for this run
@@ -2597,6 +2929,24 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 		err = a.CreateBase(ctx, rest)
 	case "edit-base":
 		err = a.EditBase(ctx, rest)
+	case "auth":
+		err = a.Auth(ctx, rest)
+		if errors.Is(err, ErrHelp) {
+			fmt.Fprint(a.Stdout, AuthUsageText())
+			return 0
+		}
+	case "skills":
+		err = a.Skills(ctx, rest)
+		if errors.Is(err, ErrHelp) {
+			fmt.Fprint(a.Stdout, SkillsUsageText())
+			return 0
+		}
+	case "profile":
+		err = a.Profile(ctx, rest)
+		if errors.Is(err, ErrHelp) {
+			fmt.Fprint(a.Stdout, ProfileUsageText())
+			return 0
+		}
 	case "run":
 		err = a.Run(ctx, rest)
 		if errors.Is(err, ErrHelp) {
@@ -2614,7 +2964,7 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 	case "status":
 		err = a.Status(ctx, rest)
 	default:
-		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup create-base edit-base run suspend resume stop remove status)\n", mode)
+		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup create-base edit-base auth skills profile run suspend resume stop remove status)\n", mode)
 		return 1
 	}
 

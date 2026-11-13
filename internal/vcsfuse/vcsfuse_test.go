@@ -781,3 +781,86 @@ func TestRunMainValidationAndStartSubprocess(t *testing.T) {
 		t.Error("expected StartSubprocess to reject symlinked mountpoint")
 	}
 }
+
+func TestProjectSkillsAndRulesPassThroughFUSEWhileVCSRemainsMasked(t *testing.T) {
+	ctx := context.Background()
+	srcDir, root := newTestFilteredRoot(t)
+
+	for _, dir := range []string{
+		".git",
+		".jj",
+		".agents/skills/review",
+		".opencode/skills/lint",
+	} {
+		if err := os.MkdirAll(filepath.Join(srcDir, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for rel, body := range map[string]string{
+		".git/config":                    "[core]\n",
+		".agents/skills/review/SKILL.md": "---\nname: review\ndescription: Code review\n---\n",
+		".opencode/skills/lint/SKILL.md": "---\nname: lint\ndescription: Lint helper\n---\n",
+		"GEMINI.md":                      "# Project rules\n",
+		"AGENTS.md":                      "# Agent instructions\n",
+	} {
+		if err := os.WriteFile(filepath.Join(srcDir, rel), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Verify FilteredNode Lookup exposes .agents, .opencode, GEMINI.md, and AGENTS.md while hiding .git and .jj.
+	for _, allowed := range []string{".agents", ".opencode", "GEMINI.md", "AGENTS.md"} {
+		var out fuse.EntryOut
+		if _, errno := root.Lookup(ctx, allowed, &out); errno != 0 {
+			t.Errorf("Lookup(%q) = %v, want 0", allowed, errno)
+		}
+	}
+	for _, masked := range []string{".git", ".jj"} {
+		var out fuse.EntryOut
+		if _, errno := root.Lookup(ctx, masked, &out); errno != syscall.ENOENT {
+			t.Errorf("Lookup(%q) = %v, want ENOENT", masked, errno)
+		}
+	}
+
+	// If kernel FUSE mounting is available, verify full path read/write through the live mount.
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		return
+	}
+	mntDir := filepath.Join(t.TempDir(), "mnt")
+	if err := os.MkdirAll(mntDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	server, err := Mount(srcDir, mntDir, DefaultHiddenEntries)
+	if err != nil {
+		return
+	}
+	defer func() {
+		_ = server.Unmount()
+		server.Wait()
+	}()
+
+	for _, rel := range []string{
+		".agents/skills/review/SKILL.md",
+		".opencode/skills/lint/SKILL.md",
+		"GEMINI.md",
+		"AGENTS.md",
+	} {
+		raw, rErr := os.ReadFile(filepath.Join(mntDir, rel))
+		if rErr != nil || len(raw) == 0 {
+			t.Errorf("ReadFile(%s) through FUSE = (%q, %v)", rel, string(raw), rErr)
+		}
+	}
+	if _, gErr := os.Stat(filepath.Join(mntDir, ".git")); !os.IsNotExist(gErr) {
+		t.Errorf("expected .git to be hidden through FUSE mount, got err=%v", gErr)
+	}
+	newSkillDir := filepath.Join(mntDir, ".agents", "skills", "created-in-guest")
+	if err := os.MkdirAll(newSkillDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) through FUSE: %v", newSkillDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(newSkillDir, "SKILL.md"), []byte("# Guest skill\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile SKILL.md through FUSE: %v", err)
+	}
+	if _, sErr := os.Stat(filepath.Join(srcDir, ".agents", "skills", "created-in-guest", "SKILL.md")); sErr != nil {
+		t.Errorf("expected guest-created skill to persist in host share: %v", sErr)
+	}
+}

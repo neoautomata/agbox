@@ -49,7 +49,7 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 	if env.DataDir != "/home/alice/.local/share/agbox" {
 		t.Errorf("DataDir = %q", env.DataDir)
 	}
-	if env.CPUs != DefaultCPUs || env.Memory != DefaultMemory || env.RootDisk != DefaultRootDisk {
+	if env.CPUs != DefaultCPUs || env.Memory != DefaultMemory || env.RootDisk != DefaultRootDisk || env.ProfileDisk != DefaultProfileDisk {
 		t.Errorf("unexpected defaults: %+v", env)
 	}
 	if env.MaskVCS != MaskStrict || env.AllowOutsideHome || env.AllowRoot {
@@ -62,6 +62,7 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 		"AGBOX_CPUS":               "4",
 		"AGBOX_MEMORY":             "8G",
 		"AGBOX_ROOT_DISK":          "16G",
+		"AGBOX_PROFILE_DISK":       "20G",
 		"AGBOX_OPENCODE_VERSION":   "1.19.5",
 		"AGBOX_AGY_INSTALLER_URL":  "https://example.com/install.sh",
 		"AGBOX_MASK_VCS":           "auto",
@@ -75,7 +76,7 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 	if env2.DataDir != "/custom/data" || env2.MSBHome != "/custom/msb" {
 		t.Errorf("paths not cleaned: DataDir=%q MSBHome=%q", env2.DataDir, env2.MSBHome)
 	}
-	if env2.CPUs != "4" || env2.Memory != "8G" || env2.RootDisk != "16G" {
+	if env2.CPUs != "4" || env2.Memory != "8G" || env2.RootDisk != "16G" || env2.ProfileDisk != "20G" {
 		t.Errorf("resource overrides failed: %+v", env2)
 	}
 	if env2.MaskVCS != MaskAuto || !env2.AllowOutsideHome || !env2.AllowRoot {
@@ -103,6 +104,8 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 		{"AGBOX_MEMORY": "-v /:/mnt"},
 		{"AGBOX_ROOT_DISK": "0M"},
 		{"AGBOX_ROOT_DISK": "bad"},
+		{"AGBOX_PROFILE_DISK": "0G"},
+		{"AGBOX_PROFILE_DISK": "bad"},
 		{"AGBOX_OPENCODE_VERSION": "latest; id"},
 		{"AGBOX_OPENCODE_VERSION": "1.0\nrm"},
 		{"AGBOX_AGY_INSTALLER_URL": "http://example.com/install.sh"},
@@ -178,15 +181,22 @@ func TestNextSnapshotMember(t *testing.T) {
 
 func TestRunMetaRoundTripAndValidation(t *testing.T) {
 	orig := RunMeta{
-		Sandbox:       "agbox-feat1",
-		OwnerPID:      4242,
-		Agent:         "opencode",
-		Mode:          RunModeServe,
-		Detached:      true,
-		RemoteControl: false,
-		Port:          4096,
-		ReadOnly:      true,
-		MaskMode:      MaskStrict,
+		Sandbox:         "agbox-feat1",
+		OwnerPID:        4242,
+		Agent:           "opencode",
+		Mode:            RunModeServe,
+		Detached:        true,
+		RemoteControl:   false,
+		Port:            4096,
+		ReadOnly:        true,
+		MaskMode:        MaskStrict,
+		Persist:         true,
+		Profile:         "work",
+		Continue:        true,
+		ContinueSession: "sess-123",
+		NoAuth:          true,
+		NoSkills:        true,
+		SkillsMounted:   true,
 		Shares: []ShareRecord{
 			{Index: 0, HostPath: "/home/alice/proj", GuestName: "proj", IsDir: true, Masked: true},
 			{Index: 1, HostPath: "/home/alice/notes.md", GuestName: "notes.md", IsDir: false, Masked: false},

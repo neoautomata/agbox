@@ -12,8 +12,8 @@ ______________________________________________________________________
    Containers share the host Linux kernel. `agbox` runs each session inside a dedicated guest kernel. Guest root commands (`sudo apt-get install ...`) stay inside the microVM.
 1. **Secure-by-Default and Fail-Closed Execution:**
    `agbox` masks VCS metadata and blocks local, private, multicast, and cloud-config IP ranges by default. If any check fails during `install.sh`, `setup`, `create-base`, `edit-base`, `run`, or `resume`, `agbox` stops immediately.
-1. **Disposable or Suspendable Runs from Snapshots (`agbox:vN`):**
-   `agbox create-base` builds the base image once. `agbox edit-base` updates the base image and saves a new snapshot. `agbox run` restores `agbox-<name>` (or `agbox-run-<pid>`) and deletes it on exit unless you detach or suspend it.
+1. **Disposable or Persistent Runs from Snapshots (`agbox:vN`):**
+   `agbox create-base` builds the base image once. `agbox edit-base` updates the base image and saves a new snapshot. `agbox run` restores `agbox-<name>` (or `agbox-run-<pid>`) and deletes it on exit unless you pass `--persist`, detach it, or suspend it.
 1. **Single Binary with Hardened FUSE Filter (`go-fuse/v2` and `openat2`):**
    A raw directory share exposes `.git/hooks`, `.jj`, and host symlinks to the guest. `agbox` embeds a hardened loopback FUSE filter (`/proc/self/exe __filter`) that confines the guest to regular files, directories, and intra-share relative symlinks:
    - The filter hides VCS directories and control files (`.git`, `.gitignore`, `.gitattributes`, `.gitmodules`, `.jj`, `.sl`, `.svn`, `.hg`, `.bzr`, `_darcs`, `.pijul`, and Fossil) case-insensitively (`ENOENT`).
@@ -192,9 +192,9 @@ ______________________________________________________________________
 
 ## User Guide: Authentication
 
-You can authenticate agents with per-run environment variables or persistent base-image credentials.
+You can authenticate agents with per-run environment variables or persistent `agbox auth` credentials.
 
-### Method 1: Per-Run API Keys (Recommended)
+### Method 1: Per-Run API Keys (Recommended for API Providers)
 
 Export your provider API keys in your host shell before you run `agbox run`:
 
@@ -214,30 +214,111 @@ Supported passthrough variables:
 - **Cloud Providers:** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_PROFILE`, `VERTEX_LOCATION`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`
 - **GitHub and UI Auth:** `GITHUB_TOKEN`, `GH_TOKEN`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_SERVER_USERNAME`
 
-### Method 2: Interactive Sign-In (OAuth or Device Auth)
+### Method 2: Persistent Sign-In (`agbox auth`)
 
-#### Temporary Sign-In (Single Session)
+Use `agbox auth` to sign in once for Google Antigravity (`agy`) or OpenCode OAuth providers without baking tokens into snapshots or sharing host credential directories:
 
-1. Start the agent with `agbox run opencode ~/projects/myapp` or `agbox run antigravity ~/projects/myapp`.
-1. In OpenCode, run `/connect`. In `agy`, the CLI prints a browser authorization URL on first launch.
-1. Open the URL in your host browser. Complete sign-in and paste the verification code into the terminal.
-1. Exit `agbox run` to delete the microVM and the session token.
+```bash
+# Sign in to Google Antigravity inside a zero-share microVM
+agbox auth antigravity
 
-#### Persistent Sign-In (Saved in Base Snapshot)
+# Sign in to OpenCode providers inside a zero-share microVM
+agbox auth opencode
 
-To save OAuth credentials in the base image, sign in as user `agent` inside `agbox edit-base`:
+# Check saved credential status
+agbox auth status
 
-1. Start an interactive shell in the base microVM:
-   ```bash
-   agbox edit-base --shell
-   ```
-1. Switch to user `agent` and run the sign-in command:
-   ```bash
-   su - agent
-   opencode auth login   # or: SSH_CONNECTION=1 agy (then /exit after sign-in)
-   exit
-   ```
-1. Exit the root shell (`exit`) so `agbox` saves snapshot `agbox:v<N+1>`. Future `agbox run` sessions inherit that token in `/home/agent`.
+# Delete saved credentials
+agbox auth logout all
+```
+
+`agbox auth` performs four steps:
+
+1. Boots a disposable `agbox-auth-<pid>` microVM with zero host shares.
+1. Runs the interactive login flow (`agy` or `opencode auth login`) as user `agent`.
+1. Captures only allowlisted credential files (`antigravity-oauth-token`, `installation_id`, `antigravity_state.pbtxt`, `jetski_state.pbtxt`, or `auth.json`) within a 64 KiB limit and saves them in `$DATA_DIR/auth/<agent>` (`0600`).
+1. Deletes `agbox-auth-<pid>` immediately on exit.
+
+On every `agbox run` and `agbox resume`, `agbox` streams saved credentials over `stdin` into the microVM (`0600`). Pass `--no-auth` to skip saved login credentials for a single run or resume.
+
+> **Temporary Sign-In:** You can also sign in directly inside `agbox run`. When you exit a non-persistent run, `agbox` deletes the microVM and the session token.
+
+______________________________________________________________________
+
+## User Guide: Persistent Skills
+
+`agbox` supports both global read-only skills across all projects and project-local skills inside shared directories.
+
+### 1. Global Skills (`agbox skills`)
+
+Store reusable skills in `$DATA_DIR/skills` on the host:
+
+```bash
+# Install a skill directory (or SKILL.md path) into $DATA_DIR/skills/<name>
+agbox skills add ~/my-skills/code-review
+
+# Replace an existing global skill
+agbox skills add --force ~/my-skills/code-review
+
+# List installed global skills
+agbox skills list
+
+# Delete a global skill
+agbox skills rm code-review
+```
+
+When `$DATA_DIR/skills` contains one or more skills, `agbox run` mounts `$DATA_DIR/skills` read-only at `/home/agent/.agbox-skills` and bind-mounts it read-only (`ro,bind`) onto `/home/agent/.gemini/config/skills` and `/home/agent/.config/opencode/skills`. Guest processes, including guest `root`, cannot modify host files in `$DATA_DIR/skills`. Pass `--no-skills` to skip global skills for a run.
+
+### 2. Project Skills and Instructions (`.agents/skills`)
+
+When you share one project directory, `agbox` starts the agent inside `/workspace/<name>`. Both `agy` and `opencode` discover `.agents/skills/<skill>/SKILL.md`, `.opencode/skills/<skill>/SKILL.md`, `GEMINI.md`, and `AGENTS.md` automatically through the FUSE VCS filter while `.git` and `.jj` stay masked. When you share multiple directories with `antigravity`, `agbox` passes `--add-dir /workspace/<name>` for each shared directory.
+
+______________________________________________________________________
+
+## User Guide: Persistent Conversations (`--persist` and `--profile`)
+
+By default, `agbox run` is ephemeral and deletes conversation history on exit. `agbox` provides two opt-in persistence modes so you can choose between full guest state and clean ephemeral root disks.
+
+### Option 1: Named Persistent Sandbox (`--persist`)
+
+Use `--persist --name <name>` to keep the microVM's `ext4` root disk across runs:
+
+```bash
+# First run creates agbox-myapp and suspends it automatically on exit
+agbox run --persist --name myapp opencode ~/projects/myapp
+
+# Next run resumes agbox-myapp and continues the latest conversation
+agbox run --persist --name myapp -c opencode ~/projects/myapp
+
+# Delete the persistent microVM when finished
+agbox stop agbox-myapp
+```
+
+`--persist` preserves conversation databases, artifacts, installed `apt` packages, and build caches inside `agbox-<name>`. While stopped, `agbox-<name>` uses zero host CPU, RAM, or FUSE processes.
+
+### Option 2: Conversation Profile Volume (`--profile`)
+
+Use `--profile <name>` to keep conversation history on a dedicated `ext4` disk volume (`agbox-profile-<name>`) while every `agbox run` still boots a fresh root filesystem from `agbox:vN`:
+
+```bash
+# Optional: create a profile volume with a custom disk size (default: 10G)
+agbox profile create --size 20G work
+
+# Run an ephemeral microVM backed by conversation profile "work"
+agbox run --profile work antigravity ~/projects/myapp
+
+# Continue the most recent conversation or a specific conversation ID
+agbox run --profile work -c antigravity ~/projects/myapp
+agbox run --profile work --conversation 1c2a8c1e-6b56-4971-8429-ad0252c024a7 antigravity ~/projects/myapp
+
+# List or delete profiles
+agbox profile list
+agbox profile rm work
+```
+
+`--profile` bind-mounts only the conversation state directories (`~/.gemini/antigravity-cli`, `~/.gemini/config/projects`, `~/.local/share/opencode`, and `~/.local/state/opencode`). Global skills, hooks, plugins, `mcp_config.json`, and system binaries stay on the clean snapshot root disk. An exclusive host `flock` (`$DATA_DIR/profiles/<name>/profile.lock`) prevents two microVMs from mounting the same `ext4` profile volume at the same time.
+
+You can also pass `-c` (`--continue`) or `-s <ID>` (`--session <ID>`, `--conversation <ID>`) to `agbox resume`.
 
 ______________________________________________________________________
 
@@ -350,12 +431,27 @@ Modes:
       Start the base microVM and install categories or run custom updates.
       Save snapshot agbox:v<N+1> unless you pass --no-snap.
 
+  agbox auth [--allow-root] [antigravity|opencode|status|logout]
+      Sign in inside a disposable microVM and save credentials in $DATA_DIR/auth.
+
+  agbox skills [--allow-root] [list|add [--force] <path>|rm <name>]
+      Manage global skills mounted read-only into sandboxes from $DATA_DIR/skills.
+
+  agbox profile [--allow-root] [list|create [--size SIZE] <name>|rm [--force] <name>]
+      Manage ext4 disk profiles for conversation history across ephemeral runs.
+
   agbox run [options] [opencode|antigravity] [paths...]
-      Restore an ephemeral microVM and mask VCS files and directories.
+      Restore a microVM and mask VCS files and directories.
       Block local, private, multicast, and cloud-config IPs by default.
-      Delete the microVM and unmount FUSE shares on exit.
+      Delete the microVM on exit unless you pass --persist or suspend it.
       Options (must precede paths):
         --name NAME          Name the sandbox agbox-NAME instead of agbox-run-PID
+        --persist            Keep the named microVM on exit and resume it on repeat runs
+        --profile NAME       Mount ext4 profile volume agbox-profile-NAME for conversations
+        -c, --continue       Continue the most recent conversation in TUI mode
+        -s, --session ID     Continue conversation ID in TUI mode (alias: --conversation)
+        --no-auth            Skip saved login credentials from $DATA_DIR/auth
+        --no-skills          Skip global skills from $DATA_DIR/skills
         --allow-root         Allow agbox to run as the root user
         --ro                 Mount shared paths read-only
         --mask-vcs           Require the FUSE VCS filter for directory shares (default)
@@ -365,7 +461,7 @@ Modes:
         --probe              With --serve: wait for the web UI, then exit
         --remote-control     Run 'agy' with Remote Control for https://antigravity.google.com
         -d, --detach         Keep --remote-control or --serve running in the background
-        --cmd "shell"        Run one command in the ephemeral microVM and exit
+        --cmd "shell"        Run one command in the microVM and exit
         --no-net             Disable guest network access
         --net SPEC           Set network profile (public|none|private|host|all) or rule
         --cpus N             Override vCPU count for this run
@@ -374,17 +470,17 @@ Modes:
   agbox suspend [--allow-root] <sandbox>
       Stop a run microVM, keep its root disk, and unmount host FUSE shares.
 
-  agbox resume [--allow-root] [-d|--detach] <sandbox>
+  agbox resume [--allow-root] [-d|--detach] [-c|--continue] [--session ID] <sandbox>
       Validate shares, mount FUSE filters, start a suspended microVM, and restart its agent.
 
   agbox stop [--allow-root] <sandbox>
       Delete a running or suspended run microVM and unmount its FUSE shares.
 
   agbox remove [--allow-root] [--yes]
-      Delete all agbox microVMs, snapshots, FUSE mounts, and ~/.local/share/agbox.
+      Delete all agbox microVMs, snapshots, profile volumes, FUSE mounts, and $DATA_DIR.
 
   agbox status [--allow-root]
-      Show base configuration, microVMs, snapshots, and disk usage.
+      Show base configuration, persistence state, microVMs, snapshots, and disk usage.
 ```
 
 ______________________________________________________________________
@@ -393,12 +489,13 @@ ______________________________________________________________________
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config` and per-run state (`run/<id>`). |
+| `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config`, `auth`, `skills`, `profiles`, and `run/<id>`. |
 | `AGBOX_INSTALL_DIR` | `~/.local/bin` (`/usr/local/bin` for `root`) | Target directory where `install.sh` installs the `agbox` binary. |
 | `AGBOX_ALLOW_ROOT` | `0` | Set to `1` to allow `install.sh` and `agbox` to run as `root`. |
 | `AGBOX_CPUS` | `4` | Default vCPU count for `create-base` and `run`. |
 | `AGBOX_MEMORY` | `8G` | Default guest RAM size for `create-base` and `run`. |
 | `AGBOX_ROOT_DISK` | `50G` | Default sparse guest root disk size for `create-base` and `edit-base`. |
+| `AGBOX_PROFILE_DISK` | `10G` | Default `ext4` disk volume size for `agbox profile create` and `run --profile`. |
 | `AGBOX_MASK_VCS` | `strict` | FUSE filter policy for directory shares: `strict`, `auto`, or `off`. |
 | `AGBOX_ALLOW_OUTSIDE_HOME` | `0` | Set to `1` to allow shares outside `$HOME`. Blocklists still apply. |
 | `AGBOX_OPENCODE_VERSION` | `latest` | npm version or tag for `opencode-ai` during `create-base`. |
@@ -425,7 +522,7 @@ ______________________________________________________________________
 | Hardware microVM isolation | `msb` (`/dev/kvm`, `libkrun`) | Each session boots its own guest kernel. Guest root commands do not affect the host kernel. |
 | Non-root host execution | `cli.CheckRootExecution`, `install.sh` | Rejects `euid == 0` unless `--allow-root` or `AGBOX_ALLOW_ROOT=1` is set. |
 | Private state directories | `config.EnsurePrivateDir`, `vcsfuse` | Rejects symlinks via `Lstat`, sets directory mode `0700`, and writes metadata files with mode `0600`. |
-| Boundary input validation | `config.FromLookup`, `cli` | Rejects invalid CPU/RAM/disk specs, control characters, malformed `--net-rule` tokens, and non-`https://` installer URLs. |
+| Boundary input validation | `config.FromLookup`, `cli`, `persist` | Rejects invalid CPU/RAM/disk specs, control characters, unsafe session IDs, malformed `--net-rule` tokens, and non-`https://` installer URLs. |
 | Explicit opt-in host shares | `cli.Run`, `pathsec.ValidateShare` | Mounts zero host paths unless passed on the CLI. Resolves symlinks and restricts shares to `$HOME` by default. |
 | Credential and system blocklist | `pathsec.DefaultBlocklist` | Blocks SSH, cloud, agent, VCS, shell, `direnv`, `DATA_DIR`, `MSB_HOME`, and system paths (plus parent directories and symlink targets). |
 | Direct VCS share prohibition | `pathsec.ContainsVCSComponent` | Blocks direct shares of any VCS directory, VCS subdirectory, or VCS working-tree file (case-insensitive). |
@@ -440,9 +537,12 @@ ______________________________________________________________________
 | Loopback-only web server binding | `cli.Run` (`--serve`) | Binds host TCP forwarding strictly on `127.0.0.1:<port>`. |
 | HTTPS and TLS 1.2+ downloads | `install.sh`, `cli`, `msb` | Enforces `--proto '=https' --tlsv1.2` on all `curl` installer downloads. |
 | Secret streaming over `stdin` | `msb.FormatEnvExports`, `cli.pushKeys` | Quotes values for POSIX `sh` and streams keys over `stdin` into `/home/agent/.agbox-keys.sh` (`0600`). Never passes secrets in CLI arguments. |
+| Allowlisted `agbox auth` credentials | `persist`, `cli.Auth`, `cli.pushAuth` | Captures only allowlisted login files (max 64 KiB, `Lstat` no-symlink check) from a zero-share microVM, stores them at `0600` in `$DATA_DIR/auth`, and streams them over `stdin`. |
+| Read-only global skills | `persist.InspectSkillsDir`, `cli` | Rejects symlinks and special files in `$DATA_DIR/skills`, mounts the volume read-only (`:ro`), and enforces `ro,bind` mounts inside the guest. |
+| Isolated `ext4` conversation profiles | `persist.LockProfile`, `cli` | Guards each `agbox-profile-<name>` disk volume with an exclusive host `flock` and bind-mounts only conversation directories while keeping global skills, hooks, plugins, and `mcp_config.json` outside the profile disk. |
 | PID-reuse signal protection | `mounttab.IsFilterCmdline` | Verifies `/proc/<pid>/cmdline` has `argv[1] == "__filter"` before sending `SIGTERM` or `SIGKILL`. |
 | Mount-verified directory deletion | `mounttab.TeardownFilterDir` | Verifies zero active mounts in `/proc/self/mountinfo` before running `os.RemoveAll`. |
-| Tamper-evident `resume` & fail-closed setup | `cli` (`Setup`, `EditBase`, `Run`, `Resume`), `install.sh` | Checks FUSE, KVM, and an offline smoke microVM in `setup`, re-validates shares and strict masking on `resume`, and aborts on any error. |
+| Tamper-evident `resume` & fail-closed setup | `cli` (`Setup`, `EditBase`, `Run`, `Resume`), `install.sh` | Checks FUSE, KVM, and an offline smoke microVM in `setup`, re-validates shares, skills, profiles, and strict masking on `resume`, and aborts on any error. |
 
 ______________________________________________________________________
 
@@ -457,6 +557,7 @@ agbox/
 │   ├── mounttab/      /proc/self/mountinfo parser and FUSE unmount verification
 │   ├── msb/           Argument builders, network rules, categories, and Runner interface
 │   ├── pathsec/       Host path validation, blocklist checks, and mount naming
+│   ├── persist/       Persistent login capture/streaming, read-only skills, and profile locking
 │   └── vcsfuse/       Loopback FUSE filesystem that hides VCS directories and blocks xattrs
 ├── install.sh         Idempotent host check, build, and installation script
 └── README.md          User and security documentation

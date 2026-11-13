@@ -33,6 +33,7 @@ const (
 	DefaultCPUs            = "4"
 	DefaultMemory          = "8G"
 	DefaultRootDisk        = "50G"
+	DefaultProfileDisk     = "10G"
 	DefaultOpenCodeVersion = "latest"
 	DefaultAgyInstallerURL = "https://antigravity.google/cli/install.sh"
 )
@@ -70,6 +71,7 @@ type Env struct {
 	CPUs             string
 	Memory           string
 	RootDisk         string
+	ProfileDisk      string
 	OpenCodeVersion  string
 	AgyInstallerURL  string
 	MaskVCS          MaskMode
@@ -122,6 +124,11 @@ func FromLookup(homeReal string, getenv func(string) string) (Env, error) {
 		return Env{}, fmt.Errorf("invalid AGBOX_ROOT_DISK %q: expected size such as 50G or 8192M", rootDisk)
 	}
 
+	profileDisk := defaultIfEmpty(getenv("AGBOX_PROFILE_DISK"), DefaultProfileDisk)
+	if !isValidSizeSpec(profileDisk) {
+		return Env{}, fmt.Errorf("invalid AGBOX_PROFILE_DISK %q: expected size such as 10G or 2048M", profileDisk)
+	}
+
 	openCodeVer := defaultIfEmpty(getenv("AGBOX_OPENCODE_VERSION"), DefaultOpenCodeVersion)
 	if hasUnsafeTokenChars(openCodeVer) {
 		return Env{}, fmt.Errorf("invalid AGBOX_OPENCODE_VERSION %q: whitespace and control characters are forbidden", openCodeVer)
@@ -140,6 +147,7 @@ func FromLookup(homeReal string, getenv func(string) string) (Env, error) {
 		CPUs:             cpus,
 		Memory:           memory,
 		RootDisk:         rootDisk,
+		ProfileDisk:      profileDisk,
 		OpenCodeVersion:  openCodeVer,
 		AgyInstallerURL:  agyURL,
 		MaskVCS:          maskMode,
@@ -263,17 +271,29 @@ type ShareRecord struct {
 
 // RunMeta stores per-run metadata in $DATA_DIR/run/<id>/run.meta and suspended.
 type RunMeta struct {
-	Sandbox       string        `json:"sandbox"`
-	OwnerPID      int           `json:"owner_pid"`
-	Agent         string        `json:"agent"`
-	Mode          RunMode       `json:"mode"`
-	Detached      bool          `json:"detached"`
-	RemoteControl bool          `json:"remote_control"`
-	Port          int           `json:"port,omitempty"`
-	Cmd           string        `json:"cmd,omitempty"`
-	ReadOnly      bool          `json:"read_only"`
-	MaskMode      MaskMode      `json:"mask_mode"`
-	Shares        []ShareRecord `json:"shares,omitempty"`
+	Sandbox         string        `json:"sandbox"`
+	OwnerPID        int           `json:"owner_pid"`
+	Agent           string        `json:"agent"`
+	Mode            RunMode       `json:"mode"`
+	Detached        bool          `json:"detached"`
+	RemoteControl   bool          `json:"remote_control"`
+	Port            int           `json:"port,omitempty"`
+	Cmd             string        `json:"cmd,omitempty"`
+	ReadOnly        bool          `json:"read_only"`
+	MaskMode        MaskMode      `json:"mask_mode"`
+	Persist         bool          `json:"persist,omitempty"`
+	Profile         string        `json:"profile,omitempty"`
+	Continue        bool          `json:"continue,omitempty"`
+	ContinueSession string        `json:"continue_session,omitempty"`
+	NoAuth          bool          `json:"no_auth,omitempty"`
+	NoSkills        bool          `json:"no_skills,omitempty"`
+	SkillsMounted   bool          `json:"skills_mounted,omitempty"`
+	Shares          []ShareRecord `json:"shares,omitempty"`
+}
+
+// IsValidSizeSpec reports whether spec is a positive integer followed by M or G.
+func IsValidSizeSpec(spec string) bool {
+	return isValidSizeSpec(spec)
 }
 
 // FormatRunMeta serializes RunMeta as indented JSON bytes.

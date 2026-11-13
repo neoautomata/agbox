@@ -21,6 +21,7 @@ import (
 	"agbox/internal/config"
 	"agbox/internal/mounttab"
 	"agbox/internal/msb"
+	"agbox/internal/persist"
 )
 
 func TestParseCreateBaseArgs(t *testing.T) {
@@ -1329,6 +1330,758 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 		}
 		if rc := app.Dispatch(ctx, []string{"resume", "agbox-tamp1"}); rc == 0 {
 			t.Errorf("tampered Resume case %d unexpectedly succeeded: %+v", idx, badMeta)
+		}
+	}
+}
+
+func TestParsePersistenceModeAndFlagArgs(t *testing.T) {
+	// 1. ParseAuthArgs
+	if aOpts, err := ParseAuthArgs(nil); err != nil || aOpts.Action != "login" || aOpts.Target != "" {
+		t.Fatalf("ParseAuthArgs(nil) = %+v, %v", aOpts, err)
+	}
+	if aOpts, err := ParseAuthArgs([]string{"--allow-root", "antigravity"}); err != nil || aOpts.Action != "login" || aOpts.Target != "antigravity" || !aOpts.AllowRoot {
+		t.Fatalf("ParseAuthArgs(antigravity) = %+v, %v", aOpts, err)
+	}
+	if aOpts, err := ParseAuthArgs([]string{"login", "opencode"}); err != nil || aOpts.Action != "login" || aOpts.Target != "opencode" {
+		t.Fatalf("ParseAuthArgs(login opencode) = %+v, %v", aOpts, err)
+	}
+	if aOpts, err := ParseAuthArgs([]string{"status"}); err != nil || aOpts.Action != "status" {
+		t.Fatalf("ParseAuthArgs(status) = %+v, %v", aOpts, err)
+	}
+	if aOpts, err := ParseAuthArgs([]string{"logout"}); err != nil || aOpts.Action != "logout" || aOpts.Target != "all" {
+		t.Fatalf("ParseAuthArgs(logout) = %+v, %v", aOpts, err)
+	}
+	if aOpts, err := ParseAuthArgs([]string{"logout", "opencode"}); err != nil || aOpts.Action != "logout" || aOpts.Target != "opencode" {
+		t.Fatalf("ParseAuthArgs(logout opencode) = %+v, %v", aOpts, err)
+	}
+	if _, err := ParseAuthArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+		t.Errorf("expected ErrHelp, got %v", err)
+	}
+	for _, bad := range [][]string{
+		{"--bad"},
+		{"status", "extra"},
+		{"logout", "bad-agent"},
+		{"logout", "opencode", "extra"},
+		{"login", "bad-agent"},
+		{"antigravity", "extra"},
+		{"unknown"},
+	} {
+		if _, err := ParseAuthArgs(bad); err == nil {
+			t.Errorf("expected ParseAuthArgs(%v) to fail", bad)
+		}
+	}
+
+	// 2. ParseSkillsArgs
+	if sOpts, err := ParseSkillsArgs(nil); err != nil || sOpts.Action != "list" {
+		t.Fatalf("ParseSkillsArgs(nil) = %+v, %v", sOpts, err)
+	}
+	if sOpts, err := ParseSkillsArgs([]string{"--allow-root", "add", "--force", "./my-skill"}); err != nil || sOpts.Action != "add" || !sOpts.Force || !sOpts.AllowRoot || sOpts.Target != "./my-skill" {
+		t.Fatalf("ParseSkillsArgs(add) = %+v, %v", sOpts, err)
+	}
+	if sOpts, err := ParseSkillsArgs([]string{"rm", "my-skill"}); err != nil || sOpts.Action != "rm" || sOpts.Target != "my-skill" {
+		t.Fatalf("ParseSkillsArgs(rm) = %+v, %v", sOpts, err)
+	}
+	if _, err := ParseSkillsArgs([]string{"-h"}); !errors.Is(err, ErrHelp) {
+		t.Errorf("expected ErrHelp, got %v", err)
+	}
+	for _, bad := range [][]string{
+		{"--bad"},
+		{"list", "extra"},
+		{"add"},
+		{"rm"},
+		{"unknown"},
+	} {
+		if _, err := ParseSkillsArgs(bad); err == nil {
+			t.Errorf("expected ParseSkillsArgs(%v) to fail", bad)
+		}
+	}
+
+	// 3. ParseProfileArgs
+	if pOpts, err := ParseProfileArgs(nil); err != nil || pOpts.Action != "list" {
+		t.Fatalf("ParseProfileArgs(nil) = %+v, %v", pOpts, err)
+	}
+	if pOpts, err := ParseProfileArgs([]string{"--allow-root", "create", "--size", "16g", "work1"}); err != nil || pOpts.Action != "create" || pOpts.Name != "work1" || pOpts.Size != "16G" || !pOpts.AllowRoot {
+		t.Fatalf("ParseProfileArgs(create) = %+v, %v", pOpts, err)
+	}
+	if pOpts, err := ParseProfileArgs([]string{"rm", "--force", "work1"}); err != nil || pOpts.Action != "rm" || pOpts.Name != "work1" || !pOpts.Force {
+		t.Fatalf("ParseProfileArgs(rm) = %+v, %v", pOpts, err)
+	}
+	if _, err := ParseProfileArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+		t.Errorf("expected ErrHelp, got %v", err)
+	}
+	for _, bad := range [][]string{
+		{"--bad"},
+		{"create"},
+		{"create", "-bad"},
+		{"create", "--size"},
+		{"create", "--size", "0G", "work1"},
+		{"rm"},
+		{"rm", "../escape"},
+		{"list", "extra"},
+		{"unknown"},
+	} {
+		if _, err := ParseProfileArgs(bad); err == nil {
+			t.Errorf("expected ParseProfileArgs(%v) to fail", bad)
+		}
+	}
+
+	// 4. ParseRunArgs persistence flags and mutual exclusions
+	rPersist, err := ParseRunArgs([]string{"--name", "dev1", "--persist", "-c", "--no-auth", "--no-skills", "opencode"}, "", nil)
+	if err != nil || !rPersist.Persist || !rPersist.Continue || !rPersist.NoAuth || !rPersist.NoSkills {
+		t.Fatalf("ParseRunArgs(--persist) = %+v, %v", rPersist, err)
+	}
+	rProf, err := ParseRunArgs([]string{"--profile=team_1", "--conversation=conv-123", "antigravity"}, "", nil)
+	if err != nil || rProf.Profile != "team_1" || rProf.ContinueSession != "conv-123" {
+		t.Fatalf("ParseRunArgs(--profile=) = %+v, %v", rProf, err)
+	}
+	for _, bad := range [][]string{
+		{"--persist", "opencode"},
+		{"--persist", "--name", "dev1", "--profile", "p1", "opencode"},
+		{"--persist", "--name", "dev1", "--probe"},
+		{"--profile"},
+		{"--profile", "../bad"},
+		{"-c", "--session", "s1", "opencode"},
+		{"--session"},
+		{"--session", "bad;id"},
+		{"-c", "--cmd", "id"},
+		{"-c", "--serve"},
+		{"-c", "-d", "--remote-control"},
+	} {
+		if _, err := ParseRunArgs(bad, "", nil); err == nil {
+			t.Errorf("expected ParseRunArgs(%v) to fail", bad)
+		}
+	}
+
+	// 5. ParseResumeArgs continuation flags
+	resOpts, err := ParseResumeArgs([]string{"--conversation=conv-42", "--no-auth", "--no-skills", "agbox-dev1"})
+	if err != nil || resOpts.ContinueSession != "conv-42" || !resOpts.NoAuth || !resOpts.NoSkills {
+		t.Fatalf("ParseResumeArgs = %+v, %v", resOpts, err)
+	}
+	for _, bad := range [][]string{
+		{"-c", "--session", "s1", "agbox-dev1"},
+		{"--session", "bad;id", "agbox-dev1"},
+		{"--session"},
+	} {
+		if _, err := ParseResumeArgs(bad); err == nil {
+			t.Errorf("expected ParseResumeArgs(%v) to fail", bad)
+		}
+	}
+}
+
+func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "both",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Help dispatch for auth, skills, profile.
+	for _, mode := range []string{"auth", "skills", "profile"} {
+		stdout.Reset()
+		if rc := app.Dispatch(ctx, []string{mode, "--help"}); rc != 0 || !strings.Contains(stdout.String(), "Usage:") {
+			t.Fatalf("Dispatch(%s --help) = %d, out=%q", mode, rc, stdout.String())
+		}
+	}
+
+	// 1. Initial auth status is unconfigured.
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"auth", "status"}); rc != 0 {
+		t.Fatalf("auth status failed: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "antigravity: not configured") || !strings.Contains(stdout.String(), "opencode: not configured") {
+		t.Fatalf("unexpected initial auth status: %q", stdout.String())
+	}
+
+	// 2. Non-TTY or missing agent when base=both fails closed.
+	if rc := app.Dispatch(ctx, []string{"auth"}); rc == 0 {
+		t.Fatal("expected auth without agent to fail when base=both")
+	}
+	app.IsTTY = func() bool { return false }
+	if rc := app.Dispatch(ctx, []string{"auth", "antigravity"}); rc == 0 {
+		t.Fatal("expected auth to fail closed without TTY")
+	}
+	app.IsTTY = func() bool { return true }
+
+	// 3. Incomplete sign-in fails closed and deletes disposable agbox-auth-<pid> VM.
+	fakeGuestHome := t.TempDir()
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 6 && req.Args[0] == "exec" && strings.Contains(req.Args[len(req.Args)-1], "printf 'FILE ") {
+			script := strings.ReplaceAll(req.Args[len(req.Args)-1], config.GuestHome, fakeGuestHome)
+			cmd := exec.Command("/bin/sh", "-c", script)
+			cmd.Env = []string{"HOME=" + fakeGuestHome, "PATH=/usr/bin:/bin"}
+			out, cErr := cmd.Output()
+			return msb.CommandResult{Stdout: string(out)}, cErr
+		}
+		return msb.CommandResult{}, nil
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"auth", "antigravity"}); rc == 0 {
+		t.Fatal("expected auth to fail closed when guest credentials are missing")
+	}
+	cleanedAuthVM := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-auth-4242"}) {
+			cleanedAuthVM = true
+		}
+	}
+	if !cleanedAuthVM {
+		t.Error("expected disposable agbox-auth-4242 VM to be removed after failed login")
+	}
+
+	// 4. Populate guest credentials for antigravity and opencode and verify capture with zero host shares.
+	if err := os.MkdirAll(filepath.Join(fakeGuestHome, ".gemini", "antigravity-cli"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeGuestHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"), []byte("super-secret-agy-oauth"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeGuestHome, ".gemini", "antigravity-cli", "installation_id"), []byte("inst-777\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(fakeGuestHome, ".local", "share", "opencode"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeGuestHome, ".local", "share", "opencode", "auth.json"), []byte(`{"anthropic":{"type":"oauth","access":"super-secret-oc-token"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"auth", "antigravity"}); rc != 0 {
+		t.Fatalf("auth antigravity failed: %s", stderr.String())
+	}
+	for _, c := range runner.calls {
+		if len(c.Args) >= 2 && c.Args[0] == "snap" && c.Args[1] == "restore" && slices.Contains(c.Args, "-v") {
+			t.Fatalf("auth VM must boot with zero host shares, got %v", c.Args)
+		}
+	}
+	if rc := app.Dispatch(ctx, []string{"auth", "opencode"}); rc != 0 {
+		t.Fatalf("auth opencode failed: %s", stderr.String())
+	}
+	runner.handler = nil
+
+	// Verify 0600 permissions on saved host credential files.
+	stToken, err := os.Stat(filepath.Join(app.Env.DataDir, "auth", "antigravity", "antigravity-oauth-token"))
+	if err != nil || stToken.Mode().Perm() != 0o600 {
+		t.Fatalf("saved oauth token stat = (%v, %v), want mode 0600", stToken, err)
+	}
+
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"auth", "status"}); rc != 0 {
+		t.Fatalf("auth status failed: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "antigravity: configured") || !strings.Contains(stdout.String(), "opencode: configured") {
+		t.Fatalf("expected both agents configured, got %q", stdout.String())
+	}
+
+	// 5. Run streams saved auth over stdin (never in CLI args), and --no-auth skips it.
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "antigravity"}); rc != 0 {
+		t.Fatalf("run antigravity failed: %s", stderr.String())
+	}
+	streamedAuth := false
+	for _, c := range runner.calls {
+		for _, a := range c.Args {
+			if strings.Contains(a, "super-secret-agy-oauth") || strings.Contains(a, "super-secret-oc-token") {
+				t.Fatalf("credential leaked in CLI args: %v", c.Args)
+			}
+		}
+		if strings.Contains(c.Stdin, "antigravity-oauth-token") {
+			streamedAuth = true
+		}
+	}
+	if !streamedAuth {
+		t.Error("expected saved antigravity credentials to be streamed over stdin during Run")
+	}
+
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "--no-auth", "antigravity"}); rc != 0 {
+		t.Fatalf("run --no-auth failed: %s", stderr.String())
+	}
+	for _, c := range runner.calls {
+		if strings.Contains(c.Stdin, "antigravity-oauth-token") {
+			t.Fatal("expected --no-auth to skip streaming saved credentials")
+		}
+	}
+
+	// 6. Logout removes credentials.
+	if rc := app.Dispatch(ctx, []string{"auth", "logout", "all"}); rc != 0 {
+		t.Fatalf("auth logout all failed: %s", stderr.String())
+	}
+	stdout.Reset()
+	_ = app.Dispatch(ctx, []string{"auth", "status"})
+	if !strings.Contains(stdout.String(), "antigravity: not configured") {
+		t.Errorf("expected antigravity unconfigured after logout, got %q", stdout.String())
+	}
+}
+
+func TestPersistentSkillsAndProjectWorkingDirectory(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "both",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Empty skills list, then add, overwrite with --force, and list.
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"skills"}); rc != 0 || !strings.Contains(stdout.String(), "No global skills") {
+		t.Fatalf("skills list empty = %d, %q", rc, stdout.String())
+	}
+
+	skillSrc := filepath.Join(t.TempDir(), "code-audit")
+	if err := os.MkdirAll(skillSrc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillSrc, "SKILL.md"), []byte("---\nname: code-audit\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rc := app.Dispatch(ctx, []string{"skills", "add", skillSrc}); rc != 0 {
+		t.Fatalf("skills add failed: %s", stderr.String())
+	}
+	if rc := app.Dispatch(ctx, []string{"skills", "add", skillSrc}); rc == 0 {
+		t.Fatal("expected duplicate skills add without --force to fail")
+	}
+	if rc := app.Dispatch(ctx, []string{"skills", "add", "--force", skillSrc}); rc != 0 {
+		t.Fatalf("skills add --force failed: %s", stderr.String())
+	}
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"skills", "list"}); rc != 0 || strings.TrimSpace(stdout.String()) != "code-audit" {
+		t.Fatalf("skills list = %d, %q", rc, stdout.String())
+	}
+
+	// 2. Single directory share mounts global skills read-only, bind-mounts guest skill dirs, and cd's into /workspace/proj1.
+	proj1 := filepath.Join(app.Env.HomeReal, "proj1")
+	proj2 := filepath.Join(app.Env.HomeReal, "proj2")
+	for _, p := range []string{proj1, proj2} {
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "antigravity", proj1}); rc != 0 {
+		t.Fatalf("run antigravity proj1 failed: %s", stderr.String())
+	}
+	wantSkillsVol := filepath.Join(app.Env.DataDir, "skills") + ":" + msb.GuestSkillsMount + ":ro,uid=1000,gid=1000"
+	foundSkillsVol := false
+	foundSkillsBind := false
+	foundProjCWD := false
+	for _, c := range runner.calls {
+		joined := strings.Join(c.Args, " ")
+		if strings.HasPrefix(joined, "snap restore ") && slices.Contains(c.Args, wantSkillsVol) {
+			foundSkillsVol = true
+		}
+		if strings.Contains(joined, "remount,ro,bind") && strings.Contains(joined, ".gemini/config/skills") {
+			foundSkillsBind = true
+		}
+		if strings.Contains(joined, "cd '/workspace/proj1' && exec agy") {
+			foundProjCWD = true
+		}
+	}
+	if !foundSkillsVol || !foundSkillsBind || !foundProjCWD {
+		t.Fatalf("missing skills volume (%v), bind script (%v), or single-share CWD (%v)", foundSkillsVol, foundSkillsBind, foundProjCWD)
+	}
+
+	// 3. Multiple directory shares use /workspace CWD and pass --add-dir to agy, while --no-skills omits the skills volume.
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "--no-skills", "antigravity", proj1, proj2}); rc != 0 {
+		t.Fatalf("run --no-skills multi-share failed: %s", stderr.String())
+	}
+	foundAddDir := false
+	for _, c := range runner.calls {
+		joined := strings.Join(c.Args, " ")
+		if slices.Contains(c.Args, wantSkillsVol) {
+			t.Fatalf("--no-skills unexpectedly mounted global skills volume: %v", c.Args)
+		}
+		if strings.Contains(joined, "cd '/workspace' && exec agy --add-dir '/workspace/proj1' --add-dir '/workspace/proj2'") {
+			foundAddDir = true
+		}
+	}
+	if !foundAddDir {
+		t.Error("expected multi-share antigravity run to pass --add-dir for each directory share")
+	}
+
+	// 4. Symlink planted inside $DATA_DIR/skills fails closed before restoring snapshot.
+	badSym := filepath.Join(app.Env.DataDir, "skills", "code-audit", "leak.md")
+	if err := os.Symlink("/etc/passwd", badSym); err != nil {
+		t.Fatal(err)
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "antigravity", proj1}); rc == 0 {
+		t.Fatal("expected Run to fail closed when $DATA_DIR/skills contains a symlink")
+	}
+	for _, c := range runner.calls {
+		if len(c.Args) >= 2 && c.Args[0] == "snap" && c.Args[1] == "restore" {
+			t.Fatal("Run restored snapshot despite symlink inside $DATA_DIR/skills")
+		}
+	}
+	_ = os.Remove(badSym)
+
+	// 5. Remove skill cleanly.
+	if rc := app.Dispatch(ctx, []string{"skills", "rm", "code-audit"}); rc != 0 {
+		t.Fatalf("skills rm failed: %s", stderr.String())
+	}
+}
+
+func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "opencode",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	projA := filepath.Join(app.Env.HomeReal, "projA")
+	projB := filepath.Join(app.Env.HomeReal, "projB")
+	for _, p := range []string{projA, projB} {
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. Setup failure before execSession on a --persist run must delete the broken VM (not persist it).
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		for _, a := range req.Args {
+			if strings.Contains(a, config.GuestKeysFile) {
+				return msb.CommandResult{ExitCode: 1}, errors.New("pushKeys failed")
+			}
+		}
+		return msb.CommandResult{}, nil
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "broken1", "opencode", projA}); rc == 0 {
+		t.Fatal("expected --persist run to fail closed when pushKeys fails")
+	}
+	foundBrokenRM := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-broken1"}) {
+			foundBrokenRM = true
+		}
+	}
+	if !foundBrokenRM {
+		t.Error("expected failed setup before execSession to delete agbox-broken1 with msb rm -f")
+	}
+	runner.handler = nil
+
+	// 2. First successful --persist run auto-suspends on exit instead of calling msb rm -f.
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "opencode", projA}); rc != 0 {
+		t.Fatalf("first --persist run failed: %s", stderr.String())
+	}
+	dev1Dir := filepath.Join(app.Env.DataDir, "run", "dev1")
+	if _, err := os.Stat(filepath.Join(dev1Dir, "suspended")); err != nil {
+		t.Fatalf("expected suspended marker after --persist exit: %v", err)
+	}
+	foundStop := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-dev1"}) {
+			t.Fatal("--persist run deleted agbox-dev1 on exit instead of suspending")
+		}
+		if slices.Equal(c.Args, []string{"stop", "agbox-dev1"}) {
+			foundStop = true
+		}
+	}
+	if !foundStop {
+		t.Error("expected msb stop agbox-dev1 on --persist exit")
+	}
+
+	// 3. Repeat --persist run with different share path fails closed and keeps suspended marker.
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-dev1 stopped\n"
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "opencode", projB}); rc == 0 {
+		t.Fatal("expected repeat --persist run with mismatched share path to fail")
+	}
+	if _, err := os.Stat(filepath.Join(dev1Dir, "suspended")); err != nil {
+		t.Fatalf("expected suspended marker to remain after share mismatch: %v", err)
+	}
+
+	// 4. Repeat --persist run with matching share and -c resumes agbox-dev1 with `opencode -c` and re-suspends on exit.
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "-c", "opencode", projA}); rc != 0 {
+		t.Fatalf("repeat --persist -c run failed: %s", stderr.String())
+	}
+	foundStart := false
+	foundContinue := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"start", "agbox-dev1"}) {
+			foundStart = true
+		}
+		if strings.Contains(strings.Join(c.Args, " "), "exec opencode -c") {
+			foundContinue = true
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-dev1"}) {
+			t.Fatal("repeat --persist run deleted agbox-dev1 on exit")
+		}
+	}
+	if !foundStart || !foundContinue {
+		t.Fatalf("repeat --persist missing msb start (%v) or opencode -c (%v)", foundStart, foundContinue)
+	}
+	if _, err := os.Stat(filepath.Join(dev1Dir, "suspended")); err != nil {
+		t.Fatalf("expected suspended marker after repeat --persist exit: %v", err)
+	}
+
+	// 5. Explicit `agbox resume --session ses_42 agbox-dev1` also re-suspends on exit until `agbox stop`.
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"resume", "--session", "ses_42", "agbox-dev1"}); rc != 0 {
+		t.Fatalf("resume --session failed: %s", stderr.String())
+	}
+	foundSessionFlag := false
+	for _, c := range runner.calls {
+		if strings.Contains(strings.Join(c.Args, " "), "exec opencode -s 'ses_42'") {
+			foundSessionFlag = true
+		}
+	}
+	if !foundSessionFlag {
+		t.Error("expected `opencode -s 'ses_42'` during resume")
+	}
+	if _, err := os.Stat(filepath.Join(dev1Dir, "suspended")); err != nil {
+		t.Fatalf("expected persistent sandbox to re-suspend after `agbox resume`: %v", err)
+	}
+
+	if rc := app.Dispatch(ctx, []string{"stop", "agbox-dev1"}); rc != 0 {
+		t.Fatalf("stop agbox-dev1 failed: %s", stderr.String())
+	}
+	if _, err := os.Stat(dev1Dir); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be deleted by stop, err=%v", dev1Dir, err)
+	}
+}
+
+func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "antigravity",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	proj := filepath.Join(app.Env.HomeReal, "proj")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	volumesOut := "NAME KIND SIZE\n"
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "volume" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: volumesOut}, nil
+		}
+		if len(req.Args) >= 3 && req.Args[0] == "volume" && req.Args[1] == "create" {
+			volumesOut += req.Args[2] + " disk 12G\n"
+			return msb.CommandResult{}, nil
+		}
+		if len(req.Args) >= 3 && req.Args[0] == "volume" && req.Args[1] == "rm" {
+			target := req.Args[2]
+			var kept []string
+			for _, line := range strings.Split(volumesOut, "\n") {
+				if !strings.HasPrefix(line, target+" ") {
+					kept = append(kept, line)
+				}
+			}
+			volumesOut = strings.Join(kept, "\n")
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	defer func() { runner.handler = nil }()
+
+	// 1. Create and list profile, and verify `agbox status` reports persistence state.
+	if rc := app.Dispatch(ctx, []string{"profile", "create", "--size", "12G", "workprof"}); rc != 0 {
+		t.Fatalf("profile create failed: %s", stderr.String())
+	}
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"profile", "list"}); rc != 0 || !strings.Contains(stdout.String(), "agbox-profile-workprof") {
+		t.Fatalf("profile list = %d, out=%q", rc, stdout.String())
+	}
+	stdout.Reset()
+	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "profiles: workprof") {
+		t.Fatalf("status missing profile info: rc=%d, out=%q", rc, stdout.String())
+	}
+
+	// 2. Run with --profile mounts raw ext4 disk volume, bind-mounts conversation dirs, passes --conversation, and deletes ephemeral VM on exit.
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "--name", "ephem1", "--profile", "workprof", "--conversation", "1c2a8c1e", "antigravity", proj}); rc != 0 {
+		t.Fatalf("run --profile failed: %s", stderr.String())
+	}
+	foundNamedVol := false
+	foundProfileBind := false
+	foundConv := false
+	foundEphemeralRM := false
+	for _, c := range runner.calls {
+		joined := strings.Join(c.Args, " ")
+		if strings.HasPrefix(joined, "snap restore ") && slices.Contains(c.Args, "agbox-profile-workprof:"+msb.GuestProfileMount) {
+			foundNamedVol = true
+		}
+		if strings.Contains(joined, ".agbox-profile/agy-cli") {
+			foundProfileBind = true
+		}
+		if strings.Contains(joined, "exec agy --conversation '1c2a8c1e'") {
+			foundConv = true
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-ephem1"}) {
+			foundEphemeralRM = true
+		}
+	}
+	if !foundNamedVol || !foundProfileBind || !foundConv || !foundEphemeralRM {
+		t.Fatalf("profile run checks: vol=%v bind=%v conv=%v rm=%v", foundNamedVol, foundProfileBind, foundConv, foundEphemeralRM)
+	}
+
+	// 3. Concurrent host flock blocks overlapping --profile runs before restoring snapshot.
+	heldLock, err := persist.LockProfile(app.Env.DataDir, "workprof")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "--profile", "workprof", "antigravity", proj}); rc == 0 {
+		_ = heldLock.Unlock()
+		t.Fatal("expected concurrent --profile run to fail while flock is held")
+	}
+	_ = heldLock.Unlock()
+	for _, c := range runner.calls {
+		if len(c.Args) >= 2 && c.Args[0] == "snap" && c.Args[1] == "restore" {
+			t.Fatal("concurrent --profile run restored snapshot despite active flock")
+		}
+	}
+
+	// 4. Suspended sandbox referencing workprof blocks `profile rm` unless --force is passed,
+	// and resuming after `--force` removal fails closed because the disk volume is gone.
+	suspDir := filepath.Join(app.Env.DataDir, "run", "psusp")
+	suspMeta := config.RunMeta{
+		Sandbox:  "agbox-psusp",
+		Agent:    "antigravity",
+		Mode:     config.RunModeTUI,
+		MaskMode: config.MaskStrict,
+		Profile:  "workprof",
+	}
+	if err := config.SaveRunMeta(filepath.Join(suspDir, "suspended"), suspMeta); err != nil {
+		t.Fatal(err)
+	}
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-psusp stopped\n"
+	if rc := app.Dispatch(ctx, []string{"profile", "rm", "workprof"}); rc == 0 {
+		t.Fatal("expected profile rm without --force to fail when referenced by suspended sandbox")
+	}
+	if rc := app.Dispatch(ctx, []string{"profile", "rm", "--force", "workprof"}); rc != 0 {
+		t.Fatalf("profile rm --force failed: %s", stderr.String())
+	}
+	if rc := app.Dispatch(ctx, []string{"resume", "agbox-psusp"}); rc == 0 {
+		t.Fatal("expected Resume to fail closed when profile disk volume was deleted")
+	}
+
+	// 5. `agbox remove --yes` deletes remaining agbox-profile-* volumes alongside sandboxes and DataDir.
+	if rc := app.Dispatch(ctx, []string{"profile", "create", "cleanupme"}); rc != 0 {
+		t.Fatalf("profile create cleanupme failed: %s", stderr.String())
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"remove", "--yes"}); rc != 0 {
+		t.Fatalf("remove --yes failed: %s", stderr.String())
+	}
+	deletedProfVol := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"volume", "rm", "agbox-profile-cleanupme"}) {
+			deletedProfVol = true
+		}
+	}
+	if !deletedProfVol {
+		t.Error("expected `agbox remove --yes` to delete agbox-profile-cleanupme volume")
+	}
+}
+
+func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+	ctx := context.Background()
+
+	// 1. Root check enforced on auth, skills, and profile without --allow-root.
+	app.GetEUID = func() int { return 0 }
+	for _, cmd := range [][]string{
+		{"auth", "status"},
+		{"skills", "list"},
+		{"profile", "list"},
+	} {
+		if rc := app.Dispatch(ctx, cmd); rc == 0 {
+			t.Errorf("expected %v to fail closed as root without --allow-root", cmd)
+		}
+	}
+	app.GetEUID = func() int { return 1000 }
+
+	// 2. Symlinked DataDir rejected on auth, skills, and profile.
+	symData := filepath.Join(t.TempDir(), "sym-data")
+	if err := os.Symlink(app.Env.DataDir, symData); err != nil {
+		t.Fatal(err)
+	}
+	symApp := *app
+	symApp.Env.DataDir = symData
+	for _, cmd := range [][]string{
+		{"auth", "status"},
+		{"skills", "list"},
+		{"profile", "list"},
+	} {
+		if rc := symApp.Dispatch(ctx, cmd); rc == 0 {
+			t.Errorf("expected %v to reject symlinked DataDir", cmd)
+		}
+	}
+
+	// 3. Tampered suspended metadata with invalid Profile or ContinueSession rejected on Resume.
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-tamp2 stopped\n"
+	tampDir := filepath.Join(app.Env.DataDir, "run", "tamp2")
+	for _, badMeta := range []config.RunMeta{
+		{
+			Sandbox:  "agbox-tamp2",
+			Agent:    "opencode",
+			Mode:     config.RunModeTUI,
+			MaskMode: config.MaskStrict,
+			Profile:  "../escape",
+		},
+		{
+			Sandbox:         "agbox-tamp2",
+			Agent:           "opencode",
+			Mode:            config.RunModeTUI,
+			MaskMode:        config.MaskStrict,
+			ContinueSession: "bad;rm -rf /",
+		},
+	} {
+		if err := config.SaveRunMeta(filepath.Join(tampDir, "suspended"), badMeta); err != nil {
+			t.Fatal(err)
+		}
+		if rc := app.Dispatch(ctx, []string{"resume", "agbox-tamp2"}); rc == 0 {
+			t.Errorf("expected tampered Resume metadata %+v to fail closed", badMeta)
 		}
 	}
 }
