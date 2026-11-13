@@ -12,19 +12,20 @@ import (
 func TestTranslateNetSpecAndBuildNetArgs(t *testing.T) {
 	publicWant := []string{
 		"--net-default", "deny",
+		"--net-rule", "allow@dns",
 		"--net-rule", "deny@host",
 		"--net-rule", "deny@loopback",
 		"--net-rule", "deny@private",
 		"--net-rule", "deny@link-local",
 		"--net-rule", "deny@multicast",
-		"--net-rule", "deny@metadata",
+		"--net-rule", "deny@meta",
 		"--net-rule", "deny@0.0.0.0/8",
 		"--net-rule", "deny@100.100.100.200/32",
 		"--net-rule", "deny@168.63.129.16/32",
 		"--net-rule", "deny@169.254.0.0/16",
 		"--net-rule", "deny@240.0.0.0/4",
-		"--net-rule", "deny@fe80::/10",
-		"--net-rule", "deny@fd00:ec2::254/128",
+		"--net-rule", "deny@[fe80::/10]",
+		"--net-rule", "deny@[fd00:ec2::254/128]",
 		"--net-rule", "allow@public",
 	}
 	for _, spec := range []string{"", "public", "public-only", "  public "} {
@@ -35,24 +36,27 @@ func TestTranslateNetSpecAndBuildNetArgs(t *testing.T) {
 		if !slices.Equal(got, publicWant) {
 			t.Errorf("TranslateNetSpec(%q) = %v, want %v", spec, got, publicWant)
 		}
+		assertAllNetRuleTokensValid(t, got)
 	}
 
-	// private allows RFC1918/CGNAT/ULA after blocking host, loopback, link-local, multicast, and cloud-config IMDS CIDRs.
+	// private allows RFC1918/CGNAT/ULA after allowing DNS and blocking host, loopback, link-local, multicast, and cloud-config IMDS CIDRs.
 	gotPrivate, err := TranslateNetSpec("private")
 	if err != nil {
 		t.Fatalf("TranslateNetSpec(private): %v", err)
 	}
+	assertAllNetRuleTokensValid(t, gotPrivate)
 	privJoined := strings.Join(gotPrivate, " ")
 	for _, mustContain := range []string{
 		"--net-default deny",
+		"--net-rule allow@dns",
 		"--net-rule deny@host",
 		"--net-rule deny@loopback",
 		"--net-rule deny@link-local",
 		"--net-rule deny@multicast",
-		"--net-rule deny@metadata",
+		"--net-rule deny@meta",
 		"--net-rule deny@100.100.100.200/32",
 		"--net-rule deny@168.63.129.16/32",
-		"--net-rule deny@fd00:ec2::254/128",
+		"--net-rule deny@[fd00:ec2::254/128]",
 		"--net-rule allow@public",
 		"--net-rule allow@private",
 	} {
@@ -60,15 +64,19 @@ func TestTranslateNetSpecAndBuildNetArgs(t *testing.T) {
 			t.Errorf("TranslateNetSpec(private) = %q, missing %q", privJoined, mustContain)
 		}
 	}
+	if strings.Index(privJoined, "allow@dns") > strings.Index(privJoined, "deny@host") {
+		t.Errorf("expected allow@dns before deny@host in %q", privJoined)
+	}
 	if strings.Contains(privJoined, "deny@private") {
 		t.Errorf("TranslateNetSpec(private) should not contain deny@private: %q", privJoined)
 	}
 
-	// host places allow@host before deny@private while still blocking loopback, multicast, and metadata.
+	// host places allow@host before deny@private while still blocking loopback, multicast, and meta.
 	gotHost, err := TranslateNetSpec("host")
 	if err != nil {
 		t.Fatalf("TranslateNetSpec(host): %v", err)
 	}
+	assertAllNetRuleTokensValid(t, gotHost)
 	hostJoined := strings.Join(gotHost, " ")
 	allowHostIdx := strings.Index(hostJoined, "allow@host")
 	denyPrivIdx := strings.Index(hostJoined, "deny@private")
@@ -87,19 +95,84 @@ func TestTranslateNetSpecAndBuildNetArgs(t *testing.T) {
 		}
 	}
 
-	// Multi-spec BuildNetArgs must emit --net-default deny once and place user deny@ rules before allow@public!
-	multiGot, err := BuildNetArgs(false, []string{"public", "deny@93.184.216.34/32", "allow@example.com:tcp:443"})
+	// Multi-spec BuildNetArgs must emit --net-default deny once and place user deny@ rules before allow@dns and allow@public.
+	multiGot, err := BuildNetArgs(false, []string{"public", "deny@evil.com", "deny@93.184.216.34/32", "allow@example.com:tcp:443"})
 	if err != nil {
 		t.Fatalf("BuildNetArgs multi-spec: %v", err)
 	}
+	assertAllNetRuleTokensValid(t, multiGot)
 	multiJoined := strings.Join(multiGot, " ")
 	if strings.Count(multiJoined, "--net-default") != 1 {
 		t.Errorf("expected single --net-default in %q", multiJoined)
 	}
+	denyEvilIdx := strings.Index(multiJoined, "deny@evil.com")
+	allowDNSIdx := strings.Index(multiJoined, "allow@dns")
 	denyCustomIdx := strings.Index(multiJoined, "deny@93.184.216.34/32")
 	allowPubIdx := strings.Index(multiJoined, "allow@public")
+	if denyEvilIdx < 0 || allowDNSIdx < 0 || denyEvilIdx > allowDNSIdx {
+		t.Errorf("expected deny@evil.com before allow@dns in %q", multiJoined)
+	}
 	if denyCustomIdx < 0 || allowPubIdx < 0 || denyCustomIdx > allowPubIdx {
 		t.Errorf("expected custom deny@ rule before allow@public in %q", multiJoined)
+	}
+
+	// Narrow custom domain rules omit allow@dns, block non-53 host traffic before user allows, and end with deny@host.
+	narrowGot, err := TranslateNetSpec("allow@api.anthropic.com:tcp:443")
+	if err != nil {
+		t.Fatalf("TranslateNetSpec(narrow): %v", err)
+	}
+	assertAllNetRuleTokensValid(t, narrowGot)
+	narrowJoined := strings.Join(narrowGot, " ")
+	if strings.Contains(narrowJoined, "allow@dns") {
+		t.Errorf("narrow domain rule should not emit broad allow@dns: %q", narrowJoined)
+	}
+	for _, must := range []string{
+		"--net-rule deny@host:tcp:0-52",
+		"--net-rule deny@host:tcp:54-65535",
+		"--net-rule deny@host:udp:0-52",
+		"--net-rule deny@host:udp:54-65535",
+		"--net-rule deny@host:icmpv4",
+		"--net-rule deny@host:icmpv6",
+		"--net-rule deny@meta",
+		"--net-rule allow@api.anthropic.com:tcp:443",
+	} {
+		if !strings.Contains(narrowJoined, must) {
+			t.Errorf("narrow rule args %q missing %q", narrowJoined, must)
+		}
+	}
+	if narrowGot[len(narrowGot)-2] != "--net-rule" || narrowGot[len(narrowGot)-1] != "deny@host" {
+		t.Errorf("narrow rule args should end with --net-rule deny@host, got %v", narrowGot)
+	}
+
+	// allow@metadata and deny@metadata normalize to meta, while metadata.example.com stays a domain.
+	metaAliasGot, err := BuildNetArgs(false, []string{"deny@metadata", "allow@metadata.example.com:tcp:443"})
+	if err != nil {
+		t.Fatalf("BuildNetArgs metadata alias: %v", err)
+	}
+	assertAllNetRuleTokensValid(t, metaAliasGot)
+	if !slices.Contains(metaAliasGot, "deny@meta") || slices.Contains(metaAliasGot, "deny@metadata") {
+		t.Errorf("expected deny@metadata to normalize to deny@meta in %v", metaAliasGot)
+	}
+	if !slices.Contains(metaAliasGot, "allow@metadata.example.com:tcp:443") {
+		t.Errorf("expected metadata.example.com domain to be preserved in %v", metaAliasGot)
+	}
+	allowMetaGot, err := TranslateNetSpec("allow@metadata")
+	if err != nil {
+		t.Fatalf("TranslateNetSpec(allow@metadata): %v", err)
+	}
+	assertAllNetRuleTokensValid(t, allowMetaGot)
+	if !slices.Contains(allowMetaGot, "allow@meta") || slices.Contains(allowMetaGot, "deny@meta") {
+		t.Errorf("expected allow@metadata to permit allow@meta without deny@meta: %v", allowMetaGot)
+	}
+
+	// allow:ingress@loopback:tcp:8080 preserves egress deny@loopback.
+	ingressGot, err := TranslateNetSpec("allow:ingress@loopback:tcp:8080")
+	if err != nil {
+		t.Fatalf("TranslateNetSpec(ingress): %v", err)
+	}
+	assertAllNetRuleTokensValid(t, ingressGot)
+	if !slices.Contains(ingressGot, "deny@loopback") || !slices.Contains(ingressGot, "allow:ingress@loopback:tcp:8080") {
+		t.Errorf("expected ingress loopback rule to preserve egress deny@loopback: %v", ingressGot)
 	}
 
 	for _, badSpec := range []string{
@@ -109,9 +182,36 @@ func TestTranslateNetSpecAndBuildNetArgs(t *testing.T) {
 		"deny@",
 		"allow@example.com --privileged",
 		"allow@example.com,deny@",
+		"deny@fe80::/10",
+		"allow@2001:db8::1",
+		"allow@[192.0.2.1]",
+		"allow@myhost",
+		"deny@*.com",
+		"deny@suffix=local",
+		"allow@example.com:443",
+		"allow@public:tcp:443-80",
+		"allow:ingress@dns",
+		"allow:ingress@public:icmpv4",
+		"allow:any@public:icmpv6",
+		"allow@public:tcp:443:extra",
 	} {
 		if _, err := TranslateNetSpec(badSpec); err == nil {
 			t.Errorf("expected error for invalid --net spec %q", badSpec)
+		}
+	}
+}
+
+func assertAllNetRuleTokensValid(t *testing.T, args []string) {
+	t.Helper()
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--net-rule" {
+			if i+1 >= len(args) {
+				t.Fatalf("dangling --net-rule at end of %v", args)
+			}
+			if err := validateNetRuleToken(args[i+1]); err != nil {
+				t.Fatalf("emitted invalid --net-rule %q in %v: %v", args[i+1], args, err)
+			}
+			i++
 		}
 	}
 }
@@ -183,9 +283,10 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		Name:     "agbox-base",
 		NetSpecs: []string{"public"},
 	})
-	if err != nil || !slices.Contains(createNetArgs, "deny@metadata") || !slices.Contains(createNetArgs, "deny@168.63.129.16/32") {
-		t.Errorf("expected BuildCreateArgs with NetSpecs=[public] to include metadata/cloud-config denies: %v, %v", createNetArgs, err)
+	if err != nil || !slices.Contains(createNetArgs, "deny@meta") || !slices.Contains(createNetArgs, "deny@168.63.129.16/32") || !slices.Contains(createNetArgs, "allow@dns") {
+		t.Errorf("expected BuildCreateArgs with NetSpecs=[public] to include meta/cloud-config denies and allow@dns: %v, %v", createNetArgs, err)
 	}
+	assertAllNetRuleTokensValid(t, createNetArgs)
 
 	if _, err := BuildRestoreArgs(RestoreOpts{Name: "agbox-run-1"}); err == nil {
 		t.Fatal("expected error when Snapshot is empty")
@@ -213,6 +314,7 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildRestoreArgs: %v", err)
 	}
+	assertAllNetRuleTokensValid(t, restoreArgs)
 	joined := strings.Join(restoreArgs, " ")
 	for _, substr := range []string{
 		"snap restore agbox:v2",
@@ -222,11 +324,13 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		"-v /tmp/mnt0:/workspace/proj:rw,uid=1000,gid=1000",
 		"-v /tmp/file.txt:/workspace/file.txt:ro,uid=1000,gid=1000",
 		"-p 127.0.0.1:4096:3000",
-		"--net-default deny --net-rule deny@host --net-rule deny@loopback --net-rule deny@private --net-rule deny@link-local --net-rule deny@multicast --net-rule deny@metadata",
+		"--net-default deny --net-rule allow@dns --net-rule deny@host --net-rule deny@loopback --net-rule deny@private --net-rule deny@link-local --net-rule deny@multicast --net-rule deny@meta",
 		"--net-rule deny@168.63.129.16/32",
 		"--net-rule deny@100.100.100.200/32",
+		"--net-rule deny@[fd00:ec2::254/128]",
 		"--net-rule allow@public",
 		"--net-rule allow@example.com:tcp:443",
+		"--net-rule allow:ingress@loopback:tcp:3000",
 	} {
 		if !strings.Contains(joined, substr) {
 			t.Errorf("restoreArgs %q missing %q", joined, substr)
@@ -240,17 +344,19 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildRestoreArgs default net: %v", err)
 	}
+	assertAllNetRuleTokensValid(t, defaultNetArgs)
 	defaultNetJoined := strings.Join(defaultNetArgs, " ")
 	for _, must := range []string{
 		"--net-default deny",
+		"--net-rule allow@dns",
 		"--net-rule deny@host",
 		"--net-rule deny@loopback",
 		"--net-rule deny@private",
 		"--net-rule deny@link-local",
 		"--net-rule deny@multicast",
-		"--net-rule deny@metadata",
+		"--net-rule deny@meta",
 		"--net-rule deny@168.63.129.16/32",
-		"--net-rule deny@fd00:ec2::254/128",
+		"--net-rule deny@[fd00:ec2::254/128]",
 		"--net-rule allow@public",
 	} {
 		if !strings.Contains(defaultNetJoined, must) {
@@ -265,6 +371,43 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 	})
 	if err != nil || !slices.Contains(noNetArgs, "--no-net") {
 		t.Errorf("expected --no-net in %v (err=%v)", noNetArgs, err)
+	}
+
+	noNetServeArgs, err := BuildRestoreArgs(RestoreOpts{
+		Snapshot: "agbox:v1",
+		Name:     "agbox-run-serve-nonet",
+		Ports:    []string{"127.0.0.1:4096:3000"},
+		NoNet:    true,
+	})
+	if err != nil {
+		t.Fatalf("BuildRestoreArgs no-net serve: %v", err)
+	}
+	assertAllNetRuleTokensValid(t, noNetServeArgs)
+	if !slices.Contains(noNetServeArgs, "--no-net") || !slices.Contains(noNetServeArgs, "allow:ingress@loopback:tcp:3000") {
+		t.Errorf("expected --no-net and loopback ingress rule in %v", noNetServeArgs)
+	}
+
+	allNetServeArgs, err := BuildRestoreArgs(RestoreOpts{
+		Snapshot: "agbox:v1",
+		Name:     "agbox-run-serve-all",
+		Ports:    []string{"[::1]:4096:3000/udp"},
+		NetSpecs: []string{"all"},
+	})
+	if err != nil {
+		t.Fatalf("BuildRestoreArgs all serve: %v", err)
+	}
+	if strings.Contains(strings.Join(allNetServeArgs, " "), "allow:ingress@loopback") {
+		t.Errorf("expected no extra ingress rule under --net-default allow, got %v", allNetServeArgs)
+	}
+
+	for _, badPort := range []string{"bad", "3000", "127.0.0.1:0:3000", "127.0.0.1:4096:99999", "127.0.0.1:4096:3000/icmp", "badip:4096:3000"} {
+		if _, err := BuildRestoreArgs(RestoreOpts{
+			Snapshot: "agbox:v1",
+			Name:     "agbox-run-badport",
+			Ports:    []string{badPort},
+		}); err == nil {
+			t.Errorf("expected error for malformed port spec %q", badPort)
+		}
 	}
 
 	execArgs := BuildExecArgs(ExecCmdOpts{

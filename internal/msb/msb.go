@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,16 +96,25 @@ var DefaultPassthroughEnvVars = []string{
 //   - 168.63.129.16/32: Microsoft Azure WireServer/IMDS (resides in public IPv4).
 //   - 169.254.0.0/16: IPv4 link-local and AWS/GCP/Azure/OpenStack IMDS (169.254.169.254).
 //   - 240.0.0.0/4: IPv4 reserved space and limited broadcast (255.255.255.255).
-//   - fe80::/10: IPv6 link-local range.
-//   - fd00:ec2::254/128: AWS IPv6 IMDS (resides inside IPv6 ULA fc00::/7).
+//   - [fe80::/10]: IPv6 link-local range.
+//   - [fd00:ec2::254/128]: AWS IPv6 IMDS (resides inside IPv6 ULA fc00::/7).
 var DefaultBlockedCIDRRules = []string{
 	"deny@0.0.0.0/8",
 	"deny@100.100.100.200/32",
 	"deny@168.63.129.16/32",
 	"deny@169.254.0.0/16",
 	"deny@240.0.0.0/4",
-	"deny@fe80::/10",
-	"deny@fd00:ec2::254/128",
+	"deny@[fe80::/10]",
+	"deny@[fd00:ec2::254/128]",
+}
+
+var nonDNSBlockHostRules = []string{
+	"deny@host:tcp:0-52",
+	"deny@host:tcp:54-65535",
+	"deny@host:udp:0-52",
+	"deny@host:udp:54-65535",
+	"deny@host:icmpv4",
+	"deny@host:icmpv6",
 }
 
 // TranslateNetSpec converts one network profile name or msb rule into CLI flags.
@@ -118,7 +128,8 @@ func TranslateNetSpec(spec string) ([]string, error) {
 
 // BuildNetArgs compiles network flags from noNet and one or more --net specs.
 // Because microsandbox evaluates --net-rule flags with first-match-wins,
-// BuildNetArgs places deny rules before allow rules.
+// BuildNetArgs places deny rules before allow rules while permitting DNS queries
+// appropriately for the selected profile or narrow allowlist.
 func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 	if noNet {
 		return []string{"--no-net"}, nil
@@ -129,14 +140,19 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 
 	allowAll := false
 	hasRestrictiveProfile := false
+	hasGroupAllow := false
 	allowHost := false
+	hostAllowToken := "allow@host"
 	allowLoopback := false
 	allowPrivate := false
 	allowLinkLocal := false
 	allowMulticast := false
 	allowMetadata := false
+	denyDNS := false
+	hasExplicitAllowDNS := false
 
 	var userDenies []string
+	var hostScopedAllows []string
 	var userAllows []string
 
 	for _, rawSpec := range specs {
@@ -144,16 +160,19 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 		switch s {
 		case "", "public", "public-only":
 			hasRestrictiveProfile = true
+			hasGroupAllow = true
 			userAllows = appendUnique(userAllows, "allow@public")
 		case "none", "deny":
 			return []string{"--no-net"}, nil
 		case "private":
 			hasRestrictiveProfile = true
+			hasGroupAllow = true
 			allowPrivate = true
 			userAllows = appendUnique(userAllows, "allow@public")
 			userAllows = appendUnique(userAllows, "allow@private")
 		case "host":
 			hasRestrictiveProfile = true
+			hasGroupAllow = true
 			allowHost = true
 			userAllows = appendUnique(userAllows, "allow@public")
 		case "all", "allow":
@@ -163,37 +182,54 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 				return nil, fmt.Errorf("unsupported --net value %q (use: public, none, private, host, all, or an msb rule like 'allow@example.com:tcp:443')", rawSpec)
 			}
 			for _, tok := range strings.Split(s, ",") {
-				rule := strings.TrimSpace(tok)
-				if err := validateNetRuleToken(rule); err != nil {
+				trimmed := strings.TrimSpace(tok)
+				rule, action, dir, right, err := parseAndNormalizeNetRule(trimmed)
+				if err != nil {
 					return nil, err
 				}
-				lower := strings.ToLower(rule)
-				if strings.HasPrefix(lower, "deny@") {
+				if action == "deny" {
 					userDenies = appendUnique(userDenies, rule)
+					if (dir == "egress" || dir == "any") && isFullDNSRight(right) {
+						denyDNS = true
+					}
 					continue
 				}
 				hasRestrictiveProfile = true
-				switch lower {
-				case "allow@host":
-					allowHost = true
-				case "allow@loopback":
-					allowLoopback = true
-				case "allow@private":
-					allowPrivate = true
-				case "allow@link-local":
-					allowLinkLocal = true
-				case "allow@multicast":
-					allowMulticast = true
-				case "allow@metadata":
-					allowMetadata = true
-				default:
-					if strings.HasPrefix(lower, "allow@host:") {
-						// Port-scoped host rule still goes before deny@private.
-						userAllows = appendUnique(userAllows, rule)
-						continue
-					}
+				if dir == "ingress" {
+					userAllows = appendUnique(userAllows, rule)
+					continue
 				}
-				if lower != "allow@host" {
+				switch {
+				case right == "any" || right == "public":
+					hasGroupAllow = true
+					userAllows = appendUnique(userAllows, rule)
+				case right == "private":
+					allowPrivate = true
+					hasGroupAllow = true
+					userAllows = appendUnique(userAllows, rule)
+				case right == "host":
+					allowHost = true
+					if dir == "any" {
+						hostAllowToken = "allow:any@host"
+					}
+				case right == "loopback":
+					allowLoopback = true
+					userAllows = appendUnique(userAllows, rule)
+				case right == "link-local":
+					allowLinkLocal = true
+					userAllows = appendUnique(userAllows, rule)
+				case right == "multicast":
+					allowMulticast = true
+					userAllows = appendUnique(userAllows, rule)
+				case right == "meta":
+					allowMetadata = true
+					userAllows = appendUnique(userAllows, rule)
+				case right == "dns" || strings.HasPrefix(right, "dns:"):
+					hasExplicitAllowDNS = true
+					hostScopedAllows = appendUnique(hostScopedAllows, rule)
+				case strings.HasPrefix(right, "host:"):
+					hostScopedAllows = appendUnique(hostScopedAllows, rule)
+				default:
 					userAllows = appendUnique(userAllows, rule)
 				}
 			}
@@ -209,19 +245,42 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 	}
 
 	args := []string{"--net-default", "deny"}
-	if allowHost {
-		args = append(args, "--net-rule", "allow@host")
+	for _, d := range userDenies {
+		args = append(args, "--net-rule", d)
 	}
-	for _, r := range userAllows {
-		if strings.HasPrefix(strings.ToLower(r), "allow@host:") {
+
+	trailingDenyHost := false
+	switch {
+	case allowHost:
+		args = append(args, "--net-rule", hostAllowToken)
+		for _, r := range hostScopedAllows {
 			args = append(args, "--net-rule", r)
+		}
+	case hasGroupAllow || hasExplicitAllowDNS:
+		for _, r := range hostScopedAllows {
+			args = append(args, "--net-rule", r)
+		}
+		if hasGroupAllow && !denyDNS && !hasExplicitAllowDNS {
+			args = append(args, "--net-rule", "allow@dns")
+		}
+		args = append(args, "--net-rule", "deny@host")
+	default:
+		for _, r := range hostScopedAllows {
+			args = append(args, "--net-rule", r)
+		}
+		if denyDNS {
+			args = append(args, "--net-rule", "deny@host")
+		} else {
+			// Block non-53 host traffic before user allows so narrow domain rules can resolve DNS
+			// without opening arbitrary DNS lookups on port 53.
+			for _, r := range nonDNSBlockHostRules {
+				args = append(args, "--net-rule", r)
+			}
+			trailingDenyHost = true
 		}
 	}
 
 	var denies []string
-	if !allowHost {
-		denies = appendUnique(denies, "deny@host")
-	}
 	if !allowLoopback {
 		denies = appendUnique(denies, "deny@loopback")
 	}
@@ -235,7 +294,7 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 		denies = appendUnique(denies, "deny@multicast")
 	}
 	if !allowMetadata {
-		denies = appendUnique(denies, "deny@metadata")
+		denies = appendUnique(denies, "deny@meta")
 	}
 	if !allowLoopback {
 		denies = appendUnique(denies, "deny@0.0.0.0/8")
@@ -251,43 +310,369 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 		denies = appendUnique(denies, "deny@240.0.0.0/4")
 	}
 	if !allowLinkLocal {
-		denies = appendUnique(denies, "deny@fe80::/10")
+		denies = appendUnique(denies, "deny@[fe80::/10]")
 	}
 	if !allowMetadata {
-		denies = appendUnique(denies, "deny@fd00:ec2::254/128")
-	}
-	for _, d := range userDenies {
-		denies = appendUnique(denies, d)
+		denies = appendUnique(denies, "deny@[fd00:ec2::254/128]")
 	}
 
 	for _, d := range denies {
 		args = append(args, "--net-rule", d)
 	}
 	for _, a := range userAllows {
-		if strings.HasPrefix(strings.ToLower(a), "allow@host:") {
-			continue
-		}
 		args = append(args, "--net-rule", a)
+	}
+	if trailingDenyHost {
+		args = append(args, "--net-rule", "deny@host")
 	}
 	return args, nil
 }
 
-func validateNetRuleToken(rule string) error {
-	if rule == "" {
-		return errors.New("empty --net-rule token")
+func isFullDNSRight(right string) bool {
+	if right == "dns" {
+		return true
 	}
-	for _, r := range rule {
+	if !strings.HasPrefix(right, "dns:") {
+		return false
+	}
+	parts := strings.Split(right, ":")
+	if len(parts) > 3 {
+		return false
+	}
+	if len(parts) >= 2 && parts[1] != "" && parts[1] != "any" {
+		return false
+	}
+	if len(parts) == 3 && parts[2] != "" && parts[2] != "any" && parts[2] != "53" {
+		return false
+	}
+	return true
+}
+
+func validateNetRuleToken(rule string) error {
+	_, _, _, _, err := parseAndNormalizeNetRule(rule)
+	return err
+}
+
+func parseAndNormalizeNetRule(raw string) (normalized, action, direction, right string, err error) {
+	if raw == "" {
+		return "", "", "", "", errors.New("empty --net-rule token")
+	}
+	for _, r := range raw {
 		if r <= 0x20 || r == 0x7f {
-			return fmt.Errorf("invalid --net-rule %q: whitespace and control characters are forbidden", rule)
+			return "", "", "", "", fmt.Errorf("invalid --net-rule %q: whitespace and control characters are forbidden", raw)
 		}
 	}
-	lower := strings.ToLower(rule)
-	if !strings.HasPrefix(lower, "allow@") && !strings.HasPrefix(lower, "deny@") {
-		return fmt.Errorf("invalid --net-rule %q: rule must start with allow@ or deny@", rule)
+	leftRaw, rightRaw, ok := strings.Cut(raw, "@")
+	if !ok {
+		return "", "", "", "", fmt.Errorf("invalid --net-rule %q: rule must use <action>[:<direction>]@<target> syntax", raw)
 	}
-	_, target, _ := strings.Cut(rule, "@")
+	left := strings.ToLower(leftRaw)
+	right = strings.ToLower(rightRaw)
+	if right == "" {
+		return "", "", "", "", fmt.Errorf("invalid --net-rule %q: missing target after '@'", raw)
+	}
+
+	action, dir, err := parseActionAndDirection(left, raw)
+	if err != nil {
+		return "", "", "", "", err
+	}
+
+	// Map the legacy "metadata" target name to the msb "meta" group keyword while leaving
+	// hostnames such as metadata.google.internal and domain=metadata untouched.
+	if right == "metadata" {
+		right = "meta"
+	} else if strings.HasPrefix(right, "metadata:") {
+		right = "meta:" + strings.TrimPrefix(right, "metadata:")
+	}
+
+	if right == "dns" || strings.HasPrefix(right, "dns:") {
+		if err := validateDNSRuleRight(right, dir, raw); err != nil {
+			return "", "", "", "", err
+		}
+		return left + "@" + right, action, dir, right, nil
+	}
+
+	var protoRaw, portsRaw string
+	if strings.HasPrefix(right, "[") {
+		protoRaw, portsRaw, err = parseBracketedNetTarget(right, raw)
+		if err != nil {
+			return "", "", "", "", err
+		}
+	} else {
+		protoRaw, portsRaw, err = parseUnbracketedNetTarget(right, raw)
+		if err != nil {
+			return "", "", "", "", err
+		}
+	}
+
+	if protoRaw != "" {
+		if err := validateNetProto(protoRaw, dir, raw); err != nil {
+			return "", "", "", "", err
+		}
+	}
+	if portsRaw != "" {
+		if err := validateNetPorts(portsRaw, raw); err != nil {
+			return "", "", "", "", err
+		}
+	}
+
+	return left + "@" + right, action, dir, right, nil
+}
+
+func parseActionAndDirection(left, fullToken string) (string, string, error) {
+	act := left
+	dir := "egress"
+	hasDir := false
+	if a, d, ok := strings.Cut(left, ":"); ok {
+		act = a
+		dir = d
+		hasDir = true
+	}
+	if act != "allow" && act != "deny" {
+		return "", "", fmt.Errorf("invalid --net-rule %q: action must be allow or deny", fullToken)
+	}
+	if hasDir && dir != "egress" && dir != "ingress" && dir != "any" {
+		return "", "", fmt.Errorf("invalid --net-rule %q: direction must be egress, ingress, or any", fullToken)
+	}
+	return act, dir, nil
+}
+
+func validateDNSRuleRight(right, dir, fullToken string) error {
+	if dir != "egress" {
+		return fmt.Errorf("invalid --net-rule %q: the dns target only supports egress rules", fullToken)
+	}
+	parts := strings.Split(right, ":")
+	if len(parts) > 3 {
+		return fmt.Errorf("invalid --net-rule %q: trailing fields after port", fullToken)
+	}
+	if len(parts) >= 2 {
+		switch parts[1] {
+		case "", "any", "udp", "tcp":
+		default:
+			return fmt.Errorf("invalid --net-rule %q: dns protocol %q must be any, udp, or tcp", fullToken, parts[1])
+		}
+	}
+	if len(parts) == 3 {
+		switch parts[2] {
+		case "", "any", "53":
+		default:
+			return fmt.Errorf("invalid --net-rule %q: dns port %q must be 53 or any", fullToken, parts[2])
+		}
+	}
+	return nil
+}
+
+func parseBracketedNetTarget(right, fullToken string) (protoRaw, portsRaw string, err error) {
+	afterOpen := right[1:]
+	closeIdx := strings.IndexByte(afterOpen, ']')
+	if closeIdx < 0 {
+		return "", "", fmt.Errorf("invalid --net-rule %q: unclosed '[' in IPv6 target", fullToken)
+	}
+	inner := afterOpen[:closeIdx]
+	afterClose := afterOpen[closeIdx+1:]
+
+	if strings.Contains(inner, "/") {
+		pfx, pfxErr := netip.ParsePrefix(inner)
+		if pfxErr != nil {
+			return "", "", fmt.Errorf("invalid --net-rule %q: invalid CIDR %q", fullToken, inner)
+		}
+		if !pfx.Addr().Is6() {
+			return "", "", fmt.Errorf("invalid --net-rule %q: bracketed target %q must be IPv6", fullToken, inner)
+		}
+	} else {
+		addr, addrErr := netip.ParseAddr(inner)
+		if addrErr != nil {
+			return "", "", fmt.Errorf("invalid --net-rule %q: invalid IPv6 address %q", fullToken, inner)
+		}
+		if !addr.Is6() || addr.Zone() != "" {
+			return "", "", fmt.Errorf("invalid --net-rule %q: bracketed target %q must be an IPv6 address without zone", fullToken, inner)
+		}
+	}
+
+	if afterClose == "" {
+		return "", "", nil
+	}
+	if !strings.HasPrefix(afterClose, ":") {
+		return "", "", fmt.Errorf("invalid --net-rule %q: unexpected characters after ']'", fullToken)
+	}
+	suffixParts := strings.Split(afterClose[1:], ":")
+	if len(suffixParts) > 2 {
+		return "", "", fmt.Errorf("invalid --net-rule %q: trailing fields after port", fullToken)
+	}
+	if suffixParts[0] == "" {
+		return "", "", fmt.Errorf("invalid --net-rule %q: protocol cannot be empty after ':'", fullToken)
+	}
+	protoRaw = suffixParts[0]
+	if len(suffixParts) == 2 {
+		if suffixParts[1] == "" {
+			return "", "", fmt.Errorf("invalid --net-rule %q: port cannot be empty after ':'", fullToken)
+		}
+		portsRaw = suffixParts[1]
+	}
+	return protoRaw, portsRaw, nil
+}
+
+func parseUnbracketedNetTarget(right, fullToken string) (protoRaw, portsRaw string, err error) {
+	if strings.Contains(right, "::") {
+		return "", "", fmt.Errorf("invalid --net-rule %q: IPv6 targets must be enclosed in brackets (for example, deny@[fe80::/10])", fullToken)
+	}
+	parts := strings.SplitN(right, ":", 4)
+	if len(parts) == 4 {
+		return "", "", fmt.Errorf("invalid --net-rule %q: trailing fields or unbracketed IPv6 address (wrap IPv6 in [...])", fullToken)
+	}
+	target := parts[0]
+	if len(parts) >= 2 {
+		protoRaw = parts[1]
+		if looksLikePortSpec(protoRaw) {
+			return "", "", fmt.Errorf("invalid --net-rule %q: port %q is in protocol position, use <target>:<proto>:<ports>", fullToken, protoRaw)
+		}
+		if protoRaw == "" {
+			return "", "", fmt.Errorf("invalid --net-rule %q: protocol cannot be empty after ':'", fullToken)
+		}
+	}
+	if len(parts) == 3 {
+		portsRaw = parts[2]
+		if portsRaw == "" {
+			return "", "", fmt.Errorf("invalid --net-rule %q: port cannot be empty after ':'", fullToken)
+		}
+	}
+	if err := validateUnbracketedTarget(target, fullToken); err != nil {
+		return "", "", err
+	}
+	return protoRaw, portsRaw, nil
+}
+
+func validateUnbracketedTarget(target, fullToken string) error {
 	if target == "" {
-		return fmt.Errorf("invalid --net-rule %q: missing target after '@'", rule)
+		return fmt.Errorf("invalid --net-rule %q: empty target", fullToken)
+	}
+	switch target {
+	case "any", "public", "private", "loopback", "link-local", "meta", "multicast", "host":
+		return nil
+	}
+	if rest, ok := strings.CutPrefix(target, "*."); ok {
+		if !isValidNetDomain(rest, true) {
+			return fmt.Errorf("invalid --net-rule %q: invalid wildcard domain suffix %q", fullToken, target)
+		}
+		return nil
+	}
+	if rest, ok := strings.CutPrefix(target, "suffix="); ok {
+		if !isValidNetDomain(rest, true) {
+			return fmt.Errorf("invalid --net-rule %q: invalid domain suffix %q", fullToken, rest)
+		}
+		return nil
+	}
+	if rest, ok := strings.CutPrefix(target, "domain="); ok {
+		if !isValidNetDomain(rest, false) {
+			return fmt.Errorf("invalid --net-rule %q: invalid domain name %q", fullToken, rest)
+		}
+		return nil
+	}
+	if strings.Contains(target, "/") {
+		pfx, err := netip.ParsePrefix(target)
+		if err != nil {
+			return fmt.Errorf("invalid --net-rule %q: invalid CIDR %q", fullToken, target)
+		}
+		if pfx.Addr().Is6() {
+			return fmt.Errorf("invalid --net-rule %q: IPv6 CIDRs must be enclosed in brackets (for example, deny@[%s])", fullToken, target)
+		}
+		return nil
+	}
+	if addr, err := netip.ParseAddr(target); err == nil {
+		if addr.Is6() || addr.Zone() != "" {
+			return fmt.Errorf("invalid --net-rule %q: IPv6 addresses must be enclosed in brackets (for example, allow@[%s])", fullToken, target)
+		}
+		return nil
+	}
+	if strings.Contains(target, ".") {
+		if !isValidNetDomain(target, true) {
+			return fmt.Errorf("invalid --net-rule %q: invalid domain name %q", fullToken, target)
+		}
+		return nil
+	}
+	return fmt.Errorf("invalid --net-rule %q: %q is ambiguous (use domain=%s or a group keyword such as public, private, loopback, link-local, meta, multicast, or host)", fullToken, target, target)
+}
+
+func isValidNetDomain(s string, requireMultiLabel bool) bool {
+	s = strings.TrimSuffix(s, ".")
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	labels := strings.Split(s, ".")
+	if requireMultiLabel && len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func looksLikePortSpec(s string) bool {
+	if s == "" {
+		return false
+	}
+	if lo, hi, ok := strings.Cut(s, "-"); ok {
+		return isValidUint16Digits(lo) && isValidUint16Digits(hi)
+	}
+	return isValidUint16Digits(s)
+}
+
+func isValidUint16Digits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseUint(s, 10, 16)
+	return err == nil
+}
+
+func validateNetProto(proto, dir, fullToken string) error {
+	switch proto {
+	case "any", "tcp", "udp":
+		return nil
+	case "icmpv4", "icmpv6":
+		if dir == "ingress" || dir == "any" {
+			return fmt.Errorf("invalid --net-rule %q: %s is only supported on egress rules", fullToken, proto)
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid --net-rule %q: unsupported protocol %q (use any, tcp, udp, icmpv4, or icmpv6)", fullToken, proto)
+	}
+}
+
+func validateNetPorts(ports, fullToken string) error {
+	if ports == "any" {
+		return nil
+	}
+	if loStr, hiStr, ok := strings.Cut(ports, "-"); ok {
+		if !isValidUint16Digits(loStr) || !isValidUint16Digits(hiStr) {
+			return fmt.Errorf("invalid --net-rule %q: invalid port range %q", fullToken, ports)
+		}
+		lo, _ := strconv.ParseUint(loStr, 10, 16)
+		hi, _ := strconv.ParseUint(hiStr, 10, 16)
+		if lo > hi {
+			return fmt.Errorf("invalid --net-rule %q: port range start %d exceeds end %d", fullToken, lo, hi)
+		}
+		return nil
+	}
+	if !isValidUint16Digits(ports) {
+		return fmt.Errorf("invalid --net-rule %q: invalid port %q", fullToken, ports)
 	}
 	return nil
 }
@@ -461,7 +846,94 @@ func BuildRestoreArgs(opts RestoreOpts) ([]string, error) {
 		return nil, err
 	}
 	args = append(args, netArgs...)
+	if len(opts.Ports) > 0 && !(len(netArgs) >= 2 && netArgs[0] == "--net-default" && netArgs[1] == "allow") {
+		for _, p := range opts.Ports {
+			rule, err := ingressRuleForPublishedPort(p)
+			if err != nil {
+				return nil, err
+			}
+			if !hasNetRule(args, rule) {
+				args = append(args, "--net-rule", rule)
+			}
+		}
+	}
 	return args, nil
+}
+
+func hasNetRule(args []string, rule string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--net-rule" && args[i+1] == rule {
+			return true
+		}
+	}
+	return false
+}
+
+func ingressRuleForPublishedPort(spec string) (string, error) {
+	trimmed := strings.TrimSpace(spec)
+	if trimmed == "" {
+		return "", errors.New("empty published port spec")
+	}
+	for _, r := range trimmed {
+		if r <= 0x20 || r == 0x7f {
+			return "", fmt.Errorf("invalid published port spec %q: whitespace and control characters are forbidden", spec)
+		}
+	}
+	base, protoRaw, hasProto := strings.Cut(trimmed, "/")
+	proto := "tcp"
+	if hasProto {
+		proto = strings.ToLower(protoRaw)
+		if proto != "tcp" && proto != "udp" {
+			return "", fmt.Errorf("invalid published port spec %q: protocol %q must be tcp or udp", spec, protoRaw)
+		}
+	}
+
+	var hostStr, guestStr string
+	if strings.HasPrefix(base, "[") {
+		closeIdx := strings.IndexByte(base, ']')
+		if closeIdx < 0 {
+			return "", fmt.Errorf("invalid published port spec %q: unclosed '[' in bind address", spec)
+		}
+		bindIP := base[1:closeIdx]
+		if addr, err := netip.ParseAddr(bindIP); err != nil || addr.Zone() != "" {
+			return "", fmt.Errorf("invalid published port spec %q: invalid bind IP %q", spec, bindIP)
+		}
+		after := base[closeIdx+1:]
+		if !strings.HasPrefix(after, ":") {
+			return "", fmt.Errorf("invalid published port spec %q: expected :hostPort:guestPort after ']'", spec)
+		}
+		parts := strings.Split(after[1:], ":")
+		if len(parts) != 2 {
+			return "", fmt.Errorf("invalid published port spec %q: expected [bindIP]:hostPort:guestPort", spec)
+		}
+		hostStr, guestStr = parts[0], parts[1]
+	} else {
+		parts := strings.Split(base, ":")
+		switch len(parts) {
+		case 2:
+			hostStr, guestStr = parts[0], parts[1]
+		case 3:
+			if addr, err := netip.ParseAddr(parts[0]); err != nil || addr.Zone() != "" {
+				return "", fmt.Errorf("invalid published port spec %q: invalid bind IP %q", spec, parts[0])
+			}
+			hostStr, guestStr = parts[1], parts[2]
+		default:
+			return "", fmt.Errorf("invalid published port spec %q: expected [bindIP:]hostPort:guestPort[/proto]", spec)
+		}
+	}
+
+	if !isValidPort1To65535(hostStr) || !isValidPort1To65535(guestStr) {
+		return "", fmt.Errorf("invalid published port spec %q: host and guest ports must be integers in 1..65535", spec)
+	}
+	return fmt.Sprintf("allow:ingress@loopback:%s:%s", proto, guestStr), nil
+}
+
+func isValidPort1To65535(s string) bool {
+	if !isValidUint16Digits(s) {
+		return false
+	}
+	v, err := strconv.ParseUint(s, 10, 16)
+	return err == nil && v >= 1
 }
 
 // ExecCmdOpts holds parameters for `msb exec`.

@@ -108,12 +108,13 @@ ______________________________________________________________________
 
 ### Default Network Policy
 
-By default, `agbox create-base` and `agbox run` configure `msb` with a default-deny egress firewall (`--net public`):
+By default, `agbox create-base` and `agbox run` configure `msb` with a default-deny firewall (`--net public`):
 
-- **Default action:** `--net-default deny` drops unmatched outbound traffic.
-- **Blocked groups:** `deny@host`, `deny@loopback`, `deny@private`, `deny@link-local`, `deny@multicast`, and `deny@metadata` block host services, loopback, RFC1918 private LANs (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), CGNAT (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), link-local ranges, multicast (`224.0.0.0/4`, `ff00::/8`), and cloud metadata endpoints.
-- **Blocked CIDRs:** Explicit rules also block `0.0.0.0/8`, `169.254.0.0/16`, `fe80::/10`, `240.0.0.0/4` (including `255.255.255.255`), Azure WireServer (`168.63.129.16/32`), Alibaba Cloud IMDS (`100.100.100.200/32`), and AWS IPv6 IMDS (`fd00:ec2::254/128`) before any `allow@...` rule.
-- **Allowed ranges:** `--net-rule allow@public` permits outbound public internet traffic for model APIs and package mirrors.
+- **Default action:** `--net-default deny` drops unmatched outbound and inbound traffic.
+- **Guest DNS on port 53:** `--net-rule allow@dns` lets the guest resolve domain names before `deny@host` blocks all other host gateway ports.
+- **Blocked groups:** `deny@host`, `deny@loopback`, `deny@private`, `deny@link-local`, `deny@multicast`, and `deny@meta` block host services, loopback, RFC1918 private LANs (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), CGNAT (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), link-local ranges, multicast (`224.0.0.0/4`, `ff00::/8`), and cloud metadata endpoints.
+- **Blocked CIDRs:** Explicit rules also block `0.0.0.0/8`, `169.254.0.0/16`, `[fe80::/10]`, `240.0.0.0/4` (including `255.255.255.255`), Azure WireServer (`168.63.129.16/32`), Alibaba Cloud IMDS (`100.100.100.200/32`), and AWS IPv6 IMDS (`[fd00:ec2::254/128]`) before any `allow@...` rule.
+- **Allowed ranges:** `--net-rule allow@public` permits outbound public internet traffic for model APIs and package mirrors. When `--serve` publishes a loopback port, `agbox` appends `--net-rule allow:ingress@loopback:tcp:3000`.
 
 You can adjust network access per run:
 
@@ -672,8 +673,8 @@ ______________________________________________________________________
 | Special-file and `ioctl` blocking | `vcsfuse` (`safeFile`, `Mknod`, `Open`) | Mounts with `nosuid,nodev`, allows `S_IFREG` only, and hides `PassthroughFd` and `Ioctl` on file and directory handles. |
 | Privilege-bit and `chown` blocking | `vcsfuse` (`sanitizeCreateMode`, `Setattr`) | Strips `setuid`/`setgid` on creation and rejects `setuid`/`setgid` modes and cross-UID/GID `chown` (`EPERM`). |
 | Extended attribute isolation | `vcsfuse.IsProtectedXattr` | Allows `user.<name>` attributes only and blocks `security.*`, `system.*`, and `trusted.*` (`EPERM` / `ENODATA`). |
-| Default-deny public-only network | `msb.BuildNetArgs` | Places `deny@host`, `deny@loopback`, `deny@private`, `deny@link-local`, `deny@multicast`, `deny@metadata`, and cloud-config CIDRs before `allow@public`. |
-| Loopback-only web server binding | `cli.Run` (`--serve`) | Binds host TCP forwarding strictly on `127.0.0.1:<port>`. |
+| Default-deny public-only network | `msb.BuildNetArgs` | Places `allow@dns`, `deny@host`, `deny@loopback`, `deny@private`, `deny@link-local`, `deny@multicast`, `deny@meta`, and cloud-config CIDRs (including bracketed IPv6 ranges) before `allow@public`. |
+| Loopback-only web server binding | `cli.Run` (`--serve`), `msb.BuildRestoreArgs` | Binds host TCP forwarding strictly on `127.0.0.1:<port>` and allows `allow:ingress@loopback:tcp:3000`. |
 | HTTPS and TLS 1.2+ downloads | `install.sh`, `cli`, `msb`, `persist` | Enforces `--proto '=https' --tlsv1.2` on all `curl` installer downloads. |
 | Secret streaming over `stdin` | `msb.FormatEnvExports`, `cli.pushKeys` | Quotes values for POSIX `sh` and streams keys over `stdin` into `/home/agent/.agbox-keys.sh` (`0600`). Never passes secrets in CLI arguments. |
 | Allowlisted `agbox auth` credentials | `persist`, `cli.Auth`, `cli.pushAuth` | Captures only allowlisted login files (max 64 KiB, `Lstat` no-symlink check) from a zero-share microVM, stores them at `0600` in `$DATA_DIR/auth`, and streams them over `stdin`. |

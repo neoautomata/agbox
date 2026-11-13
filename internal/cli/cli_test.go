@@ -739,9 +739,10 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 			for _, want := range []string{
 				"--name agbox-sec1",
 				"/run/sec1/ws:/workspace:rw",
-				"--net-default deny --net-rule deny@host --net-rule deny@loopback --net-rule deny@private --net-rule deny@link-local --net-rule deny@multicast --net-rule deny@metadata",
+				"--net-default deny --net-rule allow@dns --net-rule deny@host --net-rule deny@loopback --net-rule deny@private --net-rule deny@link-local --net-rule deny@multicast --net-rule deny@meta",
 				"--net-rule deny@168.63.129.16/32",
 				"--net-rule deny@100.100.100.200/32",
+				"--net-rule deny@[fd00:ec2::254/128]",
 				"--net-rule allow@public",
 			} {
 				if !strings.Contains(joined, want) {
@@ -1167,13 +1168,15 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 			foundCreateNet = true
 			for _, must := range []string{
 				"--net-default deny",
+				"--net-rule allow@dns",
 				"--net-rule deny@host",
 				"--net-rule deny@loopback",
 				"--net-rule deny@private",
 				"--net-rule deny@link-local",
 				"--net-rule deny@multicast",
-				"--net-rule deny@metadata",
+				"--net-rule deny@meta",
 				"--net-rule deny@168.63.129.16/32",
+				"--net-rule deny@[fd00:ec2::254/128]",
 				"--net-rule allow@public",
 			} {
 				if !strings.Contains(joined, must) {
@@ -1254,6 +1257,9 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 			}
 			if !slices.Contains(c.Args, "127.0.0.1:4321:3000") {
 				t.Errorf("expected loopback-only port binding 127.0.0.1:4321:3000 in %v", c.Args)
+			}
+			if !slices.Contains(c.Args, "allow:ingress@loopback:tcp:3000") {
+				t.Errorf("expected loopback ingress rule allow:ingress@loopback:tcp:3000 in %v", c.Args)
 			}
 		}
 	}

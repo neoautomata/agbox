@@ -62,8 +62,8 @@ All defaults must choose the most restrictive behavior. Any privilege expansion 
 
 ### Networking, Secrets, and Read-Only Host Caches
 
-- Keep `--net public` default-deny (`--net-default deny`) with explicit `deny@host`, `deny@loopback`, `deny@private`, `deny@link-local`, `deny@multicast`, `deny@metadata`, and cloud IMDS CIDR blocks placed before `allow@public`.
-- Bind `--serve` host port forwarding strictly to `127.0.0.1`.
+- Keep `--net public` default-deny (`--net-default deny`) with explicit `allow@dns` (on group profiles) before `deny@host`, `deny@loopback`, `deny@private`, `deny@link-local`, `deny@multicast`, `deny@meta`, and cloud IMDS CIDR blocks (with IPv6 CIDRs bracketed as `[fe80::/10]` and `[fd00:ec2::254/128]`), all placed before `allow@public`.
+- Keep `--serve` host port forwarding bound strictly to `127.0.0.1`, and pair published guest ports with `--net-rule allow:ingress@loopback:<proto>:<guestPort>` under default-deny policy.
 - Enforce `--proto '=https' --tlsv1.2` on all `curl` downloads.
 - Never pass API keys or auth tokens in CLI arguments or bake them into snapshots. Stream secrets over `stdin` into `0600` files inside the guest.
 - Run `agbox auth` and `agbox update` inside disposable zero-share microVMs. `agbox update` must also pass zero API keys and zero saved login tokens, verify ELF magic (`\x7fELF`), size bounds, `st_nlink == 1`, and SHA-256 digests in `manifest.json`.
