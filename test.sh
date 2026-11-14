@@ -1185,9 +1185,17 @@ assert_not_contains() {
 run_capture() {
   local __var_name="$1"
   shift
-  local __out=""
+  local __cap_dir="${TEST_ROOT:-/tmp}"
+  if [[ ! -d "${__cap_dir}" ]]; then
+    __cap_dir="/tmp"
+  fi
+  local __tmp=""
+  __tmp="$(mktemp "${__cap_dir}/agbox-cap.XXXXXX")"
   local __rc=0
-  __out="$("$@" 2>&1)" || __rc=$?
+  "$@" >"${__tmp}" 2>&1 || __rc=$?
+  local __out=""
+  __out="$(<"${__tmp}")"
+  rm -f "${__tmp}"
   printf -v "${__var_name}" '%s' "${__out}"
   if [[ "${__rc}" -ne 0 ]]; then
     printf '%s\n' "${__out}" >&2
@@ -2207,8 +2215,12 @@ check_22_persist_remote_control_shares_suspend_resume() {
   if [[ "${use_rc}" -eq 1 ]]; then
     # Verify non-zero exit prints [agbox] ERROR: + stub stderr details and cleans up on failure.
     local fail_out=""
-    fail_out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-      agbox_exec "${ACTIVE_BIN}" run --no-auth --persist --name "${fail_name}" -d --remote-control "${proj}" 2>&1)" || rc=$?
+    local fail_tmp="${TEST_ROOT}/rc-fail.out"
+    rm -f "${fail_tmp}"
+    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
+      agbox_exec "${ACTIVE_BIN}" run --no-auth --persist --name "${fail_name}" -d --remote-control "${proj}" >"${fail_tmp}" 2>&1 || rc=$?
+    fail_out="$(<"${fail_tmp}")"
+    rm -f "${fail_tmp}"
     [[ "${rc}" -ne 0 ]] || { echo "Expected --remote-control without auth to fail" >&2; return 1; }
     assert_contains "${fail_out}" "[agbox] ERROR:" "rc failure error prefix"
     assert_contains "${fail_out}" "missing saved antigravity oauth token" "rc failure stderr detail"
@@ -2223,8 +2235,12 @@ check_22_persist_remote_control_shares_suspend_resume() {
   else
     # Verify opencode-only base rejects --remote-control cleanly, then run --persist lifecycle via --serve -d.
     local rej_out=""
-    rej_out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 \
-      agbox_exec "${ACTIVE_BIN}" run --persist --name "${fail_name}" -d --remote-control "${proj}" 2>&1)" || rc=$?
+    local rej_tmp="${TEST_ROOT}/rc-rej.out"
+    rm -f "${rej_tmp}"
+    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 \
+      agbox_exec "${ACTIVE_BIN}" run --persist --name "${fail_name}" -d --remote-control "${proj}" >"${rej_tmp}" 2>&1 || rc=$?
+    rej_out="$(<"${rej_tmp}")"
+    rm -f "${rej_tmp}"
     [[ "${rc}" -ne 0 ]] || return 1
     assert_contains "${rej_out}" "[agbox] ERROR:" "opencode base rejects remote-control"
 
@@ -2553,21 +2569,23 @@ check_33_serve_detached_basic_auth_lifecycle() {
   [[ -n "${url}" ]] || { echo "Failed to parse serve URL from output" >&2; return 1; }
 
   local code=""
-  code="$(curl -sS -o /dev/null -w '%{http_code}' "${url}/doc")"
+  code="$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "${url}/doc")"
   [[ "${code}" == "401" ]] || { echo "Expected HTTP 401 without basic auth, got ${code}" >&2; return 1; }
 
-  code="$(curl -sS -u "opencode:${pass}" -o /dev/null -w '%{http_code}' "${url}/doc")"
+  code="$(curl -sS --connect-timeout 5 --max-time 15 -u "opencode:${pass}" -o /dev/null -w '%{http_code}' "${url}/doc")"
   [[ "${code}" == "200" ]] || { echo "Expected HTTP 200 with basic auth, got ${code}" >&2; return 1; }
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" suspend "${sbx}"
-  if curl -fsS --connect-timeout 1 "${url}/doc" >/dev/null 2>&1; then
+  if curl -fsS --connect-timeout 1 --max-time 3 "${url}/doc" >/dev/null 2>&1; then
     echo "Expected port ${url} closed after suspend" >&2
     return 1
   fi
 
-  OPENCODE_SERVER_PASSWORD="${pass}" MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
+  local resume_out=""
+  OPENCODE_SERVER_PASSWORD="${pass}" MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture resume_out with_timeout 180 \
     agbox_exec "${ACTIVE_BIN}" resume -d "${sbx}"
-  code="$(curl -sS -u "opencode:${pass}" -o /dev/null -w '%{http_code}' "${url}/doc")"
+  printf '%s\n' "${resume_out}"
+  code="$(curl -sS --connect-timeout 5 --max-time 15 -u "opencode:${pass}" -o /dev/null -w '%{http_code}' "${url}/doc")"
   [[ "${code}" == "200" ]] || { echo "Expected HTTP 200 after resume, got ${code}" >&2; return 1; }
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${sbx}"

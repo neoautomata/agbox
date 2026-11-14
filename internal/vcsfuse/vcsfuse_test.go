@@ -8,9 +8,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"agbox/internal/config"
 
@@ -1389,5 +1391,146 @@ func TestWorkspaceHubXattrAndGuestIDMapping(t *testing.T) {
 	}
 	if eOut.Attr.Uid != mappedUID || eOut.Attr.Gid != mappedGID {
 		t.Errorf("hub.Lookup(dyn) uid:gid = %d:%d, want %d:%d", eOut.Attr.Uid, eOut.Attr.Gid, mappedUID, mappedGID)
+	}
+}
+
+func TestDetachedSubprocessPipeHelper(t *testing.T) {
+	if os.Getenv("AGBOX_TEST_DETACHED_HELPER") != "1" {
+		return
+	}
+	hangScript := os.Getenv("AGBOX_TEST_HANG_SCRIPT")
+	baseDir := os.Getenv("AGBOX_TEST_BASE_DIR")
+	mode := os.Getenv("AGBOX_TEST_MODE")
+	if mode == "hub" {
+		_, err := StartHubSubprocess(
+			hangScript,
+			filepath.Join(baseDir, "ws"),
+			filepath.Join(baseDir, "ws.sock"),
+			filepath.Join(baseDir, "ws.pid"),
+			nil,
+			filepath.Join(baseDir, "data"),
+			false,
+		)
+		if err == nil {
+			t.Fatal("expected StartHubSubprocess timeout error from hang script")
+		}
+		return
+	}
+	_, err := StartSubprocess(
+		hangScript,
+		baseDir,
+		filepath.Join(baseDir, "m0"),
+		filepath.Join(baseDir, "m0.pid"),
+		false,
+	)
+	if err == nil {
+		t.Fatal("expected StartSubprocess timeout error from hang script")
+	}
+}
+
+func TestStartHubAndFilterSubprocessDoNotLeakCallerStderrPipe(t *testing.T) {
+	base := t.TempDir()
+	srcDir := filepath.Join(base, "src")
+	dataDir := filepath.Join(base, "data")
+	if err := os.MkdirAll(srcDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Failing daemon stderr is captured in a 0600 .err file and returned in the error.
+	failScript := filepath.Join(base, "fail-daemon.sh")
+	if err := os.WriteFile(failScript, []byte("#!/bin/sh\necho \"daemon boot failure detail\" >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	m0Pid := filepath.Join(base, "m0.pid")
+	if _, err := StartSubprocess(failScript, srcDir, filepath.Join(base, "m0"), m0Pid, true); err == nil || !strings.Contains(err.Error(), "daemon boot failure detail") {
+		t.Fatalf("StartSubprocess error = %v, want daemon boot failure detail", err)
+	}
+	if info, err := os.Stat(filepath.Join(base, "m0.err")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("m0.err stat = %+v, %v, want mode 0600", info, err)
+	}
+
+	wsPid := filepath.Join(base, "ws.pid")
+	if _, err := StartHubSubprocess(failScript, filepath.Join(base, "ws"), filepath.Join(base, "ws.sock"), wsPid, nil, dataDir, false); err == nil || !strings.Contains(err.Error(), "daemon boot failure detail") {
+		t.Fatalf("StartHubSubprocess error = %v, want daemon boot failure detail", err)
+	}
+	if info, err := os.Stat(filepath.Join(base, "ws.err")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("ws.err stat = %+v, %v, want mode 0600", info, err)
+	}
+
+	// 2. Symlinked .err path is rejected fail-closed before launching the subprocess.
+	symPid := filepath.Join(base, "sym.pid")
+	symErr := filepath.Join(base, "sym.err")
+	if err := os.Symlink(filepath.Join(base, "outside"), symErr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartSubprocess(failScript, srcDir, filepath.Join(base, "msym"), symPid, true); err == nil || !strings.Contains(err.Error(), "refusing non-regular daemon stderr log path") {
+		t.Fatalf("StartSubprocess symlink .err = %v, want symlink rejection", err)
+	}
+	if _, err := StartHubSubprocess(failScript, filepath.Join(base, "wssym"), filepath.Join(base, "wssym.sock"), symPid, nil, dataDir, false); err == nil || !strings.Contains(err.Error(), "refusing non-regular daemon stderr log path") {
+		t.Fatalf("StartHubSubprocess symlink .err = %v, want symlink rejection", err)
+	}
+
+	// 3. Detached daemons that stay alive do not hold the parent's stdout/stderr pipes open.
+	hangScript := filepath.Join(base, "hang-daemon.sh")
+	if err := os.WriteFile(hangScript, []byte("#!/bin/sh\ntrap '' TERM\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, mode := range []string{"hub", "filter"} {
+		subBase := filepath.Join(base, "pipe-"+mode)
+		if err := os.MkdirAll(subBase, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		pidFile := filepath.Join(subBase, "m0.pid")
+		if mode == "hub" {
+			pidFile = filepath.Join(subBase, "ws.pid")
+		}
+		t.Cleanup(func() {
+			raw, rErr := os.ReadFile(pidFile)
+			if rErr != nil {
+				return
+			}
+			pid, pErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+			if pErr != nil || pid <= 0 {
+				return
+			}
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			deadline := time.Now().Add(500 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				if syscall.Kill(pid, 0) != nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := exec.CommandContext(ctx, exe, "-test.run=^TestDetachedSubprocessPipeHelper$")
+		cmd.Env = append(os.Environ(),
+			"AGBOX_TEST_DETACHED_HELPER=1",
+			"AGBOX_TEST_HANG_SCRIPT="+hangScript,
+			"AGBOX_TEST_BASE_DIR="+subBase,
+			"AGBOX_TEST_MODE="+mode,
+		)
+		out, runErr := cmd.CombinedOutput()
+		cancel()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("%s CombinedOutput hung because detached child inherited stdout/stderr pipe", mode)
+		}
+		if runErr != nil {
+			t.Fatalf("%s helper failed: %v\n%s", mode, runErr, string(out))
+		}
+		if !strings.Contains(string(out), "PASS") {
+			t.Fatalf("%s helper unexpected output:\n%s", mode, string(out))
+		}
 	}
 }

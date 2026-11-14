@@ -52,6 +52,7 @@ All defaults must choose the most restrictive behavior. Any privilege expansion 
 
 - Reject host `root` execution (`euid == 0`) unless `--allow-root` or `AGBOX_ALLOW_ROOT=1` is set.
 - Create host state directories with `config.EnsurePrivateDir` (`Lstat` symlink rejection and mode `0700`) and write metadata or secret files at mode `0600`.
+- Redirect background FUSE daemon `stderr` (`StartHubSubprocess` and `StartSubprocess`) to a private mode `0600` `.err` log file inside the run directory (`ws.err` or `m*.err`), never inheriting `os.Stdout` or `os.Stderr`, so shell command-substitution pipes (`$(agbox run -d ... 2>&1)`) never hang after the CLI exits.
 - Before signaling any recorded FUSE PID, verify `/proc/<pid>/cmdline` matches `agbox __filter` (`mounttab.IsFilterCmdline`).
 - Before calling `os.RemoveAll` on any run directory, unmount FUSE shares and verify zero active mounts remain in `/proc/self/mountinfo` (`mounttab.TeardownFilterDir`).
 
@@ -139,7 +140,7 @@ Every edit to `test.sh` or any new feature that adds user-visible behavior must 
 
 - **Completely automated execution:** Every check must run unattended from start to finish with zero interactive prompts (`</dev/null`, `--yes`, and `with_timeout` or `with_timeout_stdin` bounds on every external command).
 - **Continue on failure:** `run_check` executes each check in an isolated subshell (`set -Eeuo pipefail`) so an earlier failure still lets independent checks and `99-verify-host-unchanged` run, then prints a final `PASS` / `FAIL` / `SKIP` summary with exact log file paths.
-- **Never swallow error diagnostics under `set -e`:** Use `run_capture <var> <cmd...>` instead of `out="$(cmd 2>&1)"` for expected-success commands so captured stderr/stdout prints before returning non-zero. Keep `err_out="$(... 2>&1)" || rc=$?` only for expected-failure assertions, and dump background daemon logs (such as `fd-run.log` or `lkp.log`) whenever `wait_for_sandbox_running` times out.
+- **Never swallow error diagnostics or hang on detached pipes:** `run_capture` captures expected-success output via a temporary regular file inside `$TEST_ROOT` instead of a `$(...)` pipe so detached daemons cannot block capture, and prints captured stderr and stdout before returning non-zero. Keep `err_out="$(... 2>&1)" || rc=$?` only for foreground expected-failure assertions, bind every `curl` check with explicit `--connect-timeout` and `--max-time` bounds, and dump background daemon logs (such as `fd-run.log` or `lkp.log`) whenever `wait_for_sandbox_running` times out.
 - **Guaranteed teardown on exit or signal:** Register `trap cleanup EXIT INT TERM HUP` to stop leftover `SUITE_ID` background processes, unmount active FUSE mounts via `/proc/self/mountinfo`, remove temporary test directories and `SUITE_ID` sandboxes/volumes, and restore any disruptive host backups.
 
 ### Check Numbering Layout

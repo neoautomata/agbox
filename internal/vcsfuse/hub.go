@@ -1169,6 +1169,11 @@ func StartHubSubprocess(exePath, mntDir, sockPath, pidFile string, initial []Hub
 	if err := ensureSafeMountDir(filepath.Dir(pidFile)); err != nil {
 		return 0, fmt.Errorf("prepare hub pidfile directory: %w", err)
 	}
+	errPath := daemonStderrPath(pidFile)
+	errFile, err := openDaemonStderrFile(errPath)
+	if err != nil {
+		return 0, err
+	}
 
 	specBytes, err := json.Marshal(hubBootstrapSpec{
 		DataDir:     dataDir,
@@ -1178,26 +1183,31 @@ func StartHubSubprocess(exePath, mntDir, sockPath, pidFile string, initial []Hub
 		Shares:      initial,
 	})
 	if err != nil {
+		_ = errFile.Close()
 		return 0, fmt.Errorf("marshal hub bootstrap spec: %w", err)
 	}
 	if len(specBytes) > MaxHubControlBytes {
+		_ = errFile.Close()
 		return 0, errors.New("initial share list exceeds maximum hub bootstrap size")
 	}
 
 	pr, pw, err := os.Pipe()
 	if err != nil {
+		_ = errFile.Close()
 		return 0, fmt.Errorf("create hub bootstrap pipe: %w", err)
 	}
 	if _, err := pw.Write(specBytes); err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
+		_ = errFile.Close()
 		return 0, fmt.Errorf("write hub bootstrap pipe: %w", err)
 	}
 	_ = pw.Close()
 
 	cmd := exec.Command(exePath, SubcommandName, "-hub", "-mnt", mntDir, "-sock", sockPath, "-spec-fd", "3")
+	cmd.Stdin = nil
 	cmd.Stdout = nil
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = errFile
 	cmd.ExtraFiles = []*os.File{pr}
 	if dieWithParent {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -1211,6 +1221,7 @@ func StartHubSubprocess(exePath, mntDir, sockPath, pidFile string, initial []Hub
 
 	startErr := cmd.Start()
 	_ = pr.Close()
+	_ = errFile.Close()
 	if startErr != nil {
 		return 0, fmt.Errorf("start FUSE hub subprocess: %w", startErr)
 	}
@@ -1235,13 +1246,13 @@ func StartHubSubprocess(exePath, mntDir, sockPath, pidFile string, initial []Hub
 		select {
 		case waitErr := <-exited:
 			_ = os.Remove(pidFile)
-			return 0, fmt.Errorf("FUSE hub exited before mounting %q: %w", mntDir, waitErr)
+			return 0, appendDaemonStderr(fmt.Errorf("FUSE hub exited before mounting %q: %w", mntDir, waitErr), errPath)
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
 
 	_ = cmd.Process.Signal(syscall.SIGTERM)
-	return 0, fmt.Errorf("timed out waiting for FUSE hub mount at %q", mntDir)
+	return 0, appendDaemonStderr(fmt.Errorf("timed out waiting for FUSE hub mount at %q", mntDir), errPath)
 }
 
 func callHubSocket(sockPath string, req hubControlRequest) (hubControlResponse, error) {

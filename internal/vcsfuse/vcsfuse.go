@@ -2158,10 +2158,16 @@ func StartSubprocess(exePath, srcDir, mntDir, pidFile string, dieWithParent bool
 	if err := ensureSafeMountDir(filepath.Dir(pidFile)); err != nil {
 		return 0, fmt.Errorf("prepare pidfile directory: %w", err)
 	}
+	errPath := daemonStderrPath(pidFile)
+	errFile, err := openDaemonStderrFile(errPath)
+	if err != nil {
+		return 0, err
+	}
 
 	cmd := exec.Command(exePath, SubcommandName, "-src", srcDir, "-mnt", mntDir, "-map-guest-ids", "-guest-uid", "1000", "-guest-gid", "1000")
+	cmd.Stdin = nil
 	cmd.Stdout = nil
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = errFile
 	if dieWithParent {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Pdeathsig: syscall.SIGTERM,
@@ -2172,8 +2178,10 @@ func StartSubprocess(exePath, srcDir, mntDir, pidFile string, dieWithParent bool
 		}
 	}
 
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start FUSE filter subprocess: %w", err)
+	startErr := cmd.Start()
+	_ = errFile.Close()
+	if startErr != nil {
+		return 0, fmt.Errorf("start FUSE filter subprocess: %w", startErr)
 	}
 	pid := cmd.Process.Pid
 
@@ -2198,14 +2206,55 @@ func StartSubprocess(exePath, srcDir, mntDir, pidFile string, dieWithParent bool
 		select {
 		case waitErr := <-exited:
 			_ = os.Remove(pidFile)
-			return 0, fmt.Errorf("FUSE filter exited before mounting %q: %w", mntDir, waitErr)
+			return 0, appendDaemonStderr(fmt.Errorf("FUSE filter exited before mounting %q: %w", mntDir, waitErr), errPath)
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
 
 	// Stop the child process if the mount timed out.
 	_ = cmd.Process.Signal(syscall.SIGTERM)
-	return 0, fmt.Errorf("timed out waiting for FUSE mount at %q", mntDir)
+	return 0, appendDaemonStderr(fmt.Errorf("timed out waiting for FUSE mount at %q", mntDir), errPath)
+}
+
+func daemonStderrPath(pidFile string) string {
+	if strings.HasSuffix(pidFile, ".pid") {
+		return strings.TrimSuffix(pidFile, ".pid") + ".err"
+	}
+	return pidFile + ".err"
+}
+
+func openDaemonStderrFile(errPath string) (*os.File, error) {
+	if err := ensureSafeMountDir(filepath.Dir(errPath)); err != nil {
+		return nil, fmt.Errorf("prepare daemon log directory: %w", err)
+	}
+	if info, err := os.Lstat(errPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("refusing non-regular daemon stderr log path %q", errPath)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspect daemon stderr log path %q: %w", errPath, err)
+	}
+	fd, err := unix.Open(errPath, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open daemon stderr log %q: %w", errPath, err)
+	}
+	_ = unix.Fchmod(fd, 0o600)
+	return os.NewFile(uintptr(fd), errPath), nil
+}
+
+func appendDaemonStderr(prefixErr error, errPath string) error {
+	f, err := os.Open(errPath)
+	if err != nil {
+		return prefixErr
+	}
+	defer f.Close()
+	buf := make([]byte, 4096)
+	n, _ := f.Read(buf)
+	detail := strings.TrimSpace(string(buf[:n]))
+	if detail == "" {
+		return prefixErr
+	}
+	return fmt.Errorf("%w (%s)", prefixErr, detail)
 }
 
 func ensureSafeMountDir(dir string) error {
