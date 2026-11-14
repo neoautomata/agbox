@@ -1206,6 +1206,10 @@ func RemoveProfileDir(dataDir, rawName string) error {
 // Global skills, hooks, plugins, and MCP configs remain outside the profile disk.
 func BuildGuestProfileMountScript() string {
 	return `set -eu
+if ! grep -qs ' /home/agent/.agbox-profile ' /proc/self/mountinfo; then
+  echo "profile disk is not mounted at /home/agent/.agbox-profile" >&2
+  exit 1
+fi
 mkdir -p \
   /home/agent/.agbox-profile \
   /home/agent/.agbox-profile/agy-cli \
@@ -1266,6 +1270,7 @@ fi
 if ! grep -qs ' /home/agent/.local/state/opencode ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-profile/opencode-state /home/agent/.local/state/opencode
 fi
+sync
 `
 }
 

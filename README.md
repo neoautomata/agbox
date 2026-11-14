@@ -215,7 +215,7 @@ Run the automated verification harness (`./test.sh`) from the repository root. B
 - `./test.sh`: Quick non-disruptive run covering static checks, race-tested unit tests, FUSE Workspace Hub, and core microVM workflows
 - `./test.sh --full`: Extended non-disruptive run adding firewall, FD revocation, lock contention, authenticated `--serve`, live update, and isolated lifecycle checks
 - `./test.sh --skip-vm`: Offline unit, style, CLI security contract, fake-`msb` validation, and FUSE Workspace Hub checks for environments without KVM or `msb`
-- `./test.sh --disruptive`: Clean-slate test that backs up host state, clears and reinstalls default host binaries and snapshots, verifies fresh setup, and restores original host state on exit
+- `./test.sh --disruptive`: Clean-slate test that backs up and restores the installed `agbox` binary (`ORIG_INSTALL_BIN`) while running `agbox remove --yes` before and after testing to verify a fresh `./install.sh`, `setup`, and `create-base` lifecycle
 - `./test.sh --full --disruptive`: Maximum end-to-end coverage combining the extended suite with the clean-slate host lifecycle
 
 Prerequisites: Go, `msb`, `/dev/kvm`, and FUSE for full runs (only Go and FUSE, or root for direct FUSE mounts without `fusermount`, for `--skip-vm`). Run `./test.sh --help` for filtering, logging, and root options, and see [`AGENTS.md`](AGENTS.md) for `test.sh` authoring rules and integration contracts.

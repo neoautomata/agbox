@@ -326,6 +326,7 @@ func TestProfileLockMetadataAndSessionIDValidation(t *testing.T) {
 	// Verify profile mount script isolates conversations and excludes global skills/mcp/plugins.
 	profScript := BuildGuestProfileMountScript()
 	for _, want := range []string{
+		"grep -qs ' /home/agent/.agbox-profile ' /proc/self/mountinfo",
 		"/home/agent/.agbox-profile/agy-cli",
 		"/home/agent/.agbox-profile/agy-projects",
 		"/home/agent/.agbox-profile/opencode-data",
@@ -334,6 +335,9 @@ func TestProfileLockMetadataAndSessionIDValidation(t *testing.T) {
 		if !strings.Contains(profScript, want) {
 			t.Errorf("profile mount script missing %q", want)
 		}
+	}
+	if !strings.HasSuffix(strings.TrimSpace(profScript), "sync") {
+		t.Errorf("profile mount script should end with sync, got %q", profScript)
 	}
 	for _, forbidden := range []string{
 		"/home/agent/.gemini/config/skills",

@@ -57,6 +57,7 @@ AGBOX_BUILT=0
 DISRUPTIVE_SETUP_DONE=0
 DISRUPTIVE_CLEANUP_DONE=0
 CLEANUP_RAN=0
+ACTIVE_CHILD_PGID=""
 EUID_VAL="$(id -u)"
 
 declare -a RESULT_IDS=()
@@ -243,6 +244,17 @@ agbox_exec() {
   fi
 }
 
+kill_active_child() {
+  if [[ -n "${ACTIVE_CHILD_PGID:-}" ]]; then
+    kill -TERM -- "-${ACTIVE_CHILD_PGID}" "${ACTIVE_CHILD_PGID}" 2>/dev/null || true
+    ACTIVE_CHILD_PGID=""
+  fi
+  local jpid=""
+  for jpid in $(jobs -pr 2>/dev/null || true); do
+    kill -TERM "${jpid}" 2>/dev/null || true
+  done
+}
+
 _run_with_timeout() {
   local secs="$1"
   local stdin_mode="$2"
@@ -278,11 +290,27 @@ _run_with_timeout() {
     cmd=("$@")
   fi
 
-  if [[ "${stdin_mode}" == "keep" ]]; then
-    timeout --kill-after=15s "${secs}s" "${cmd[@]}"
-  else
-    timeout --kill-after=15s "${secs}s" "${cmd[@]}" </dev/null
+  if [[ "${CLEANUP_RAN}" -eq 0 && "${BASH_SUBSHELL}" -gt 0 ]]; then
+    trap 'kill_active_child; exit 130' INT
+    trap 'kill_active_child; exit 143' TERM
+    trap 'kill_active_child; exit 129' HUP
   fi
+
+  local rc=0
+  if [[ "${stdin_mode}" == "keep" ]]; then
+    exec 3<&0
+    timeout --kill-after=15s "${secs}s" "${cmd[@]}" <&3 3<&- &
+    ACTIVE_CHILD_PGID=$!
+    exec 3<&-
+    wait "${ACTIVE_CHILD_PGID}" || rc=$?
+    ACTIVE_CHILD_PGID=""
+  else
+    timeout --kill-after=15s "${secs}s" "${cmd[@]}" </dev/null &
+    ACTIVE_CHILD_PGID=$!
+    wait "${ACTIVE_CHILD_PGID}" || rc=$?
+    ACTIVE_CHILD_PGID=""
+  fi
+  return "${rc}"
 }
 
 with_timeout() {
@@ -508,6 +536,16 @@ global_cleanup() {
   if [[ "${CREATED_CACHE_DIR}" -eq 1 && -d "${HOME_REAL}/.cache" ]]; then
     rmdir "${HOME_REAL}/.cache" 2>/dev/null || true
   fi
+}
+
+handle_interrupt() {
+  local sig="$1"
+  local code="$2"
+  trap - INT TERM HUP
+  kill_active_child
+  warn_msg "Interrupted by ${sig}. Cleaning up and exiting..."
+  global_cleanup
+  exit "${code}"
 }
 
 fingerprint_dir() {
@@ -1222,6 +1260,9 @@ run_check() {
     (
       set -Eeuo pipefail
       trap 'printf "[FAIL LINE %d] %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+      trap 'kill_active_child; exit 130' INT
+      trap 'kill_active_child; exit 143' TERM
+      trap 'kill_active_child; exit 129' HUP
       "${fn_name}" </dev/null
     ) 2>&1 | tee -a "${step_log}"
     rc="${PIPESTATUS[0]}"
@@ -1229,9 +1270,20 @@ run_check() {
     (
       set -Eeuo pipefail
       trap 'printf "[FAIL LINE %d] %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+      trap 'kill_active_child; exit 130' INT
+      trap 'kill_active_child; exit 143' TERM
+      trap 'kill_active_child; exit 129' HUP
       "${fn_name}" </dev/null
     ) >"${step_log}" 2>&1
     rc=$?
+  fi
+
+  if [[ "${rc}" -eq 130 ]]; then
+    handle_interrupt INT 130
+  elif [[ "${rc}" -eq 143 ]]; then
+    handle_interrupt TERM 143
+  elif [[ "${rc}" -eq 129 ]]; then
+    handle_interrupt HUP 129
   fi
 
   end_s="$(date +%s)"
@@ -3074,7 +3126,10 @@ print_final_report() {
 main() {
   parse_args "$@"
   init_environment
-  trap global_cleanup EXIT INT TERM HUP
+  trap global_cleanup EXIT
+  trap 'handle_interrupt INT 130' INT
+  trap 'handle_interrupt TERM 143' TERM
+  trap 'handle_interrupt HUP 129' HUP
 
   log_msg "Starting agbox test suite (mode: full=${FULL_MODE}, disruptive=${DISRUPTIVE_MODE}, skip_vm=${SKIP_VM})"
   log_msg "Logs directory: ${LOG_DIR}"

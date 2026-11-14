@@ -2025,7 +2025,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	var meta config.RunMeta
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
 	sandboxCreated := false
-	persistReady := false
+	sandboxRunning := false
+	sessionReady := false
 	detached := false
 	var cleanupOnce sync.Once
 	cleanup := func() {
@@ -2037,12 +2038,12 @@ func (a *App) Run(ctx context.Context, args []string) error {
 				_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
 				return
 			}
-			if persistReady && sandboxCreated {
+			if opts.Persist && sessionReady && sandboxCreated {
 				a.suspendSandboxOnExit(runSandbox, runFilterDir, meta)
 				return
 			}
 			if sandboxCreated {
-				_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", runSandbox}})
+				_, _ = a.destroySandbox(context.Background(), runSandbox, opts.Profile != "" && sandboxRunning)
 			}
 			_ = mounttab.TeardownFilterDir(runFilterDir, a.MountCtl)
 		})
@@ -2258,6 +2259,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	if res, err := a.MSB.Run(runCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
 		return formatMSBError("snapshot restore failed", res, err)
 	}
+	sandboxRunning = true
 
 	if err := a.ensureGuestUser(runCtx, runSandbox); err != nil {
 		return err
@@ -2295,8 +2297,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	persistReady = opts.Persist
-	return a.execSession(runCtx, meta, runFilterDir, opts.Probe, &detached)
+	return a.execSession(runCtx, meta, runFilterDir, opts.Probe, &detached, &sessionReady)
 }
 
 // Suspend halts a run microVM, saves its metadata, and unmounts host FUSE shares.
@@ -2703,7 +2704,7 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
-	sessionStarted := false
+	sessionReady := false
 	detached := false
 	var cleanupOnce sync.Once
 	cleanup := func() {
@@ -2715,11 +2716,11 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 				_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
 				return
 			}
-			if meta.Persist || !sessionStarted {
+			if meta.Persist || !sessionReady {
 				a.suspendSandboxOnExit(opts.Sandbox, runFilterDir, meta)
 				return
 			}
-			_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", opts.Sandbox}})
+			_, _ = a.destroySandbox(context.Background(), opts.Sandbox, meta.Profile != "")
 			_ = mounttab.TeardownFilterDir(runFilterDir, a.MountCtl)
 		})
 	}
@@ -2775,8 +2776,7 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 	execMeta := meta
 	execMeta.Continue = wantContinue
 	execMeta.ContinueSession = wantSession
-	sessionStarted = true
-	return a.execSession(runCtx, execMeta, runFilterDir, false, &detached)
+	return a.execSession(runCtx, execMeta, runFilterDir, false, &detached, &sessionReady)
 }
 
 func (a *App) resolveRunShareTargets(opts RunOpts) ([]pathsec.ShareTarget, error) {
@@ -2850,7 +2850,7 @@ func (a *App) ensureGuestUser(ctx context.Context, sandbox string) error {
 	return nil
 }
 
-func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir string, probe bool, detached *bool) error {
+func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir string, probe bool, detached *bool, sessionReady *bool) error {
 	runSandbox := meta.Sandbox
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
 	guestEnv := msb.GuestEnvFlags()
@@ -2877,6 +2877,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 				"--", meta.Cmd,
 			},
 		})
+		*sessionReady = true
 		res, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        execArgs,
 			Stdin:       cmdStdin,
@@ -2917,6 +2918,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			}
 			return fmt.Errorf("opencode serve did not become ready on 127.0.0.1:%d", meta.Port)
 		}
+		*sessionReady = !probe
 
 		a.logf("OpenCode web UI: http://127.0.0.1:%d", meta.Port)
 		a.warnf("Loopback TCP (127.0.0.1:%d) is reachable by local host processes. Set OPENCODE_SERVER_PASSWORD for HTTP basic auth. Provider keys stay inside the disposable microVM.", meta.Port)
@@ -2994,6 +2996,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			}
 			return fmt.Errorf("agy remote-control start failed: %w", startErr)
 		}
+		*sessionReady = true
 
 		statusArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: runSandbox,
@@ -3032,6 +3035,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			Env:     guestEnv,
 			Command: []string{"sh", "-c", fmt.Sprintf("%s cd %s && exec %s", msb.KeyLoaderPrefix, quotedWorkDir, inv)},
 		})
+		*sessionReady = true
 		res, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        tuiArgs,
 			Interactive: true,
@@ -3136,6 +3140,17 @@ func tailLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
+// destroySandbox gracefully stops sandboxes that have a mounted ext4 profile disk
+// before calling `msb rm -f`, so guest kernel teardown flushes dirty ext4 pages and journals.
+func (a *App) destroySandbox(ctx context.Context, sandbox string, flushProfile bool) (msb.CommandResult, error) {
+	if flushProfile {
+		stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		_, _ = a.MSB.Run(stopCtx, msb.CommandRequest{Args: []string{"stop", "-t", "10", sandbox}})
+		cancel()
+	}
+	return a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", sandbox}})
+}
+
 // Stop deletes a running or suspended run sandbox and unmounts its FUSE shares.
 func (a *App) Stop(ctx context.Context, args []string) error {
 	name, allowRoot, err := parseStopOpts(args)
@@ -3148,10 +3163,19 @@ func (a *App) Stop(ctx context.Context, args []string) error {
 	if err := a.ensureMSB(); err != nil {
 		return err
 	}
-	rmRes, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", name}})
-	var tdErr error
+	filterDir := ""
+	flushProfile := false
 	if dirID, dErr := RunDirIDFromSandbox(name); dErr == nil {
-		filterDir := filepath.Join(a.Env.DataDir, "run", dirID)
+		filterDir = filepath.Join(a.Env.DataDir, "run", dirID)
+		if !hasMarker(filepath.Join(filterDir, "suspended")) {
+			if meta, mErr := config.LoadRunMeta(filepath.Join(filterDir, "run.meta")); mErr == nil && meta.Profile != "" {
+				flushProfile = true
+			}
+		}
+	}
+	rmRes, rmErr := a.destroySandbox(ctx, name, flushProfile)
+	var tdErr error
+	if filterDir != "" {
 		if _, sErr := os.Stat(filterDir); sErr == nil {
 			tdErr = mounttab.TeardownFilterDir(filterDir, a.MountCtl)
 		}

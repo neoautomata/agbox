@@ -2012,6 +2012,79 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 	if _, err := os.Stat(dev1Dir); !os.IsNotExist(err) {
 		t.Errorf("expected %s to be deleted by stop, err=%v", dev1Dir, err)
 	}
+
+	// 6. Startup failure inside execSession for --persist --remote-control or --persist --serve
+	// must delete the failed sandbox instead of suspending it.
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "both",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		for _, a := range req.Args {
+			if strings.Contains(a, "agy remote-control start") {
+				return msb.CommandResult{ExitCode: 1, Stderr: "missing saved antigravity oauth token"}, errors.New("exit 1")
+			}
+		}
+		return msb.CommandResult{}, nil
+	}
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--no-auth", "--persist", "--name", "rcfail", "-d", "--remote-control", "antigravity", projA}); rc == 0 {
+		t.Fatal("expected --persist -d --remote-control startup failure to fail")
+	}
+	rcFailDir := filepath.Join(app.Env.DataDir, "run", "rcfail")
+	if _, err := os.Stat(rcFailDir); !os.IsNotExist(err) {
+		t.Errorf("expected failed rc run dir %s to be cleaned up, err=%v", rcFailDir, err)
+	}
+	foundRCRM := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "agbox-rcfail"}) {
+			t.Fatal("failed --persist -d --remote-control called msb stop instead of cleaning up")
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-rcfail"}) {
+			foundRCRM = true
+		}
+	}
+	if !foundRCRM {
+		t.Error("expected failed --persist -d --remote-control startup to delete agbox-rcfail with msb rm -f")
+	}
+
+	origWaitServe := app.WaitServeUI
+	app.WaitServeUI = func(context.Context, int, string) bool { return false }
+	runner.handler = nil
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "srvfail", "-d", "--serve", "opencode", projA}); rc == 0 {
+		app.WaitServeUI = origWaitServe
+		t.Fatal("expected --persist -d --serve readiness failure to fail")
+	}
+	app.WaitServeUI = origWaitServe
+	srvFailDir := filepath.Join(app.Env.DataDir, "run", "srvfail")
+	if _, err := os.Stat(srvFailDir); !os.IsNotExist(err) {
+		t.Errorf("expected failed serve run dir %s to be cleaned up, err=%v", srvFailDir, err)
+	}
+	foundSrvRM := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "agbox-srvfail"}) {
+			t.Fatal("failed --persist -d --serve called msb stop instead of cleaning up")
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-srvfail"}) {
+			foundSrvRM = true
+		}
+	}
+	if !foundSrvRM {
+		t.Error("expected failed --persist -d --serve startup to delete agbox-srvfail with msb rm -f")
+	}
 }
 
 func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
@@ -2084,8 +2157,9 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 	foundDiskMount := false
 	foundProfileBind := false
 	foundConv := false
-	foundEphemeralRM := false
-	for _, c := range runner.calls {
+	stopIdx := -1
+	rmIdx := -1
+	for i, c := range runner.calls {
 		joined := strings.Join(c.Args, " ")
 		if strings.HasPrefix(joined, "snap restore ") && strings.Contains(joined, "--mount-disk "+wantDiskFlag) {
 			foundDiskMount = true
@@ -2096,12 +2170,41 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 		if strings.Contains(joined, "exec agy --conversation '1c2a8c1e'") {
 			foundConv = true
 		}
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", "agbox-ephem1"}) {
+			stopIdx = i
+		}
 		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-ephem1"}) {
-			foundEphemeralRM = true
+			rmIdx = i
 		}
 	}
-	if !foundDiskMount || !foundProfileBind || !foundConv || !foundEphemeralRM {
-		t.Fatalf("profile run checks: disk=%v bind=%v conv=%v rm=%v", foundDiskMount, foundProfileBind, foundConv, foundEphemeralRM)
+	if !foundDiskMount || !foundProfileBind || !foundConv || stopIdx < 0 || rmIdx <= stopIdx {
+		t.Fatalf("profile run checks: disk=%v bind=%v conv=%v stopIdx=%d rmIdx=%d", foundDiskMount, foundProfileBind, foundConv, stopIdx, rmIdx)
+	}
+
+	// Verify `agbox stop` flushes a running profile sandbox before deleting it.
+	stopRunDir := filepath.Join(app.Env.DataDir, "run", "ephem-stop")
+	if err := config.SaveRunMeta(filepath.Join(stopRunDir, "run.meta"), config.RunMeta{
+		Sandbox: "agbox-ephem-stop",
+		Profile: "workprof",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"stop", "agbox-ephem-stop"}); rc != 0 {
+		t.Fatalf("agbox stop profile sandbox failed: %s", stderr.String())
+	}
+	manualStopIdx := -1
+	manualRMIdx := -1
+	for i, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", "agbox-ephem-stop"}) {
+			manualStopIdx = i
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-ephem-stop"}) {
+			manualRMIdx = i
+		}
+	}
+	if manualStopIdx < 0 || manualRMIdx <= manualStopIdx {
+		t.Fatalf("expected agbox stop on profile sandbox to run stop -t 10 before rm -f (stopIdx=%d rmIdx=%d)", manualStopIdx, manualRMIdx)
 	}
 
 	// Verify `msb volume inspect` path overrides the MSB_HOME fallback when present.
