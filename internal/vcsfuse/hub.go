@@ -922,9 +922,10 @@ func MountWorkspaceHub(mntDir, sockPath string, initial []HubShareConfig, dataDi
 		AttrTimeout:  &ttl,
 		EntryTimeout: &ttl,
 		MountOptions: fuse.MountOptions{
-			FsName:  "agbox-workspace-hub",
-			Name:    "agboxhub",
-			Options: []string{"nosuid", "nodev"},
+			FsName:      "agbox-workspace-hub",
+			Name:        "agboxhub",
+			Options:     []string{"nosuid", "nodev"},
+			DirectMount: os.Geteuid() == 0,
 		},
 	}
 

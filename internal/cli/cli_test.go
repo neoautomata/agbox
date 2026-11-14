@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -231,10 +232,105 @@ type recordedCall struct {
 }
 
 type fakeMSBRunner struct {
-	calls     []recordedCall
-	sandboxes string
-	snapshots string
-	handler   func(req msb.CommandRequest) (msb.CommandResult, error)
+	calls        []recordedCall
+	sandboxes    string
+	snapshots    string
+	defaultUsers map[string]string
+	handler      func(req msb.CommandRequest) (msb.CommandResult, error)
+}
+
+func parseFakeExecCall(args []string) (sandbox, explicitUser, cmdStr string) {
+	cmdStart := len(args)
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			cmdStart = i + 1
+			break
+		}
+		if strings.HasPrefix(a, "--user=") {
+			explicitUser = strings.TrimPrefix(a, "--user=")
+			continue
+		}
+		if strings.HasPrefix(a, "-u=") {
+			explicitUser = strings.TrimPrefix(a, "-u=")
+			continue
+		}
+		switch a {
+		case "-d", "--detach", "-t", "--tty", "--stream", "--no-tty", "--no-stdin":
+		case "-w", "--workdir", "-e", "--env":
+			i++
+		case "-u", "--user":
+			if i+1 < len(args) {
+				explicitUser = args[i+1]
+				i++
+			}
+		default:
+			if !strings.HasPrefix(a, "-") && sandbox == "" {
+				sandbox = a
+			}
+		}
+	}
+	if cmdStart < len(args) {
+		cmdStr = strings.Join(args[cmdStart:], " ")
+	}
+	return sandbox, explicitUser, cmdStr
+}
+
+func execCommandRequiresRoot(cmdStr string) bool {
+	for _, tok := range []string{
+		"mount --bind",
+		"remount,ro,bind",
+		"/etc/agbox-global-rules",
+		"/etc/sudoers.d/",
+		"drop_caches",
+		"npm install -g",
+		"ln -sfn /home/agent/.local/bin/agy /usr/local/bin/agy",
+	} {
+		if strings.Contains(cmdStr, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeMSBRunner) trackDefaultUsers(args []string) {
+	if len(args) == 0 {
+		return
+	}
+	if f.defaultUsers == nil {
+		f.defaultUsers = make(map[string]string)
+	}
+	isCreate := args[0] == "create"
+	isRestore := len(args) >= 2 && args[0] == "snap" && args[1] == "restore"
+	if isCreate || isRestore {
+		var name string
+		user := "root"
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "--name":
+				if i+1 < len(args) {
+					name = args[i+1]
+					i++
+				}
+			case "-u", "--user":
+				if i+1 < len(args) {
+					user = args[i+1]
+					i++
+				}
+			}
+		}
+		if name != "" {
+			f.defaultUsers[name] = user
+		}
+		return
+	}
+	if len(args) >= 2 && args[0] == "rm" {
+		for _, a := range args[1:] {
+			if !strings.HasPrefix(a, "-") {
+				delete(f.defaultUsers, a)
+			}
+		}
+	}
 }
 
 func (f *fakeMSBRunner) Run(_ context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
@@ -244,6 +340,27 @@ func (f *fakeMSBRunner) Run(_ context.Context, req msb.CommandRequest) (msb.Comm
 		stdinStr = string(raw)
 	}
 	f.calls = append(f.calls, recordedCall{Args: slices.Clone(req.Args), Stdin: stdinStr})
+	f.trackDefaultUsers(req.Args)
+
+	if len(req.Args) >= 1 && req.Args[0] == "exec" {
+		sandbox, explicitUser, cmdStr := parseFakeExecCall(req.Args)
+		effectiveUser := explicitUser
+		if effectiveUser == "" {
+			if u, ok := f.defaultUsers[sandbox]; ok {
+				effectiveUser = u
+			} else if IsRunSandboxName(sandbox) {
+				effectiveUser = config.GuestUser
+			} else {
+				effectiveUser = "root"
+			}
+		}
+		if execCommandRequiresRoot(cmdStr) && effectiveUser != "root" {
+			return msb.CommandResult{
+				Stderr:   "mount: must be superuser",
+				ExitCode: 1,
+			}, fmt.Errorf("guest command requires root (got user=%s)", effectiveUser)
+		}
+	}
 
 	if f.handler != nil {
 		return f.handler(req)
@@ -1162,6 +1279,8 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 	}
 	foundCreateNet := false
 	foundAgyTLS := false
+	foundBaseApt := false
+	foundBaseTools := false
 	for _, c := range runner.calls {
 		joined := strings.Join(c.Args, " ")
 		if strings.HasPrefix(joined, "create ") {
@@ -1184,12 +1303,18 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 				}
 			}
 		}
+		if strings.Contains(joined, "apt-get install") && strings.Contains(joined, "shellcheck") && strings.Contains(joined, "pipx") {
+			foundBaseApt = true
+		}
+		if strings.Contains(joined, "pipx install --force mdformat") && strings.Contains(joined, "shellcheck --version") {
+			foundBaseTools = true
+		}
 		if strings.Contains(joined, "antigravity.google") {
 			foundAgyTLS = strings.Contains(joined, "=https") && strings.Contains(joined, "--tlsv1.2 -fsSL --")
 		}
 	}
-	if !foundCreateNet || !foundAgyTLS {
-		t.Errorf("CreateBase missing network isolation (%v) or TLS curl flags (%v)", foundCreateNet, foundAgyTLS)
+	if !foundCreateNet || !foundAgyTLS || !foundBaseApt || !foundBaseTools {
+		t.Errorf("CreateBase missing network isolation (%v), TLS curl flags (%v), base apt (%v), or base tools (%v)", foundCreateNet, foundAgyTLS, foundBaseApt, foundBaseTools)
 	}
 
 	// Provisioning failure in CreateBase must clean up partial agbox-base.
@@ -2822,4 +2947,238 @@ func TestShareLiveAndSuspended(t *testing.T) {
 	if !usedLegacyFilter {
 		t.Fatal("expected legacy WorkspaceHub=false sandbox to resume using StartFilter")
 	}
+}
+
+func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "both",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Seed saved antigravity auth, one global skill, and one global rule.
+	if err := persist.SaveAuthBundle(app.Env.DataDir, persist.AuthBundle{
+		Files: []persist.AuthFile{
+			{
+				Agent: "antigravity",
+				Name:  "antigravity-oauth-token",
+				Data:  []byte("oauth-token-blip-test"),
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SaveAuthBundle: %v", err)
+	}
+
+	skillSrc := filepath.Join(t.TempDir(), "blip-skill")
+	if err := os.MkdirAll(skillSrc, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillSrc, "SKILL.md"), []byte("---\nname: blip-skill\ndescription: Test skill.\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rc := app.Dispatch(ctx, []string{"skills", "add", skillSrc}); rc != 0 {
+		t.Fatalf("skills add failed: %s", stderr.String())
+	}
+
+	ruleSrc := filepath.Join(t.TempDir(), "blip-rule.md")
+	if err := os.WriteFile(ruleSrc, []byte("# Blip Rule\nAlways run tests.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rc := app.Dispatch(ctx, []string{"rules", "add", ruleSrc}); rc != 0 {
+		t.Fatalf("rules add failed: %s", stderr.String())
+	}
+
+	repoDir := filepath.Join(app.Env.HomeReal, "agbox")
+	if err := os.MkdirAll(repoDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Run the persistent detached remote-control command with auth, skill, and rule present.
+	runner.calls = nil
+	stdout.Reset()
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "blip", "-d", "--remote-control", repoDir}); rc != 0 {
+		t.Fatalf("run --persist --name blip -d --remote-control failed (rc=%d): %s", rc, stderr.String())
+	}
+
+	detachedPath := filepath.Join(app.Env.DataDir, "run", "blip", "detached")
+	if _, err := os.Stat(detachedPath); err != nil {
+		t.Fatalf("expected detached marker at %s: %v", detachedPath, err)
+	}
+
+	foundRootSkills := false
+	foundRootRules := false
+	foundAgentAuth := false
+	foundRCStart := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-blip"}) {
+			t.Fatal("successful --persist detached run deleted agbox-blip")
+		}
+		sbx, explicitUser, cmdStr := parseFakeExecCall(c.Args)
+		if len(c.Args) >= 1 && c.Args[0] == "exec" && sbx == "agbox-blip" {
+			if strings.Contains(cmdStr, "/home/agent/.gemini/config/skills") {
+				if explicitUser != "root" {
+					t.Fatalf("setupGuestSkills must pass -u root, got args %v", c.Args)
+				}
+				foundRootSkills = true
+			}
+			if strings.Contains(cmdStr, "/etc/agbox-global-rules") {
+				if explicitUser != "root" {
+					t.Fatalf("setupGuestRules must pass -u root, got args %v", c.Args)
+				}
+				foundRootRules = true
+			}
+			if strings.Contains(c.Stdin, "oauth-token-blip-test") || strings.Contains(c.Stdin, "antigravity-oauth-token") {
+				if explicitUser != config.GuestUser {
+					t.Fatalf("pushAuth must pass -u %s, got args %v", config.GuestUser, c.Args)
+				}
+				foundAgentAuth = true
+			}
+			if strings.Contains(cmdStr, "agy remote-control start --name 'agbox-blip'") {
+				if explicitUser != config.GuestUser {
+					t.Fatalf("remote-control start must pass -u %s, got args %v", config.GuestUser, c.Args)
+				}
+				foundRCStart = true
+			}
+		}
+	}
+	if !foundRootSkills || !foundRootRules || !foundAgentAuth || !foundRCStart {
+		t.Fatalf("run checks failed: skills=%v rules=%v auth=%v rcStart=%v",
+			foundRootSkills, foundRootRules, foundAgentAuth, foundRCStart)
+	}
+
+	// 3. Suspend and resume agbox-blip and verify root exec flags repeat cleanly on resume.
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-blip running\n"
+	if rc := app.Dispatch(ctx, []string{"suspend", "agbox-blip"}); rc != 0 {
+		t.Fatalf("suspend agbox-blip failed: %s", stderr.String())
+	}
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-blip stopped\n"
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"resume", "agbox-blip"}); rc != 0 {
+		t.Fatalf("resume agbox-blip failed: %s", stderr.String())
+	}
+	resumedSkills := false
+	resumedRules := false
+	for _, c := range runner.calls {
+		sbx, explicitUser, cmdStr := parseFakeExecCall(c.Args)
+		if len(c.Args) >= 1 && c.Args[0] == "exec" && sbx == "agbox-blip" {
+			if strings.Contains(cmdStr, "/home/agent/.gemini/config/skills") && explicitUser == "root" {
+				resumedSkills = true
+			}
+			if strings.Contains(cmdStr, "/etc/agbox-global-rules") && explicitUser == "root" {
+				resumedRules = true
+			}
+		}
+	}
+	if !resumedSkills || !resumedRules {
+		t.Fatalf("resume missing -u root skills (%v) or rules (%v)", resumedSkills, resumedRules)
+	}
+	if rc := app.Dispatch(ctx, []string{"stop", "agbox-blip"}); rc != 0 {
+		t.Fatalf("stop agbox-blip failed: %s", stderr.String())
+	}
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+
+	// 4. Real *exec.ExitError on snap restore and guest setup prints [agbox] ERROR and captured stderr.
+	exit7Err := exec.Command("sh", "-c", "exit 7").Run()
+	if exit7Err == nil {
+		t.Fatal("expected sh exit 7 to produce an error")
+	}
+
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
+			return msb.CommandResult{
+				Stderr:   "restore volume missing\n",
+				ExitCode: 7,
+			}, exit7Err
+		}
+		return msb.CommandResult{}, nil
+	}
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "failrestore", "-d", "--remote-control", repoDir}); rc != 7 {
+		t.Fatalf("expected rc=7 on snap restore ExitError, got rc=%d, stderr=%q", rc, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "[agbox] ERROR:") || !strings.Contains(stderr.String(), "restore volume missing") {
+		t.Fatalf("expected snap restore error and msb stderr in output, got %q", stderr.String())
+	}
+	foundRM := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-failrestore"}) {
+			foundRM = true
+		}
+	}
+	if !foundRM {
+		t.Error("expected partial agbox-failrestore VM to be deleted after snap restore failure")
+	}
+
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" && strings.Contains(strings.Join(req.Args, " "), "/home/agent/.gemini/config/skills") {
+			return msb.CommandResult{
+				Stderr:   "mount permission denied\n",
+				ExitCode: 7,
+			}, exit7Err
+		}
+		return msb.CommandResult{}, nil
+	}
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "failskills", "-d", "--remote-control", repoDir}); rc != 7 {
+		t.Fatalf("expected rc=7 on setupGuestSkills ExitError, got rc=%d, stderr=%q", rc, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "[agbox] ERROR:") || !strings.Contains(stderr.String(), "mount permission denied") {
+		t.Fatalf("expected setupGuestSkills error and msb stderr in output, got %q", stderr.String())
+	}
+	foundRM = false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-failskills"}) {
+			foundRM = true
+		}
+	}
+	if !foundRM {
+		t.Error("expected partial agbox-failskills VM to be deleted after setupGuestSkills failure")
+	}
+
+	// 5. Real *exec.ExitError on interactive --cmd session exits cleanly without extra [agbox] ERROR line.
+	exit23Err := exec.Command("sh", "-c", "exit 23").Run()
+	if exit23Err == nil {
+		t.Fatal("expected sh exit 23 to produce an error")
+	}
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" && req.Interactive {
+			return msb.CommandResult{ExitCode: 23}, exit23Err
+		}
+		return msb.CommandResult{}, nil
+	}
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "false", repoDir}); rc != 23 {
+		t.Fatalf("expected --cmd ExitError passthrough rc=23, got rc=%d, stderr=%q", rc, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "[agbox] ERROR:") {
+		t.Fatalf("did not expect [agbox] ERROR wrapper on interactive --cmd exit, got %q", stderr.String())
+	}
+	runner.handler = nil
 }

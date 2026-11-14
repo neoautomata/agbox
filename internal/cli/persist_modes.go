@@ -229,8 +229,8 @@ func (a *App) Auth(ctx context.Context, args []string) error {
 
 	a.logf("Booting disposable login microVM %s (zero host shares)...", authSandbox)
 	sandboxCreated = true
-	if _, err := a.MSB.Run(authCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
-		return fmt.Errorf("snapshot restore failed: %w", err)
+	if res, err := a.MSB.Run(authCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
+		return formatMSBError("snapshot restore failed", res, err)
 	}
 	if err := a.ensureGuestUser(authCtx, authSandbox); err != nil {
 		return err
@@ -272,7 +272,7 @@ func (a *App) Auth(ctx context.Context, args []string) error {
 		Args: []string{"exec", "-u", config.GuestUser, authSandbox, "--", "sh", "-c", capScript},
 	})
 	if err != nil {
-		return fmt.Errorf("capture %s credentials: %w", agent, err)
+		return formatMSBError(fmt.Sprintf("capture %s credentials", agent), capRes, err)
 	}
 	bundle, err := persist.ParseAuthCapture(agent, capRes.Stdout)
 	if err != nil {
@@ -765,7 +765,7 @@ func (a *App) Profile(ctx context.Context, args []string) error {
 
 		lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 		if err != nil {
-			return fmt.Errorf("list sandboxes: %w", err)
+			return formatMSBError("list sandboxes", lsRes, err)
 		}
 		sandboxes := msb.ParseSandboxList(lsRes.Stdout)
 		if err := a.checkProfileRemovable(opts.Name, opts.Force, sandboxes); err != nil {
@@ -778,8 +778,8 @@ func (a *App) Profile(ctx context.Context, args []string) error {
 			return err
 		}
 		if exists {
-			if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"volume", "rm", volName}}); err != nil {
-				return fmt.Errorf("delete volume %s: %w", volName, err)
+			if rmRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"volume", "rm", volName}}); err != nil {
+				return formatMSBError("delete volume "+volName, rmRes, err)
 			}
 		}
 		_ = lock.Unlock()
@@ -807,8 +807,8 @@ func (a *App) ensureProfileVolume(ctx context.Context, profileName, size string)
 			return "", err
 		}
 		a.logf("Creating ext4 profile disk volume %s (%s)...", volName, size)
-		if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: createArgs}); err != nil {
-			return "", fmt.Errorf("create profile disk volume %s: %w", volName, err)
+		if crRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: createArgs}); err != nil {
+			return "", formatMSBError("create profile disk volume "+volName, crRes, err)
 		}
 	}
 	if err := persist.SaveProfileMeta(a.Env.DataDir, persist.ProfileMeta{
@@ -889,11 +889,11 @@ func (a *App) pushAuth(ctx context.Context, sandbox, effectiveAgent string) erro
 	if err != nil {
 		return fmt.Errorf("format login restore script: %w", err)
 	}
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
+	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
 		Args:  []string{"exec", "-u", config.GuestUser, sandbox, "--", "sh"},
 		Stdin: strings.NewReader(script),
 	}); err != nil {
-		return fmt.Errorf("stream saved login credentials into %s: %w", sandbox, err)
+		return formatMSBError("stream saved login credentials into "+sandbox, res, err)
 	}
 	a.logf("Streamed saved login credentials into %s.", sandbox)
 	return nil
@@ -901,30 +901,30 @@ func (a *App) pushAuth(ctx context.Context, sandbox, effectiveAgent string) erro
 
 func (a *App) setupGuestSkills(ctx context.Context, sandbox string) error {
 	script := persist.BuildGuestSkillsMountScript()
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", sandbox, "--", "sh", "-c", script},
+	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", script},
 	}); err != nil {
-		return fmt.Errorf("bind-mount global skills in %s: %w", sandbox, err)
+		return formatMSBError("bind-mount global skills in "+sandbox, res, err)
 	}
 	return nil
 }
 
 func (a *App) setupGuestRules(ctx context.Context, sandbox string) error {
 	script := persist.BuildGuestRulesMountScript()
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", sandbox, "--", "sh", "-c", script},
+	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", script},
 	}); err != nil {
-		return fmt.Errorf("bind-mount global rules in %s: %w", sandbox, err)
+		return formatMSBError("bind-mount global rules in "+sandbox, res, err)
 	}
 	return nil
 }
 
 func (a *App) setupGuestProfile(ctx context.Context, sandbox string) error {
 	script := persist.BuildGuestProfileMountScript()
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", sandbox, "--", "sh", "-c", script},
+	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", script},
 	}); err != nil {
-		return fmt.Errorf("bind-mount conversation profile in %s: %w", sandbox, err)
+		return formatMSBError("bind-mount conversation profile in "+sandbox, res, err)
 	}
 	return nil
 }

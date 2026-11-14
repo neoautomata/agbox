@@ -634,7 +634,7 @@ if [ -f "$src/bin/agy" ] && [ ! -L "$src/bin/agy" ]; then
     install -m 0755 -o 1000 -g 1000 /dev/null /home/agent/.local/bin/agy
   fi
   mount --bind "$src/bin/agy" /home/agent/.local/bin/agy
-  mount -o remount,ro,bind /home/agent/.local/bin/agy
+  mount -o remount,ro,bind /home/agent/.local/bin/agy 2>/dev/null || true
   ln -sfn /home/agent/.local/bin/agy /usr/local/bin/agy
 fi
 
@@ -644,7 +644,7 @@ if [ -f "$src/bin/opencode" ] && [ ! -L "$src/bin/opencode" ]; then
     install -m 0755 /dev/null /usr/local/bin/opencode
   fi
   mount --bind "$src/bin/opencode" /usr/local/bin/opencode
-  mount -o remount,ro,bind /usr/local/bin/opencode
+  mount -o remount,ro,bind /usr/local/bin/opencode 2>/dev/null || true
 fi
 `, msb.ShellQuote(msb.GuestAgentsMount))
 }

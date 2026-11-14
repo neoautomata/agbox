@@ -34,6 +34,7 @@ All defaults must choose the most restrictive behavior. Any privilege expansion 
 - Abort immediately if any validation, FUSE mount, socket bind, network rule, snapshot lookup, or secret transfer fails.
 - Never fall back to weaker isolation (such as raw directory mounts when `AGBOX_MASK_VCS=strict` or unauthenticated sockets) on error.
 - Clean up partial microVMs, mounts, and state directories on failure.
+- Exit silently with a child status code only for direct interactive session exits (`--cmd` and TUI). Print `[agbox] ERROR: ...` with captured `msb` diagnostics for every setup, mount, or `msb` failure.
 
 ### Host Execution and State Permissions
 
@@ -68,10 +69,12 @@ All defaults must choose the most restrictive behavior. Any privilege expansion 
 - Never pass API keys or auth tokens in CLI arguments or bake them into snapshots. Stream secrets over `stdin` into `0600` files inside the guest.
 - Run `agbox auth` and `agbox update` inside disposable zero-share microVMs. `agbox update` must also pass zero API keys and zero saved login tokens, verify ELF magic (`\x7fELF`), size bounds, `st_nlink == 1`, and SHA-256 digests in `manifest.json`.
 - Mount `$DATA_DIR/skills`, `$DATA_DIR/rules`, and `$DATA_DIR/agents` read-only (`:ro`) from the host and re-bind them read-only (`ro,bind`) inside the guest after rejecting symlinks via `Lstat`.
+- Always pass an explicit `-u root` or `-u agent` flag to `msb exec`. Because `msb snap restore -u agent` sets the default `msb exec` user to `agent`, every privileged guest setup or cache-flush command must pass `-u root`.
 - Guard each `--profile` `ext4` volume with an exclusive host `flock` (`profile.lock`).
 
 ### Base-Image Agent Defaults
 
+- `create-base` installs `shellcheck` and `mdformat` in every base snapshot alongside `git`, `ripgrep`, `curl`, `less`, `procps`, and `sudo`.
 - `create-base` initializes default guest agent configs inside `/home/agent` (without overwriting user customizations on `edit-base` or `--profile`):
   - `agy` (`/home/agent/.gemini/antigravity-cli/settings.json`): `"toolPermission": "always-proceed"` (`turbo`), `"queuedMessages": "send-immediately"`, `"allowNonWorkspaceAccess": true`, and `"trustedWorkspaces": ["/workspace"]`.
   - `opencode` (`/home/agent/.config/opencode/opencode.json`): `"permission": "allow"` (`general.followup` defaults to `"steer"`).
@@ -85,7 +88,7 @@ ______________________________________________________________________
   - Keep sentences short and focused on one instruction or claim.
   - Keep noun clusters to three words or fewer where practical.
   - Avoid marketing adjectives and vague qualifiers.
-  - **Do not use semicolons (`;`) in Go `//` comments, error strings, CLI help text, `README.md`, or `AGENTS.md` prose.** Split compound clauses into separate sentences instead.
+  - **Do not use semicolons (`;`) in Go `//` comments, error strings, CLI help text, `README.md`, `USER_GUIDE.md`, or `AGENTS.md` prose.** Split compound clauses into separate sentences instead.
 - Format all Go files with `gofmt` and all Markdown files with `mdformat`.
 
 ______________________________________________________________________
@@ -96,8 +99,12 @@ Run these commands from `/workspace/agbox` before finishing any change:
 
 ```bash
 gofmt -w ./cmd ./internal
-mdformat README.md AGENTS.md
+mdformat README.md USER_GUIDE.md AGENTS.md
+bash -n install.sh test.sh
 go vet ./...
 go test -count=1 -race ./...
 go build -o /dev/null ./cmd/agbox
+./test.sh --skip-vm
 ```
+
+On a host with KVM and `msb` available, also run `./test.sh` (or `./test.sh --full` before a release).

@@ -482,7 +482,7 @@ func TestCategoriesAndResolution(t *testing.T) {
 	}
 
 	table := FormatCategoriesTable()
-	for _, kw := range []string{"core", "go", "rust", "esphome", "embedded-rust", "chrome", "hugo", "caddy", "golangci-lint", "clippy", "xcaddy"} {
+	for _, kw := range []string{"core", "go", "rust", "esphome", "embedded-rust", "chrome", "hugo", "caddy", "shellcheck", "golangci-lint", "clippy", "xcaddy"} {
 		if !strings.Contains(table, kw) {
 			t.Errorf("FormatCategoriesTable missing %q", kw)
 		}
@@ -490,6 +490,7 @@ func TestCategoriesAndResolution(t *testing.T) {
 
 	script := BuildCategoriesScript(cats)
 	for _, kw := range []string{
+		"shellcheck",
 		"pipx install --force mdformat",
 		"github.com/go-delve/delve/cmd/dlv@latest",
 		"golang.org/x/tools/gopls@latest",
@@ -693,6 +694,8 @@ printf '%s\0%s\0%s' "$ANTHROPIC_API_KEY" "$OPENAI_API_KEY" "$GEMINI_API_KEY"`
 func TestProvisionGuestUserScriptAgentDefaults(t *testing.T) {
 	script := ProvisionGuestUserScript()
 	for _, want := range []string{
+		"/etc/profile.d/agbox-path.sh",
+		"/usr/local/bin/mdformat",
 		"/home/agent/.agbox-agents",
 		"/home/agent/.gemini/antigravity-cli/settings.json",
 		`"toolPermission": "always-proceed"`,

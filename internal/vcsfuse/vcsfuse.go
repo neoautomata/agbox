@@ -1918,9 +1918,10 @@ func Mount(srcDir, mntDir string, hiddenEntries []string) (*fuse.Server, error) 
 		AttrTimeout:  &sec,
 		EntryTimeout: &sec,
 		MountOptions: fuse.MountOptions{
-			FsName:  resolvedSrc,
-			Name:    "agboxfilter",
-			Options: []string{"nosuid", "nodev"},
+			FsName:      resolvedSrc,
+			Name:        "agboxfilter",
+			Options:     []string{"nosuid", "nodev"},
+			DirectMount: os.Geteuid() == 0,
 		},
 	}
 

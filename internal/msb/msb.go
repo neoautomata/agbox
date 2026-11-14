@@ -1051,7 +1051,10 @@ if [[ -f /root/.local/bin/agy ]]; then
   ln -sf /home/agent/.local/bin/agy /usr/local/bin/agy
   rm -f /root/.local/bin/agy
 fi
-chown -R 1000:1000 "/home/agent" /workspace
+if [[ -x /home/agent/.local/bin/mdformat ]]; then
+  ln -sf /home/agent/.local/bin/mdformat /usr/local/bin/mdformat
+fi
+` + ensureGuestPathProfileSnippet() + `chown -R 1000:1000 "/home/agent" /workspace
 su - "agent" -c "sudo -n true"
 `
 }

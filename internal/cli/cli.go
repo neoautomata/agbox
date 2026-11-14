@@ -40,6 +40,44 @@ import (
 // ErrHelp indicates that `-h` or `--help` was requested.
 var ErrHelp = errors.New("help requested")
 
+type passthroughExitError struct {
+	code int
+	err  error
+}
+
+func (e passthroughExitError) Error() string {
+	return e.err.Error()
+}
+
+func (e passthroughExitError) Unwrap() error {
+	return e.err
+}
+
+func wrapPassthroughExit(res msb.CommandResult, err error) error {
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 {
+		return passthroughExitError{code: exitErr.ExitCode(), err: err}
+	}
+	if res.ExitCode > 0 {
+		return passthroughExitError{code: res.ExitCode, err: err}
+	}
+	return err
+}
+
+func formatMSBError(prefix string, res msb.CommandResult, err error) error {
+	detail := strings.TrimSpace(res.Stderr)
+	if detail == "" {
+		detail = strings.TrimSpace(res.Stdout)
+	}
+	if detail != "" {
+		return fmt.Errorf("%s: %w (%s)", prefix, err, tailLines(detail, 10))
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
+}
+
 // GlobalOpts holds top-level CLI flags that precede the mode name.
 type GlobalOpts struct {
 	AllowRoot bool
@@ -1324,10 +1362,10 @@ func (a *App) Setup(ctx context.Context, args []string) error {
 			_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", smoke}})
 		}
 	}()
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
+	if createRes, err := a.MSB.Run(ctx, msb.CommandRequest{
 		Args: []string{"create", "alpine", "--name", smoke, "--cpus", "1", "--memory", "256M", "--no-net"},
 	}); err != nil {
-		return fmt.Errorf("could not boot smoke-test sandbox: %w", err)
+		return formatMSBError("could not boot smoke-test sandbox", createRes, err)
 	}
 	execRes, err := a.MSB.Run(ctx, msb.CommandRequest{
 		Args: []string{"exec", smoke, "--", "sh", "-c", "echo SMOKE-OK; id -u"},
@@ -1335,8 +1373,8 @@ func (a *App) Setup(ctx context.Context, args []string) error {
 	if err != nil || !strings.Contains(execRes.Stdout, "SMOKE-OK") {
 		return errors.New("smoke test failed: cannot run commands in a sandbox")
 	}
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", smoke}}); err != nil {
-		return fmt.Errorf("delete smoke-test sandbox %s: %w", smoke, err)
+	if rmRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", smoke}}); err != nil {
+		return formatMSBError("delete smoke-test sandbox "+smoke, rmRes, err)
 	}
 	smokeRemoved = true
 	a.logf("Smoke test: OK (guest boots, exec works, teardown clean)")
@@ -1370,8 +1408,8 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 			_, confErr := os.Stat(a.Env.ConfigFile)
 			if opts.Force || os.IsNotExist(confErr) {
 				a.logf("Replacing existing base sandbox %q...", config.BaseSandbox)
-				if _, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", config.BaseSandbox}}); rmErr != nil {
-					return fmt.Errorf("delete existing base sandbox %q: %w", config.BaseSandbox, rmErr)
+				if rmRes, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", config.BaseSandbox}}); rmErr != nil {
+					return formatMSBError(fmt.Sprintf("delete existing base sandbox %q", config.BaseSandbox), rmRes, rmErr)
 				}
 			} else {
 				return fmt.Errorf("base sandbox %q already exists. Edit it with 'agbox edit-base' or rebuild with 'agbox create-base --force %s'", config.BaseSandbox, opts.Agent)
@@ -1414,10 +1452,10 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 		}
 	}()
 
-	a.logf("Provisioning guest (apt baseline + non-root %q user with passwordless sudo)...", config.GuestUser)
-	aptCmd := "apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git ripgrep less procps sudo >/dev/null"
+	a.logf("Provisioning guest (apt baseline, shellcheck, mdformat, and non-root %q user with passwordless sudo)...", config.GuestUser)
+	aptCmd := "apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git ripgrep less procps sudo shellcheck python3 python3-venv pipx >/dev/null"
 	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args:   []string{"exec", "--stream", "--no-stdin", config.BaseSandbox, "--", "sh", "-c", aptCmd},
+		Args:   []string{"exec", "--stream", "--no-stdin", "-u", "root", config.BaseSandbox, "--", "sh", "-c", aptCmd},
 		Stdout: a.Stdout,
 		Stderr: a.Stderr,
 	}); err != nil {
@@ -1428,13 +1466,29 @@ func (a *App) CreateBase(ctx context.Context, args []string) error {
 		return fmt.Errorf("guest user provisioning failed: %w", err)
 	}
 
+	baseToolsScript := fmt.Sprintf(`set -euo pipefail
+su - %s -c 'export PATH="/home/agent/.local/bin:$PATH" && pipx install --force mdformat && rm -rf /home/agent/.cache/pip'
+if [ -x /home/agent/.local/bin/mdformat ]; then
+  ln -sf /home/agent/.local/bin/mdformat /usr/local/bin/mdformat
+fi
+su - %s -c 'export PATH="/home/agent/.local/bin:$PATH" && shellcheck --version >/dev/null && mdformat --version >/dev/null'
+apt-get clean
+rm -rf /var/lib/apt/lists/*`, config.GuestUser, config.GuestUser)
+	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args:   []string{"exec", "--stream", "--no-stdin", "-u", "root", config.BaseSandbox, "--", "bash", "-c", baseToolsScript},
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
+	}); err != nil {
+		return formatMSBError("install baseline tools (shellcheck and mdformat)", res, err)
+	}
+
 	if opts.Agent == "opencode" || opts.Agent == "both" {
 		a.logf("Installing OpenCode (npm opencode-ai@%s)...", a.Env.OpenCodeVersion)
 		ocScript := fmt.Sprintf(`set -euo pipefail
 npm install -g --no-fund --no-audit "opencode-ai@$1"
 su - %q -c "opencode --version"`, config.GuestUser)
 		if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-			Args:   []string{"exec", "--stream", "--no-stdin", config.BaseSandbox, "--", "bash", "-c", ocScript, "--", a.Env.OpenCodeVersion},
+			Args:   []string{"exec", "--stream", "--no-stdin", "-u", "root", config.BaseSandbox, "--", "bash", "-c", ocScript, "--", a.Env.OpenCodeVersion},
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		}); err != nil {
@@ -1452,7 +1506,7 @@ if [ -x /home/agent/.local/bin/agy ]; then
 fi
 su - %s -c "agy --version"`, config.GuestUser, msb.ShellQuote(innerCmd), config.GuestUser)
 		if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-			Args:   []string{"exec", "--stream", "--no-stdin", config.BaseSandbox, "--", "bash", "-c", agyScript},
+			Args:   []string{"exec", "--stream", "--no-stdin", "-u", "root", config.BaseSandbox, "--", "bash", "-c", agyScript},
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		}); err != nil {
@@ -1476,8 +1530,8 @@ su - %s -c "agy --version"`, config.GuestUser, msb.ShellQuote(innerCmd), config.
 	member := fmt.Sprintf("v%d", count)
 
 	a.logf("Stopping base and snapshotting %s...", snapSelector)
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}}); err != nil {
-		return fmt.Errorf("stop base sandbox: %w", err)
+	if stopRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}}); err != nil {
+		return formatMSBError("stop base sandbox", stopRes, err)
 	}
 	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
 		Args:   []string{"snap", "create", member, "--sandbox", config.BaseSandbox, "--group", config.SnapGroup},
@@ -1508,10 +1562,12 @@ su - %s -c "agy --version"`, config.GuestUser, msb.ShellQuote(innerCmd), config.
 }
 
 func (a *App) provisionGuestUser(ctx context.Context, sandbox string) error {
-	_, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", sandbox, "--", "bash", "-c", msb.ProvisionGuestUserScript()},
-	})
-	return err
+	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args: []string{"exec", "-u", "root", sandbox, "--", "bash", "-c", msb.ProvisionGuestUserScript()},
+	}); err != nil {
+		return formatMSBError("provision guest user in "+sandbox, res, err)
+	}
+	return nil
 }
 
 func (a *App) installCategories(ctx context.Context, sandbox string, cats []msb.Category) error {
@@ -1522,7 +1578,7 @@ func (a *App) installCategories(ctx context.Context, sandbox string, cats []msb.
 	a.logf("Installing categories (%s) in %s...", strings.Join(names, ", "), sandbox)
 	script := msb.BuildCategoriesScript(cats)
 	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args:   []string{"exec", "--stream", "--no-stdin", sandbox, "--", "bash", "-c", script},
+		Args:   []string{"exec", "--stream", "--no-stdin", "-u", "root", sandbox, "--", "bash", "-c", script},
 		Stdout: a.Stdout,
 		Stderr: a.Stderr,
 	}); err != nil {
@@ -1553,7 +1609,7 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 
 	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 	if err != nil {
-		return fmt.Errorf("msb ls: %w", err)
+		return formatMSBError("msb ls", lsRes, err)
 	}
 	baseInfo, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), config.BaseSandbox)
 	if !exists {
@@ -1593,8 +1649,8 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 
 	if !baseInfo.Running {
 		a.logf("Starting base sandbox...")
-		if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"start", config.BaseSandbox}}); err != nil {
-			return fmt.Errorf("start base sandbox: %w", err)
+		if startRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"start", config.BaseSandbox}}); err != nil {
+			return formatMSBError("start base sandbox", startRes, err)
 		}
 	}
 
@@ -1609,7 +1665,7 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 	if opts.Cmd != "" {
 		a.logf("Running provisioning command in the base...")
 		if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-			Args:   []string{"exec", "--stream", "--no-stdin", config.BaseSandbox, "--", "sh", "-c", opts.Cmd},
+			Args:   []string{"exec", "--stream", "--no-stdin", "-u", "root", config.BaseSandbox, "--", "sh", "-c", opts.Cmd},
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		}); err != nil {
@@ -1622,7 +1678,7 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 		fmt.Fprintln(a.Stdout, "Interactive shell in the base sandbox.")
 		fmt.Fprintf(a.Stdout, "Changes persist in %q AND (after the snapshot below) in future run microVMs.\n", config.BaseSandbox)
 		if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-			Args:        []string{"exec", "-t", config.BaseSandbox, "--", "sh", "-c", "cd /workspace 2>/dev/null || cd /; bash; exit 0"},
+			Args:        []string{"exec", "-t", "-u", "root", config.BaseSandbox, "--", "sh", "-c", "cd /workspace 2>/dev/null || cd /; bash; exit 0"},
 			Interactive: true,
 		}); err != nil {
 			_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}})
@@ -1636,8 +1692,8 @@ func (a *App) EditBase(ctx context.Context, args []string) error {
 	}
 
 	a.logf("Stopping base...")
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}}); err != nil {
-		return fmt.Errorf("stop base sandbox: %w", err)
+	if stopRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}}); err != nil {
+		return formatMSBError("stop base sandbox", stopRes, err)
 	}
 
 	if opts.NoSnap {
@@ -1783,7 +1839,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 
 	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 	if err != nil {
-		return fmt.Errorf("list sandboxes: %w", err)
+		return formatMSBError("list sandboxes", lsRes, err)
 	}
 	sandboxes := msb.ParseSandboxList(lsRes.Stdout)
 	if existing, exists := msb.FindSandbox(sandboxes, runSandbox); exists {
@@ -2138,8 +2194,8 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		a.logf("Booting ephemeral microVM %s from %s (changes do not persist to the base)...", runSandbox, baseState.Snapshot)
 	}
 	sandboxCreated = true
-	if _, err := a.MSB.Run(runCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
-		return fmt.Errorf("snapshot restore failed: %w", err)
+	if res, err := a.MSB.Run(runCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
+		return formatMSBError("snapshot restore failed", res, err)
 	}
 
 	if err := a.ensureGuestUser(runCtx, runSandbox); err != nil {
@@ -2206,7 +2262,7 @@ func (a *App) Suspend(ctx context.Context, args []string) error {
 
 	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 	if err != nil {
-		return fmt.Errorf("list sandboxes: %w", err)
+		return formatMSBError("list sandboxes", lsRes, err)
 	}
 	sb, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), opts.Sandbox)
 	if !exists {
@@ -2231,11 +2287,11 @@ func (a *App) Suspend(ctx context.Context, args []string) error {
 
 	if sb.Running {
 		a.logf("Stopping microVM %s...", opts.Sandbox)
-		if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", opts.Sandbox}}); err != nil {
+		if stopRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", opts.Sandbox}}); err != nil {
 			if !wasSuspended {
 				_ = os.Remove(suspendedPath)
 			}
-			return fmt.Errorf("stop sandbox %s: %w", opts.Sandbox, err)
+			return formatMSBError("stop sandbox "+opts.Sandbox, stopRes, err)
 		}
 	}
 
@@ -2311,7 +2367,7 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 
 	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 	if err != nil {
-		return fmt.Errorf("list sandboxes: %w", err)
+		return formatMSBError("list sandboxes", lsRes, err)
 	}
 	sandboxes := msb.ParseSandboxList(lsRes.Stdout)
 	sb, exists := msb.FindSandbox(sandboxes, opts.Sandbox)
@@ -2563,9 +2619,9 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 	}
 
 	a.logf("Starting suspended microVM %s...", opts.Sandbox)
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"start", opts.Sandbox}}); err != nil {
+	if startRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"start", opts.Sandbox}}); err != nil {
 		_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
-		return fmt.Errorf("start sandbox %s: %w", opts.Sandbox, err)
+		return formatMSBError("start sandbox "+opts.Sandbox, startRes, err)
 	}
 
 	meta.Sandbox = opts.Sandbox
@@ -2754,7 +2810,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 				"--", meta.Cmd,
 			},
 		})
-		_, err := a.MSB.Run(ctx, msb.CommandRequest{
+		res, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        execArgs,
 			Interactive: true,
 		})
@@ -2762,7 +2818,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			a.logf("Session %s suspended.", runSandbox)
 			return nil
 		}
-		return err
+		return wrapPassthroughExit(res, err)
 
 	case config.RunModeServe:
 		a.logf("Starting 'opencode serve' on guest:%d as %s...", config.GuestPort, config.GuestUser)
@@ -2775,8 +2831,8 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			Env:      guestEnv,
 			Command:  []string{"sh", "-c", serveCmd},
 		})
-		if _, err := a.MSB.Run(ctx, msb.CommandRequest{Args: serveArgs}); err != nil {
-			return fmt.Errorf("start opencode serve: %w", err)
+		if serveRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: serveArgs}); err != nil {
+			return formatMSBError("start opencode serve", serveRes, err)
 		}
 
 		up := false
@@ -2804,7 +2860,11 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 				return fmt.Errorf("write detached marker: %w", err)
 			}
 			*detached = true
-			a.logf("Detached session %s is running. Stop it with: agbox stop %s", runSandbox, runSandbox)
+			if meta.Persist {
+				a.logf("Detached persistent session %s is running. Suspend it with 'agbox suspend %s' or delete it with 'agbox stop %s'.", runSandbox, runSandbox, runSandbox)
+			} else {
+				a.logf("Detached session %s is running. Stop it with: agbox stop %s", runSandbox, runSandbox)
+			}
 			return nil
 		}
 
@@ -2880,7 +2940,11 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 		*detached = true
 		a.logf("Detached Remote Control microVM: %s (instance: %s)", runSandbox, runSandbox)
 		a.logf("Open https://antigravity.google.com and select %q in the instance switcher.", runSandbox)
-		a.logf("Stop and delete it with: agbox stop %s", runSandbox)
+		if meta.Persist {
+			a.logf("Suspend it with 'agbox suspend %s' or delete it with 'agbox stop %s'.", runSandbox, runSandbox)
+		} else {
+			a.logf("Stop and delete it with: agbox stop %s", runSandbox)
+		}
 		return nil
 
 	default:
@@ -2897,7 +2961,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			Env:     guestEnv,
 			Command: []string{"sh", "-c", fmt.Sprintf("%s cd %s && exec %s", msb.KeyLoaderPrefix, quotedWorkDir, inv)},
 		})
-		_, err := a.MSB.Run(ctx, msb.CommandRequest{
+		res, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        tuiArgs,
 			Interactive: true,
 		})
@@ -2905,7 +2969,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 			a.logf("Session %s suspended.", runSandbox)
 			return nil
 		}
-		return err
+		return wrapPassthroughExit(res, err)
 	}
 }
 
@@ -2942,12 +3006,12 @@ func (a *App) pushKeys(ctx context.Context, sandbox string) error {
 	if count == 0 {
 		return nil
 	}
-	_, err := a.MSB.Run(ctx, msb.CommandRequest{
+	keyRes, err := a.MSB.Run(ctx, msb.CommandRequest{
 		Args:  []string{"exec", "-u", config.GuestUser, sandbox, "--", "sh", "-c", "umask 077; cat > " + config.GuestKeysFile},
 		Stdin: strings.NewReader(script),
 	})
 	if err != nil {
-		return fmt.Errorf("stream environment secrets into %s: %w", sandbox, err)
+		return formatMSBError("stream environment secrets into "+sandbox, keyRes, err)
 	}
 	a.logf("Streamed %d environment secret(s) from host env into the disposable guest.", count)
 	return nil
@@ -3013,7 +3077,7 @@ func (a *App) Stop(ctx context.Context, args []string) error {
 	if err := a.ensureMSB(); err != nil {
 		return err
 	}
-	_, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", name}})
+	rmRes, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", name}})
 	var tdErr error
 	if dirID, dErr := RunDirIDFromSandbox(name); dErr == nil {
 		filterDir := filepath.Join(a.Env.DataDir, "run", dirID)
@@ -3022,7 +3086,7 @@ func (a *App) Stop(ctx context.Context, args []string) error {
 		}
 	}
 	if rmErr != nil {
-		return fmt.Errorf("delete sandbox %s: %w", name, rmErr)
+		return formatMSBError("delete sandbox "+name, rmRes, rmErr)
 	}
 	if tdErr != nil {
 		return tdErr
@@ -3397,11 +3461,15 @@ func (a *App) Dispatch(ctx context.Context, args []string) int {
 			fmt.Fprint(a.Stdout, UsageText())
 			return 0
 		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode()
+		var passErr passthroughExitError
+		if errors.As(err, &passErr) {
+			return passErr.code
 		}
 		fmt.Fprintf(a.Stderr, "[agbox] ERROR: %v\n", err)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 {
+			return exitErr.ExitCode()
+		}
 		return 1
 	}
 	return 0

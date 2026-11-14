@@ -240,8 +240,8 @@ func (a *App) Update(ctx context.Context, args []string) error {
 
 	a.logf("Booting disposable update microVM %s (zero host shares, zero host secrets)...", updSandbox)
 	sandboxCreated = true
-	if _, err := a.MSB.Run(updCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
-		return fmt.Errorf("snapshot restore failed: %w", err)
+	if res, err := a.MSB.Run(updCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
+		return formatMSBError("snapshot restore failed", res, err)
 	}
 	if err := a.ensureGuestUser(updCtx, updSandbox); err != nil {
 		return err
@@ -254,7 +254,7 @@ func (a *App) Update(ctx context.Context, args []string) error {
 		}
 		a.logf("Updating %s inside %s...", ag, updSandbox)
 		updRes, err := a.MSB.Run(updCtx, msb.CommandRequest{
-			Args: []string{"exec", updSandbox, "--", "bash", "-c", updScript},
+			Args: []string{"exec", "-u", "root", updSandbox, "--", "bash", "-c", updScript},
 		})
 		if err != nil {
 			detail := strings.TrimSpace(updRes.Stderr + "\n" + updRes.Stdout)
@@ -265,10 +265,10 @@ func (a *App) Update(ctx context.Context, args []string) error {
 		}
 
 		verRes, err := a.MSB.Run(updCtx, msb.CommandRequest{
-			Args: []string{"exec", updSandbox, "--", "sh", "-c", verCmd},
+			Args: []string{"exec", "-u", "root", updSandbox, "--", "sh", "-c", verCmd},
 		})
 		if err != nil {
-			return fmt.Errorf("read updated %s version: %w", ag, err)
+			return formatMSBError("read updated "+ag+" version", verRes, err)
 		}
 
 		cw, err := persist.NewAgentBinaryCaptureWriter(agentsDir, ag)
@@ -277,6 +277,7 @@ func (a *App) Update(ctx context.Context, args []string) error {
 		}
 		streamArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: updSandbox,
+			User:    "root",
 			NoTTY:   true,
 			Command: []string{"sh", "-c", streamCmd},
 		})
@@ -286,7 +287,7 @@ func (a *App) Update(ctx context.Context, args []string) error {
 		})
 		if streamErr != nil {
 			cw.Abort()
-			return fmt.Errorf("stream %s binary from %s: %w", ag, updSandbox, streamErr)
+			return formatMSBError("stream "+ag+" binary from "+updSandbox, streamRes, streamErr)
 		}
 		if cw.Written() == 0 && len(streamRes.Stdout) > 0 {
 			if _, wErr := io.WriteString(cw, streamRes.Stdout); wErr != nil {
@@ -310,10 +311,10 @@ func (a *App) Update(ctx context.Context, args []string) error {
 
 func (a *App) setupGuestAgents(ctx context.Context, sandbox string) error {
 	script := persist.BuildGuestAgentsMountScript()
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", sandbox, "--", "sh", "-c", script},
+	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", script},
 	}); err != nil {
-		return fmt.Errorf("bind-mount cached agent binaries in %s: %w", sandbox, err)
+		return formatMSBError("bind-mount cached agent binaries in "+sandbox, res, err)
 	}
 	return nil
 }

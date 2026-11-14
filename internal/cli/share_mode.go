@@ -226,7 +226,7 @@ func (a *App) Share(ctx context.Context, args []string) error {
 
 	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 	if err != nil {
-		return fmt.Errorf("list sandboxes: %w", err)
+		return formatMSBError("list sandboxes", lsRes, err)
 	}
 	sb, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), opts.Sandbox)
 	if !exists {
@@ -562,6 +562,6 @@ func findShareRecordIndex(shares []config.ShareRecord, query string) (int, error
 
 func (a *App) dropGuestVFSCaches(ctx context.Context, sandbox string) {
 	_, _ = a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", sandbox, "--", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true"},
+		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true"},
 	})
 }

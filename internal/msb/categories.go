@@ -26,11 +26,11 @@ func Categories() []Category {
 		{
 			Name:    "core",
 			Aliases: []string{"base", "cli"},
-			Summary: "Core build chain, C headers, Python/pipx, mdformat, and CLI utilities",
+			Summary: "Core build chain, C headers, Python/pipx, shellcheck, mdformat, and CLI utilities",
 			Details: []string{
 				"apt: build-essential, pkg-config, cmake, ninja-build, libffi-dev, libssl-dev, libsqlite3-dev, sqlite3",
 				"apt: ca-certificates, curl, wget, git, htop, ncdu, net-tools, iproute2, dnsutils, rsync, unzip, zip, vim",
-				"apt: jq, ripgrep, fd-find, less, procps, psmisc, lsof, strace, tree, file, openssh-client",
+				"apt: jq, ripgrep, fd-find, shellcheck, less, procps, psmisc, lsof, strace, tree, file, openssh-client",
 				"apt: python3, python3-pip, python3-setuptools, python3-venv, python3-wheel, pipx",
 				"pipx: mdformat",
 			},
@@ -265,11 +265,14 @@ apt-get install -y -qq --no-install-recommends \
   build-essential ca-certificates curl wget git htop ncdu net-tools iproute2 dnsutils \
   libffi-dev libssl-dev libsqlite3-dev sqlite3 pkg-config cmake ninja-build \
   python3 python3-pip python3-setuptools python3-venv python3-wheel pipx \
-  rsync unzip zip vim jq ripgrep fd-find less procps psmisc lsof strace tree file openssh-client >/dev/null
+  rsync unzip zip vim jq ripgrep fd-find shellcheck less procps psmisc lsof strace tree file openssh-client >/dev/null
 if [ -x /usr/bin/fdfind ] && [ ! -e /usr/local/bin/fd ]; then
   ln -s /usr/bin/fdfind /usr/local/bin/fd
 fi
-su - agent -c 'export PATH="/home/agent/.local/bin:$PATH"; pipx install --force mdformat'
+su - agent -c 'export PATH="/home/agent/.local/bin:$PATH" && pipx install --force mdformat && rm -rf /home/agent/.cache/pip'
+if [ -x /home/agent/.local/bin/mdformat ]; then
+  ln -sf /home/agent/.local/bin/mdformat /usr/local/bin/mdformat
+fi
 `
 }
 

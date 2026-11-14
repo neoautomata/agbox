@@ -695,7 +695,7 @@ func TestXattrBlockingOnRootAndSubdirs(t *testing.T) {
 	}
 
 	// Verify direct FilteredNode handler enforcement for all protected prefixes.
-	fn := &FilteredNode{}
+	_, fn := newTestFilteredRoot(t)
 	for _, attr := range []string{"security.capability", "security.selinux", "system.posix_acl_access", "system.posix_acl_default"} {
 		if errno := fn.Setxattr(context.Background(), attr, []byte("val"), 0); errno != syscall.EPERM {
 			t.Errorf("FilteredNode.Setxattr(%q) = %v, want EPERM", attr, errno)
