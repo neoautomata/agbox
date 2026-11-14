@@ -1,6 +1,7 @@
 package msb
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -444,6 +445,31 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 	if !slices.Contains(streamArgs, "--stream") {
 		t.Errorf("expected --stream in %v", streamArgs)
 	}
+	if slices.Contains(streamArgs, "--no-stdin") {
+		t.Errorf("did not expect --no-stdin when NoStdin=false in %v", streamArgs)
+	}
+
+	streamNoStdinArgs := BuildExecArgs(ExecCmdOpts{
+		Sandbox: "agbox-run-99",
+		Stream:  true,
+		NoStdin: true,
+		User:    GuestUser,
+		Command: []string{"id"},
+	})
+	wantStreamNoStdin := []string{"exec", "--stream", "--no-stdin", "-u", "agent", "agbox-run-99", "--", "id"}
+	if !slices.Equal(streamNoStdinArgs, wantStreamNoStdin) {
+		t.Errorf("BuildExecArgs(Stream+NoStdin) = %v, want %v", streamNoStdinArgs, wantStreamNoStdin)
+	}
+
+	ttyNoStdinArgs := BuildExecArgs(ExecCmdOpts{
+		Sandbox: "agbox-run-99",
+		TTY:     true,
+		NoStdin: true,
+		Command: []string{"bash"},
+	})
+	if slices.Contains(ttyNoStdinArgs, "--no-stdin") {
+		t.Errorf("expected --no-stdin to be omitted when TTY=true in %v", ttyNoStdinArgs)
+	}
 }
 
 func TestCategoriesAndResolution(t *testing.T) {
@@ -708,5 +734,43 @@ func TestProvisionGuestUserScriptAgentDefaults(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Errorf("ProvisionGuestUserScript missing %q", want)
 		}
+	}
+}
+
+func TestExecRunnerInteractiveStreaming(t *testing.T) {
+	tmp := t.TempDir()
+	fakeMSB := filepath.Join(tmp, "msb")
+	script := `#!/bin/sh
+echo "streamed-stdout-ok"
+echo "streamed-stderr-ok" >&2
+`
+	if err := os.WriteFile(fakeMSB, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runner, err := NewExecRunner(fakeMSB)
+	if err != nil {
+		t.Fatalf("NewExecRunner: %v", err)
+	}
+
+	var outBuf, errBuf bytes.Buffer
+	res, err := runner.Run(context.Background(), CommandRequest{
+		Args:        []string{"exec", "--stream", "--no-stdin", "agbox-run-1", "--", "id"},
+		Stdin:       bytes.NewReader(nil),
+		Stdout:      &outBuf,
+		Stderr:      &errBuf,
+		Interactive: true,
+	})
+	if err != nil {
+		t.Fatalf("ExecRunner.Run unexpected error: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0", res.ExitCode)
+	}
+	if !strings.Contains(outBuf.String(), "streamed-stdout-ok") {
+		t.Errorf("expected streamed stdout in writer, got %q", outBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "streamed-stderr-ok") {
+		t.Errorf("expected streamed stderr in writer, got %q", errBuf.String())
 	}
 }

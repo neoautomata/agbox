@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"agbox/internal/config"
 	"agbox/internal/mounttab"
 	"agbox/internal/msb"
@@ -3181,4 +3183,228 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 		t.Fatalf("did not expect [agbox] ERROR wrapper on interactive --cmd exit, got %q", stderr.String())
 	}
 	runner.handler = nil
+}
+
+func TestRunCmdStreamsOutputAndHandlesStdinModes(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. isFileTerminal rejects /dev/null and pipes.
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	if isFileTerminal(devNull) {
+		t.Fatal("expected /dev/null NOT to be detected as a terminal")
+	}
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	defer pw.Close()
+	if isFileTerminal(pr) || isFileTerminal(pw) {
+		t.Fatal("expected pipe ends NOT to be detected as terminals")
+	}
+
+	// 2. Real msb.ExecRunner backed by a script simulating upstream msb exec behavior:
+	// rejects --stream when --no-stdin is missing and no piped data was supplied.
+	app, _, stdout, stderr := newTestApp(t)
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:    "both",
+		Snapshot: "agbox:v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app.StartHub = nil
+	app.IsTTY = func() bool { return false }
+
+	fakeMSB := filepath.Join(t.TempDir(), "fake-msb")
+	fakeMSBScript := `#!/bin/sh
+cmd="$1"
+shift
+case "$cmd" in
+  ls)
+    if [ -n "${FAKE_MSB_RUNNING:-}" ]; then
+      echo "NAME STATE"
+      echo "$FAKE_MSB_RUNNING running"
+    fi
+    exit 0
+    ;;
+  snap)
+    echo "agbox:v1 1m 100M"
+    exit 0
+    ;;
+  exec)
+    has_stream=0
+    has_no_stdin=0
+    user=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --stream) has_stream=1; shift ;;
+        --no-stdin) has_no_stdin=1; shift ;;
+        -u) user="$2"; shift 2 ;;
+        -e|-w) shift 2 ;;
+        -t|--no-tty|-d) shift ;;
+        --) shift; break ;;
+        *) shift ;;
+      esac
+    done
+    # Simulated root setup helpers (ensureGuestUser, pushKeys, etc.)
+    if [ "$user" = "root" ]; then
+      exit 0
+    fi
+    # Check whether this is pushKeys (sh -c "umask 077 ...")
+    if [ "${1:-}" = "sh" ] && [ "${2:-}" = "-c" ] && printf '%s' "${3:-}" | grep -q "umask 077"; then
+      cat >/dev/null
+      exit 0
+    fi
+    if [ "$has_stream" -ne 1 ]; then
+      echo "expected --stream flag for --cmd" >&2
+      exit 1
+    fi
+    if [ "$has_stream" -eq 1 ] && [ "$has_no_stdin" -eq 0 ]; then
+      stdin_data="$(cat)"
+      if [ -z "$stdin_data" ]; then
+        echo "Error: '--stream' requires piped stdin or '--no-stdin'" >&2
+        exit 1
+      fi
+      printf 'CMD_OUT_PIPED:%s\n' "$stdin_data"
+      printf 'CMD_ERR_PIPED\n' >&2
+      exit 0
+    fi
+    echo "CMD_OUT_STREAM"
+    echo "CMD_ERR_STREAM" >&2
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+	if err := os.WriteFile(fakeMSB, []byte(fakeMSBScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	execRunner, err := msb.NewExecRunner(fakeMSB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.MSB = execRunner
+
+	// 2a. With /dev/null stdin, --cmd must pass --no-stdin and stream stdout/stderr to App writers.
+	app.Stdin = devNull
+	stdout.Reset()
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "echo hello"}); rc != 0 {
+		t.Fatalf("run --cmd with /dev/null stdin failed rc=%d, stdout=%q, stderr=%q", rc, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "CMD_OUT_STREAM") {
+		t.Errorf("expected guest stdout in App.Stdout, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "CMD_ERR_STREAM") {
+		t.Errorf("expected guest stderr in App.Stderr, got %q", stderr.String())
+	}
+
+	// 2b. With piped stdin containing data, --cmd omits --no-stdin and forwards stdin bytes.
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(pipeW, "piped-payload"); err != nil {
+		t.Fatal(err)
+	}
+	_ = pipeW.Close()
+	app.Stdin = pipeR
+	stdout.Reset()
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "cat"}); rc != 0 {
+		_ = pipeR.Close()
+		t.Fatalf("run --cmd with piped stdin failed rc=%d, stdout=%q, stderr=%q", rc, stdout.String(), stderr.String())
+	}
+	_ = pipeR.Close()
+	if !strings.Contains(stdout.String(), "CMD_OUT_PIPED:piped-payload") {
+		t.Errorf("expected piped payload echoed to App.Stdout, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "CMD_ERR_PIPED") {
+		t.Errorf("expected stderr from piped --cmd in App.Stderr, got %q", stderr.String())
+	}
+
+	// 2c. With a real PTY slave stdin (simulating command substitution $(agbox run --cmd ...) in a terminal),
+	// isFileTerminal must return true and --cmd must pass --no-stdin so msb exec streams output.
+	if ptmx, pErr := os.OpenFile("/dev/ptmx", os.O_RDWR, 0); pErr == nil {
+		defer ptmx.Close()
+		if lockErr := unix.IoctlSetInt(int(ptmx.Fd()), unix.TIOCSPTLCK, 0); lockErr == nil {
+			if ptyNum, nErr := unix.IoctlGetInt(int(ptmx.Fd()), unix.TIOCGPTN); nErr == nil {
+				slavePath := fmt.Sprintf("/dev/pts/%d", ptyNum)
+				if slave, sErr := os.OpenFile(slavePath, os.O_RDWR, 0); sErr == nil {
+					defer slave.Close()
+					if !isFileTerminal(slave) {
+						t.Fatalf("expected PTY slave %s to be detected as a terminal", slavePath)
+					}
+					app.Stdin = slave
+					stdout.Reset()
+					stderr.Reset()
+					if rc := app.Dispatch(ctx, []string{"run", "--cmd", "echo tty-cmd"}); rc != 0 {
+						t.Fatalf("run --cmd with TTY stdin failed rc=%d, stdout=%q, stderr=%q", rc, stdout.String(), stderr.String())
+					}
+					if !strings.Contains(stdout.String(), "CMD_OUT_STREAM") || !strings.Contains(stderr.String(), "CMD_ERR_STREAM") {
+						t.Errorf("expected streamed output with TTY stdin, got stdout=%q stderr=%q", stdout.String(), stderr.String())
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Resuming a persistent sandbox with --persist --name ... --cmd ... also passes --stream --no-stdin and writes to App writers.
+	app2, recRunner, stdout2, stderr2 := newTestApp(t)
+	if err := config.SaveFile(app2.Env.ConfigFile, config.State{
+		Agent:    "both",
+		Snapshot: "agbox:v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app2.StartHub = nil
+	app2.Stdin = devNull
+	runDir := filepath.Join(app2.Env.DataDir, "run", "cmdp")
+	if err := config.EnsurePrivateDir(runDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(runDir, "suspended"), config.RunMeta{
+		Sandbox:  "agbox-cmdp",
+		OwnerPID: 999999,
+		Agent:    "opencode",
+		Mode:     config.RunModeTUI,
+		Persist:  true,
+		MaskMode: config.MaskStrict,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recRunner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-cmdp stopped\n"
+	recRunner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: recRunner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: recRunner.snapshots}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" && req.Interactive {
+			if !slices.Contains(req.Args, "--stream") || !slices.Contains(req.Args, "--no-stdin") {
+				return msb.CommandResult{ExitCode: 1}, fmt.Errorf("missing --stream/--no-stdin in %v", req.Args)
+			}
+			if req.Stdout != nil {
+				_, _ = io.WriteString(req.Stdout, "PERSIST_CMD_STDOUT\n")
+			}
+			if req.Stderr != nil {
+				_, _ = io.WriteString(req.Stderr, "PERSIST_CMD_STDERR\n")
+			}
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	if rc := app2.Dispatch(ctx, []string{"run", "--persist", "--name", "cmdp", "--cmd", "echo ok"}); rc != 0 {
+		t.Fatalf("persistent --cmd resume failed rc=%d, stderr=%q", rc, stderr2.String())
+	}
+	if !strings.Contains(stdout2.String(), "PERSIST_CMD_STDOUT") || !strings.Contains(stderr2.String(), "PERSIST_CMD_STDERR") {
+		t.Errorf("expected persistent --cmd stdout/stderr, got stdout=%q stderr=%q", stdout2.String(), stderr2.String())
+	}
 }

@@ -49,11 +49,13 @@ RUNTIME_MSB_HOME=""
 BASE_AGENT=""
 BASE_SNAP=""
 VM_READY=0
+VM_ENV_READY=0
 VM_PREFLIGHT_RAN=0
 VM_BLOCK_REASON=""
 HELPERS_BUILT=0
 AGBOX_BUILT=0
 DISRUPTIVE_SETUP_DONE=0
+DISRUPTIVE_CLEANUP_DONE=0
 CLEANUP_RAN=0
 EUID_VAL="$(id -u)"
 
@@ -473,8 +475,6 @@ restore_install_bin_if_needed() {
   if [[ "${ORIG_INSTALL_EXISTED}" -eq 1 && -n "${BACKUP_INSTALL_BIN}" && -f "${BACKUP_INSTALL_BIN}" ]]; then
     mkdir -p "$(dirname "${ORIG_INSTALL_BIN}")"
     install -m 0755 "${BACKUP_INSTALL_BIN}" "${ORIG_INSTALL_BIN}" 2>/dev/null || true
-    rm -f "${BACKUP_INSTALL_BIN}" 2>/dev/null || true
-    BACKUP_INSTALL_BIN=""
   elif [[ "${ORIG_INSTALL_EXISTED}" -eq 0 && -e "${ORIG_INSTALL_BIN}" ]]; then
     rm -f "${ORIG_INSTALL_BIN}" 2>/dev/null || true
   fi
@@ -490,7 +490,7 @@ global_cleanup() {
 
   if [[ "${DISRUPTIVE_MODE}" -eq 1 && "${DISRUPTIVE_SETUP_DONE}" -eq 1 ]]; then
     local rem_bin="${ACTIVE_BIN:-${TEST_BIN:-}}"
-    if [[ -n "${rem_bin}" && -x "${rem_bin}" ]]; then
+    if [[ "${DISRUPTIVE_CLEANUP_DONE}" -ne 1 && -n "${rem_bin}" && -x "${rem_bin}" ]]; then
       MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 60 agbox_exec "${rem_bin}" remove --yes >/dev/null 2>&1 || true
     fi
     restore_install_bin_if_needed
@@ -667,7 +667,8 @@ capture_state() {
 }
 
 write_helpers() {
-  if [[ "${HELPERS_BUILT}" -eq 1 ]]; then
+  if [[ -f "${TEST_ROOT}/helpers/.ready" ]]; then
+    HELPERS_BUILT=1
     return 0
   fi
   local hdir="${TEST_ROOT}/helpers"
@@ -993,14 +994,21 @@ EOF
 
   STYLECHECK_SRC="${hdir}/stylecheck/main.go"
   STUB_AGY_BIN="${hdir}/agy"
+  : > "${hdir}/.ready"
   HELPERS_BUILT=1
 }
 
 build_test_binaries() {
   write_helpers
+  if [[ -z "${ACTIVE_BIN}" ]]; then
+    ACTIVE_BIN="${TEST_BIN}"
+  fi
+  if [[ -x "${TEST_BIN}" && -x "${STUB_AGY_BIN}" ]]; then
+    AGBOX_BUILT=1
+    return 0
+  fi
   mkdir -p "${TEST_ROOT}/bin"
   chmod 0700 "${TEST_ROOT}/bin"
-  TEST_BIN="${TEST_ROOT}/bin/agbox"
 
   (
     cd "${REPO_DIR}"
@@ -1014,9 +1022,6 @@ build_test_binaries() {
   )
   chmod 0755 "${STUB_AGY_BIN}"
 
-  if [[ -z "${ACTIVE_BIN}" ]]; then
-    ACTIVE_BIN="${TEST_BIN}"
-  fi
   AGBOX_BUILT=1
 }
 
@@ -1524,6 +1529,91 @@ EOF
   fi
   assert_contains "${err_out}" "[agbox] ERROR:" "stop stderr prefix"
   assert_contains "${err_out}" "simulated msb backend failure detail" "stop stderr msb detail"
+
+  if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+    local cmd_fake_bin="${TEST_ROOT}/fake-msb-cmd-bin"
+    local cmd_data="${TEST_ROOT}/cmd-stream-data"
+    rm -rf "${cmd_fake_bin}" "${cmd_data}"
+    mkdir -p "${cmd_fake_bin}" "${cmd_data}"
+    chmod 0700 "${cmd_fake_bin}" "${cmd_data}"
+    cat > "${cmd_data}/config" <<'EOF'
+agent=both
+snapshot=agbox:v1
+EOF
+    chmod 0600 "${cmd_data}/config"
+
+    cat > "${cmd_fake_bin}/msb" <<'EOF'
+#!/usr/bin/env bash
+sub="$1"
+shift
+case "${sub}" in
+  ls)
+    exit 0
+    ;;
+  snap)
+    echo "agbox:v1 1m 100M"
+    exit 0
+    ;;
+  exec)
+    has_stream=0
+    has_no_stdin=0
+    user=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --stream) has_stream=1; shift ;;
+        --no-stdin) has_no_stdin=1; shift ;;
+        -u) user="$2"; shift 2 ;;
+        -e|-w) shift 2 ;;
+        -t|--no-tty|-d) shift ;;
+        --) shift; break ;;
+        *) shift ;;
+      esac
+    done
+    if [[ "${user}" == "root" ]]; then
+      exit 0
+    fi
+    if [[ "${1:-}" == "sh" && "${2:-}" == "-c" ]] && grep -Fq "umask 077" <<< "${3:-}"; then
+      cat >/dev/null
+      exit 0
+    fi
+    if [[ "${has_stream}" -ne 1 ]]; then
+      echo "missing --stream flag" >&2
+      exit 1
+    fi
+    if [[ "${has_no_stdin}" -eq 0 ]]; then
+      stdin_data="$(cat)"
+      if [[ -z "${stdin_data}" ]]; then
+        echo "'--stream' requires piped stdin or '--no-stdin'" >&2
+        exit 1
+      fi
+      printf 'FAKE_CMD_PIPED:%s\n' "${stdin_data}"
+      printf 'FAKE_CMD_PIPED_ERR\n' >&2
+      exit 0
+    fi
+    printf 'FAKE_CMD_STDOUT_OK\n'
+    printf 'FAKE_CMD_STDERR_OK\n' >&2
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+    chmod 0755 "${cmd_fake_bin}/msb"
+
+    local cmd_stdout="${TEST_ROOT}/fake-cmd.stdout"
+    local cmd_stderr="${TEST_ROOT}/fake-cmd.stderr"
+    PATH="${cmd_fake_bin}:${PATH}" AGBOX_DATA_DIR="${cmd_data}" agbox_exec "${TEST_BIN}" run --no-net --cmd "echo hi" </dev/null >"${cmd_stdout}" 2>"${cmd_stderr}"
+    assert_contains "$(cat "${cmd_stdout}")" "FAKE_CMD_STDOUT_OK" "fake msb --cmd stdout"
+    assert_not_contains "$(cat "${cmd_stdout}")" "FAKE_CMD_STDERR_OK" "fake msb --cmd stdout excludes stderr"
+    assert_contains "$(cat "${cmd_stderr}")" "FAKE_CMD_STDERR_OK" "fake msb --cmd stderr"
+
+    local pipe_out=""
+    pipe_out="$(printf 'piped-hello\n' | PATH="${cmd_fake_bin}:${PATH}" AGBOX_DATA_DIR="${cmd_data}" agbox_exec "${TEST_BIN}" run --no-net --cmd "cat" 2>&1)"
+    assert_contains "${pipe_out}" "FAKE_CMD_PIPED:piped-hello" "fake msb --cmd piped stdin"
+  else
+    echo "/dev/kvm not accessible. Skipping CLI fake-msb --cmd streaming subcheck (covered by Go unit test)."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +1860,7 @@ check_11_disruptive_install_sh() {
 
 check_12_disruptive_create_and_edit_base() {
   DISRUPTIVE_SETUP_DONE=1
+  local base_cmd_out=""
   if [[ "${FULL_MODE}" -eq 1 ]]; then
     MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 1200 agbox_exec "${ACTIVE_BIN}" create-base --add core,go both
     MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 600 agbox_exec "${ACTIVE_BIN}" edit-base --add hugo --cmd "echo e2e-v2 > /etc/agbox-e2e-v2"
@@ -1778,14 +1869,18 @@ check_12_disruptive_create_and_edit_base() {
     load_base_info_from_config "${ORIG_DATA_DIR}/config"
     assert_contains "${BASE_SNAP}" "agbox:v2" "config snapshot after edit-base"
 
-    MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-ebchk" --cmd \
-      'command -v mdformat >/dev/null && command -v shellcheck >/dev/null && command -v jq >/dev/null && command -v go >/dev/null && command -v hugo >/dev/null && grep -qx e2e-v2 /etc/agbox-e2e-v2 && test ! -e /etc/agbox-unsnapped'
+    base_cmd_out="$(MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-ebchk" --cmd \
+      'command -v mdformat >/dev/null && command -v shellcheck >/dev/null && command -v jq >/dev/null && command -v go >/dev/null && command -v hugo >/dev/null && grep -qx e2e-v2 /etc/agbox-e2e-v2 && test ! -e /etc/agbox-unsnapped && echo BASE_CMD_STDOUT_OK' 2>&1)"
+    printf '%s\n' "${base_cmd_out}"
+    assert_contains "${base_cmd_out}" "BASE_CMD_STDOUT_OK" "check_12 --cmd stdout"
   else
     MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 900 agbox_exec "${ACTIVE_BIN}" create-base both
     load_base_info_from_config "${ORIG_DATA_DIR}/config"
     [[ -n "${BASE_SNAP}" ]] || { echo "Missing snapshot in config" >&2; return 1; }
-    MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-basechk" --cmd \
-      'command -v mdformat >/dev/null && command -v shellcheck >/dev/null'
+    base_cmd_out="$(MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-basechk" --cmd \
+      'command -v mdformat >/dev/null && command -v shellcheck >/dev/null && echo BASE_CMD_STDOUT_OK' 2>&1)"
+    printf '%s\n' "${base_cmd_out}"
+    assert_contains "${base_cmd_out}" "BASE_CMD_STDOUT_OK" "check_12 --cmd stdout"
   fi
 }
 
@@ -1883,6 +1978,25 @@ echo "GUEST_EPH_OK"
     return 1
   fi
 
+  # Interactive --cmd must stream stdout and stderr separately and forward piped stdin.
+  local io_stdout="${TEST_ROOT}/cmd-io.stdout"
+  local io_stderr="${TEST_ROOT}/cmd-io.stderr"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 120 \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-io" --cmd \
+    'printf "LIVE_STDOUT_LINE\n"; printf "LIVE_STDERR_LINE\n" >&2' \
+    >"${io_stdout}" 2>"${io_stderr}"
+  cat "${io_stdout}"
+  cat "${io_stderr}" >&2
+  assert_contains "$(cat "${io_stdout}")" "LIVE_STDOUT_LINE" "live --cmd stdout"
+  assert_not_contains "$(cat "${io_stdout}")" "LIVE_STDERR_LINE" "live --cmd stdout excludes stderr"
+  assert_contains "$(cat "${io_stderr}")" "LIVE_STDERR_LINE" "live --cmd stderr"
+
+  local pipe_out=""
+  pipe_out="$(printf 'LIVE_STDIN_PAYLOAD\n' | MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout_stdin 120 \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-pipe" --cmd 'cat' 2>&1)"
+  printf '%s\n' "${pipe_out}"
+  assert_contains "${pipe_out}" "LIVE_STDIN_PAYLOAD" "live --cmd piped stdin"
+
   # Interactive --cmd non-zero exit must pass through exit code 42 without [agbox] ERROR:.
   rc=0
   err_out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 120 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-exit42" --cmd "exit 42" 2>&1)" || rc=$?
@@ -1962,6 +2076,7 @@ echo "PERSIST_RUN1_OK"
   local out1=""
   out1="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
     agbox_exec "${ACTIVE_BIN}" run --no-net --profile "${prof}" --name "${SUITE_ID}-pr1" --cmd "${script1}" "${proj}")"
+  printf '%s\n' "${out1}"
   assert_contains "${out1}" "PERSIST_RUN1_OK" "persist run 1"
 
   local script2='
@@ -1980,6 +2095,7 @@ echo "PERSIST_RUN2_OK"
   local out2=""
   out2="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
     agbox_exec "${ACTIVE_BIN}" run --no-net --profile "${prof}" --no-skills --no-rules --no-auth --no-agent-cache --name "${SUITE_ID}-pr2" --cmd "${script2}")"
+  printf '%s\n' "${out2}"
   assert_contains "${out2}" "PERSIST_RUN2_OK" "persist run 2 opt-out"
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" profile rm "${prof}"
@@ -2060,21 +2176,21 @@ check_22_persist_remote_control_shares_suspend_resume() {
   assert_contains "${out}" "vcs=mask" "share list initial vcs"
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" share add "${sbx}" "${extra}"
-  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- sh -eu -c '
+  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- sh -eu -c '
     test "$(cat /workspace/extra1/note.txt)" = "extra-note"
     test ! -e /workspace/extra1/.git
     if touch /workspace/extra1/blocked.txt 2>/dev/null; then exit 1; fi
   '
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" share set --rw --vcs "${sbx}" extra1
-  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- sh -eu -c '
+  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- sh -eu -c '
     test -f /workspace/extra1/.git/HEAD
     printf "ref: refs/heads/e2e\n" > /workspace/extra1/.git/HEAD
     if printf "bad\n" > /workspace/extra1/.git/hooks/pre-commit 2>/dev/null; then exit 1; fi
   '
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" share rm "${sbx}" extra1
-  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- sh -eu -c 'test ! -e /workspace/extra1'
+  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- sh -eu -c 'test ! -e /workspace/extra1'
 
   # Suspend, add share while suspended, and resume detached.
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" suspend "${sbx}"
@@ -2145,6 +2261,7 @@ echo "BLOCKED_RANGES_OK"
   local out=""
   out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
     agbox_exec "${ACTIVE_BIN}" run --name "${SUITE_ID}-pubfw" --cmd "${net_script}" 2>&1)"
+  printf '%s\n' "${out}"
   assert_contains "${out}" "BLOCKED_RANGES_OK" "guest firewall check"
 
   # Check public HTTPS only if the host itself can reach example.com.
@@ -2186,12 +2303,12 @@ check_31_share_open_fd_revocation() {
   [[ -S "${sock}" ]] || { echo "ws.sock did not appear" >&2; return 1; }
 
   # Launch guest process holding open writable FD 3 until /tmp/fd-go appears.
-  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 20 "${MSB_BIN_PATH}" exec -d -u agent "${sbx}" -- sh -c \
+  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 20 "${MSB_BIN_PATH}" exec -d --no-stdin -u agent "${sbx}" -- sh -c \
     'exec 3>> /workspace/proj1/open-fd.txt; printf "before\n" >&3; : > /tmp/fd-ready; while [ ! -f /tmp/fd-go ]; do sleep 0.1; done; printf "after\n" >&3 2>/tmp/fd-err; echo "$?" > /tmp/fd-rc'
 
   i=0
   while [[ "${i}" -lt 30 ]]; do
-    if MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 10 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- test -f /tmp/fd-ready 2>/dev/null; then
+    if MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 10 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- test -f /tmp/fd-ready 2>/dev/null; then
       break
     fi
     sleep 0.2
@@ -2212,12 +2329,12 @@ check_31_share_open_fd_revocation() {
 
   # Force downgrade rw -> ro must succeed and fail subsequent writes to FD 3.
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 30 agbox_exec "${ACTIVE_BIN}" share set --ro --force "${sbx}" proj1
-  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 15 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- sh -c ': > /tmp/fd-go'
+  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 15 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- sh -c ': > /tmp/fd-go'
 
   local fd_rc=""
   i=0
   while [[ "${i}" -lt 30 ]]; do
-    fd_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 10 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- cat /tmp/fd-rc 2>/dev/null || true)"
+    fd_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 10 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- cat /tmp/fd-rc 2>/dev/null || true)"
     if [[ -n "${fd_rc}" ]]; then
       break
     fi
@@ -2228,11 +2345,11 @@ check_31_share_open_fd_revocation() {
 
   # Restore rw, open FD 4, then force remove share and verify write revocation.
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 30 agbox_exec "${ACTIVE_BIN}" share set --rw "${sbx}" proj1
-  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 20 "${MSB_BIN_PATH}" exec -d -u agent "${sbx}" -- sh -c \
+  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 20 "${MSB_BIN_PATH}" exec -d --no-stdin -u agent "${sbx}" -- sh -c \
     'exec 4>> /workspace/proj1/open-fd2.txt; printf "before2\n" >&4; : > /tmp/fd2-ready; while [ ! -f /tmp/fd2-go ]; do sleep 0.1; done; printf "after2\n" >&4 2>/tmp/fd2-err; echo "$?" > /tmp/fd2-rc'
   i=0
   while [[ "${i}" -lt 30 ]]; do
-    if MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 10 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- test -f /tmp/fd2-ready 2>/dev/null; then
+    if MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 10 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- test -f /tmp/fd2-ready 2>/dev/null; then
       break
     fi
     sleep 0.2
@@ -2240,11 +2357,11 @@ check_31_share_open_fd_revocation() {
   done
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 30 agbox_exec "${ACTIVE_BIN}" share rm --force "${sbx}" proj1
-  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 15 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- sh -c ': > /tmp/fd2-go'
+  MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 15 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- sh -c ': > /tmp/fd2-go'
   local fd2_rc=""
   i=0
   while [[ "${i}" -lt 30 ]]; do
-    fd2_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 10 "${MSB_BIN_PATH}" exec -u agent "${sbx}" -- cat /tmp/fd2-rc 2>/dev/null || true)"
+    fd2_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 10 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- cat /tmp/fd2-rc 2>/dev/null || true)"
     if [[ -n "${fd2_rc}" ]]; then
       break
     fi
@@ -2592,6 +2709,11 @@ init_environment() {
   mkdir -p "${TEST_ROOT}"
   chmod 0700 "${TEST_ROOT}"
 
+  STYLECHECK_SRC="${TEST_ROOT}/helpers/stylecheck/main.go"
+  STUB_AGY_BIN="${TEST_ROOT}/helpers/agy"
+  TEST_BIN="${TEST_ROOT}/bin/agbox"
+  ACTIVE_BIN="${TEST_BIN}"
+
   if ! command -v go >/dev/null 2>&1; then
     if [[ -d /usr/local/go/bin && -x /usr/local/go/bin/go ]]; then
       export PATH="${PATH}:/usr/local/go/bin"
@@ -2641,6 +2763,11 @@ init_environment() {
   capture_state "${BASELINE_DIR}"
 }
 
+last_check_passed() {
+  local n="${#RESULT_STATUSES[@]}"
+  [[ "${n}" -gt 0 && "${RESULT_STATUSES[$((n - 1))]}" == "PASS" ]]
+}
+
 ensure_vm_preflight_evaluated() {
   if [[ "${VM_PREFLIGHT_RAN}" -eq 1 ]]; then
     return 0
@@ -2660,17 +2787,48 @@ ensure_vm_preflight_evaluated() {
 }
 
 prepare_runtime_env_for_vm_tests() {
-  [[ "${VM_READY}" -eq 1 ]] || return 1
+  if [[ "${VM_READY}" -ne 1 || "${VM_ENV_READY}" -eq 1 ]]; then
+    return 0
+  fi
+
+  if [[ ! -x "${TEST_BIN}" || ! -x "${STUB_AGY_BIN}" ]]; then
+    build_test_binaries
+  fi
+
   if [[ "${DISRUPTIVE_MODE}" -eq 1 ]]; then
     RUNTIME_MSB_HOME="${ORIG_MSB_HOME}"
     RUNTIME_DATA_DIR="${ORIG_DATA_DIR}"
+    DISRUPTIVE_SETUP_DONE=1
+
     run_check "10-disruptive-clean-pre" "Remove existing state before clean-slate test" check_10_disruptive_clean_pre
-    run_check "11-disruptive-install-sh" "Run install.sh and setup on clean system" check_11_disruptive_install_sh
-    run_check "12-disruptive-create-and-edit-base" "Create and edit live base snapshot" check_12_disruptive_create_and_edit_base
-    if [[ ! -f "${RUNTIME_DATA_DIR}/config" ]]; then
-      return 1
+    if ! last_check_passed; then
+      VM_READY=0
+      VM_BLOCK_REASON="blocked by failed 10-disruptive-clean-pre"
+      return 0
     fi
+
+    run_check "11-disruptive-install-sh" "Run install.sh and setup on clean system" check_11_disruptive_install_sh
+    if ! last_check_passed || [[ ! -x "${ORIG_INSTALL_BIN}" ]]; then
+      VM_READY=0
+      VM_BLOCK_REASON="blocked by failed 11-disruptive-install-sh"
+      return 0
+    fi
+    ACTIVE_BIN="${ORIG_INSTALL_BIN}"
+
+    run_check "12-disruptive-create-and-edit-base" "Create and edit live base snapshot" check_12_disruptive_create_and_edit_base
+    if ! last_check_passed || [[ ! -f "${RUNTIME_DATA_DIR}/config" ]]; then
+      VM_READY=0
+      VM_BLOCK_REASON="blocked by failed 12-disruptive-create-and-edit-base"
+      return 0
+    fi
+
     load_base_info_from_config "${RUNTIME_DATA_DIR}/config"
+    if [[ -z "${BASE_SNAP}" ]]; then
+      VM_READY=0
+      VM_BLOCK_REASON="missing snapshot in config"
+      return 0
+    fi
+    VM_ENV_READY=1
     return 0
   fi
 
@@ -2712,9 +2870,13 @@ prepare_runtime_env_for_vm_tests() {
     fi
 
     run_check "10-agbox-setup" "Run agbox setup against isolated runtime config" check_10_agbox_setup
-    if [[ "${RESULT_STATUSES[$(( ${#RESULT_STATUSES[@]} - 1 ))]}" != "PASS" ]]; then
-      return 1
+    if ! last_check_passed; then
+      VM_READY=0
+      VM_BLOCK_REASON="blocked by failed 10-agbox-setup"
+      return 0
     fi
+    load_base_info_from_config "${RUNTIME_DATA_DIR}/config"
+    VM_ENV_READY=1
     return 0
   fi
 
@@ -2722,7 +2884,7 @@ prepare_runtime_env_for_vm_tests() {
   if ! prepare_isolated_msb_home "${TEST_ROOT}/iso-msb"; then
     VM_READY=0
     VM_BLOCK_REASON="no existing base snapshot and msb does not isolate MSB_HOME (re-run with --disruptive)"
-    return 1
+    return 0
   fi
   RUNTIME_MSB_HOME="${TEST_ROOT}/iso-msb"
   RUNTIME_DATA_DIR="${TEST_ROOT}/iso-data"
@@ -2730,13 +2892,24 @@ prepare_runtime_env_for_vm_tests() {
   chmod 0700 "${RUNTIME_DATA_DIR}"
 
   run_check "10-agbox-setup" "Run agbox setup inside isolated MSB_HOME" check_10_agbox_setup
-  if [[ "${RESULT_STATUSES[$(( ${#RESULT_STATUSES[@]} - 1 ))]}" != "PASS" ]]; then
-    return 1
+  if ! last_check_passed; then
+    VM_READY=0
+    VM_BLOCK_REASON="blocked by failed 10-agbox-setup"
+    return 0
   fi
   run_check "11-bootstrap-isolated-base" "Build isolated base snapshot for integration checks" check_11_bootstrap_isolated_base
-  if [[ "${RESULT_STATUSES[$(( ${#RESULT_STATUSES[@]} - 1 ))]}" != "PASS" ]]; then
-    return 1
+  if ! last_check_passed; then
+    VM_READY=0
+    VM_BLOCK_REASON="blocked by failed 11-bootstrap-isolated-base"
+    return 0
   fi
+  load_base_info_from_config "${RUNTIME_DATA_DIR}/config"
+  if [[ -z "${BASE_SNAP}" ]]; then
+    VM_READY=0
+    VM_BLOCK_REASON="missing snapshot in isolated config"
+    return 0
+  fi
+  VM_ENV_READY=1
   return 0
 }
 
@@ -2751,7 +2924,7 @@ maybe_run_phase_check() {
   fi
 
   if [[ "${needs_vm}" -eq 1 ]]; then
-    if [[ "${AGBOX_BUILT}" -eq 0 ]]; then
+    if [[ ! -x "${TEST_BIN}" || ! -x "${STUB_AGY_BIN}" ]]; then
       build_test_binaries
     fi
     ensure_vm_preflight_evaluated
@@ -2759,9 +2932,10 @@ maybe_run_phase_check() {
       record_blocked_skip "${id}" "${desc}" "${VM_BLOCK_REASON}"
       return 0
     fi
-    if [[ -z "${RUNTIME_DATA_DIR}" ]]; then
-      if ! prepare_runtime_env_for_vm_tests; then
-        record_blocked_skip "${id}" "${desc}" "${VM_BLOCK_REASON:-base environment setup failed}"
+    if [[ "${VM_ENV_READY}" -ne 1 ]]; then
+      prepare_runtime_env_for_vm_tests
+      if [[ "${VM_READY}" -ne 1 || "${VM_ENV_READY}" -ne 1 ]]; then
+        record_blocked_skip "${id}" "${desc}" "${VM_BLOCK_REASON:-runtime environment setup failed}"
         return 0
       fi
     fi
@@ -2846,10 +3020,7 @@ main() {
   if [[ -z "${FILTER_PATTERN}" ]]; then
     ensure_vm_preflight_evaluated
     if [[ "${VM_READY}" -eq 1 ]]; then
-      if ! prepare_runtime_env_for_vm_tests; then
-        VM_READY=0
-        VM_BLOCK_REASON="${VM_BLOCK_REASON:-runtime environment setup failed}"
-      fi
+      prepare_runtime_env_for_vm_tests
     fi
   fi
 
@@ -2865,7 +3036,7 @@ main() {
     done
     if [[ "${DISRUPTIVE_MODE}" -eq 0 ]]; then
       if should_run_check "40-isolated-full-lifecycle" "Run isolated clean-slate install, create-base, edit-base, update, and remove"; then
-        if [[ "${AGBOX_BUILT}" -eq 0 ]]; then
+        if [[ ! -x "${TEST_BIN}" || ! -x "${STUB_AGY_BIN}" ]]; then
           build_test_binaries
         fi
         ensure_vm_preflight_evaluated
@@ -2881,6 +3052,9 @@ main() {
   # Phase 8: Final teardown and state verification (always runs).
   if [[ "${DISRUPTIVE_MODE}" -eq 1 ]]; then
     run_check "99-verify-disruptive-cleanup" "Verify agbox remove --yes cleaned all live state" check_99_verify_disruptive_cleanup
+    if last_check_passed; then
+      DISRUPTIVE_CLEANUP_DONE=1
+    fi
   else
     run_check "99-verify-host-unchanged" "Verify existing agbox state, binaries, and msb resources stayed unchanged" check_99_verify_host_unchanged
   fi

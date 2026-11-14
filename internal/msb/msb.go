@@ -945,6 +945,7 @@ type ExecCmdOpts struct {
 	TTY      bool
 	NoTTY    bool
 	Stream   bool
+	NoStdin  bool
 	Env      []string // KEY=VAL pairs
 	Command  []string
 }
@@ -961,6 +962,9 @@ func BuildExecArgs(opts ExecCmdOpts) []string {
 		args = append(args, "--stream")
 	} else if opts.NoTTY {
 		args = append(args, "--no-tty")
+	}
+	if !opts.TTY && opts.NoStdin {
+		args = append(args, "--no-stdin")
 	}
 	if opts.Workdir != "" {
 		args = append(args, "-w", opts.Workdir)

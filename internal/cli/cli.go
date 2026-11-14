@@ -13,6 +13,7 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -28,6 +29,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"agbox/internal/config"
 	"agbox/internal/mounttab"
@@ -1047,11 +1050,34 @@ func isFileTerminal(f *os.File) bool {
 	if f == nil {
 		return false
 	}
-	st, err := f.Stat()
-	if err != nil {
+	_, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+	return err == nil
+}
+
+func (a *App) cmdNeedsNoStdin() bool {
+	if a.Stdin == nil {
+		return true
+	}
+	if f, ok := a.Stdin.(*os.File); ok {
+		if isFileTerminal(f) {
+			return true
+		}
+		st, err := f.Stat()
+		if err != nil {
+			return true
+		}
+		if (st.Mode() & os.ModeCharDevice) != 0 {
+			return true
+		}
+		if st.Mode().IsRegular() && st.Size() == 0 {
+			return true
+		}
 		return false
 	}
-	return (st.Mode() & os.ModeCharDevice) != 0
+	if sized, ok := a.Stdin.(interface{ Len() int }); ok {
+		return sized.Len() == 0
+	}
+	return false
 }
 
 func (a *App) logf(format string, args ...any) {
@@ -2799,9 +2825,15 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 	switch meta.Mode {
 	case config.RunModeCmd:
 		a.logf("Running command in %s as %s (passwordless sudo available)...", runSandbox, config.GuestUser)
+		noStdin := a.cmdNeedsNoStdin()
+		var cmdStdin io.Reader = a.Stdin
+		if noStdin {
+			cmdStdin = bytes.NewReader(nil)
+		}
 		execArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: runSandbox,
 			Stream:  true,
+			NoStdin: noStdin,
 			User:    config.GuestUser,
 			Env:     guestEnv,
 			Command: []string{
@@ -2812,6 +2844,9 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 		})
 		res, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        execArgs,
+			Stdin:       cmdStdin,
+			Stdout:      a.Stdout,
+			Stderr:      a.Stderr,
 			Interactive: true,
 		})
 		if err != nil && hasMarker(suspendedPath) {
@@ -2827,6 +2862,7 @@ func (a *App) execSession(ctx context.Context, meta config.RunMeta, runFilterDir
 		serveArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox:  runSandbox,
 			Detached: true,
+			NoStdin:  true,
 			User:     config.GuestUser,
 			Env:      guestEnv,
 			Command:  []string{"sh", "-c", serveCmd},
