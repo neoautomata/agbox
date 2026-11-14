@@ -2024,6 +2024,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 
 	var meta config.RunMeta
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
+	deletingPath := filepath.Join(runFilterDir, "deleting")
 	sandboxCreated := false
 	sandboxRunning := false
 	sessionReady := false
@@ -2032,6 +2033,9 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	cleanup := func() {
 		cleanupOnce.Do(func() {
 			if detached {
+				return
+			}
+			if hasMarker(deletingPath) {
 				return
 			}
 			if hasMarker(suspendedPath) {
@@ -2043,7 +2047,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 				return
 			}
 			if sandboxCreated {
-				_, _ = a.destroySandbox(context.Background(), runSandbox, opts.Profile != "" && sandboxRunning)
+				_, _ = a.destroySandbox(context.Background(), runSandbox, opts.Profile != "" && sandboxRunning, true)
 			}
 			_ = mounttab.TeardownFilterDir(runFilterDir, a.MountCtl)
 		})
@@ -2704,12 +2708,16 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
+	deletingPath := filepath.Join(runFilterDir, "deleting")
 	sessionReady := false
 	detached := false
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
 			if detached {
+				return
+			}
+			if hasMarker(deletingPath) {
 				return
 			}
 			if hasMarker(suspendedPath) {
@@ -2720,7 +2728,7 @@ func (a *App) resumeSandbox(ctx context.Context, opts ResumeOpts) error {
 				a.suspendSandboxOnExit(opts.Sandbox, runFilterDir, meta)
 				return
 			}
-			_, _ = a.destroySandbox(context.Background(), opts.Sandbox, meta.Profile != "")
+			_, _ = a.destroySandbox(context.Background(), opts.Sandbox, meta.Profile != "", true)
 			_ = mounttab.TeardownFilterDir(runFilterDir, a.MountCtl)
 		})
 	}
@@ -3140,15 +3148,26 @@ func tailLines(s string, n int) string {
 	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
+func isMSBSandboxNotFound(res msb.CommandResult) bool {
+	combined := strings.ToLower(res.Stderr + "\n" + res.Stdout)
+	return strings.Contains(combined, "sandbox not found")
+}
+
 // destroySandbox gracefully stops sandboxes that have a mounted ext4 profile disk
 // before calling `msb rm -f`, so guest kernel teardown flushes dirty ext4 pages and journals.
-func (a *App) destroySandbox(ctx context.Context, sandbox string, flushProfile bool) (msb.CommandResult, error) {
+func (a *App) destroySandbox(ctx context.Context, sandbox string, flushProfile bool, allowConcurrentGone bool) (msb.CommandResult, error) {
+	stoppedOK := false
 	if flushProfile {
 		stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		_, _ = a.MSB.Run(stopCtx, msb.CommandRequest{Args: []string{"stop", "-t", "10", sandbox}})
+		_, stopErr := a.MSB.Run(stopCtx, msb.CommandRequest{Args: []string{"stop", "-t", "10", sandbox}})
 		cancel()
+		stoppedOK = stopErr == nil
 	}
-	return a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", sandbox}})
+	rmRes, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"rm", "-f", sandbox}})
+	if rmErr != nil && (stoppedOK || allowConcurrentGone) && isMSBSandboxNotFound(rmRes) {
+		return msb.CommandResult{}, nil
+	}
+	return rmRes, rmErr
 }
 
 // Stop deletes a running or suspended run sandbox and unmounts its FUSE shares.
@@ -3164,20 +3183,32 @@ func (a *App) Stop(ctx context.Context, args []string) error {
 		return err
 	}
 	filterDir := ""
+	deletingPath := ""
+	wroteDeleting := false
 	flushProfile := false
 	if dirID, dErr := RunDirIDFromSandbox(name); dErr == nil {
-		filterDir = filepath.Join(a.Env.DataDir, "run", dirID)
-		if !hasMarker(filepath.Join(filterDir, "suspended")) {
-			if meta, mErr := config.LoadRunMeta(filepath.Join(filterDir, "run.meta")); mErr == nil && meta.Profile != "" {
-				flushProfile = true
+		candidate := filepath.Join(a.Env.DataDir, "run", dirID)
+		if st, sErr := os.Stat(candidate); sErr == nil && st.IsDir() {
+			filterDir = candidate
+			if !hasMarker(filepath.Join(filterDir, "suspended")) {
+				if meta, mErr := config.LoadRunMeta(filepath.Join(filterDir, "run.meta")); mErr == nil && meta.Profile != "" {
+					flushProfile = true
+				}
+			}
+			deletingPath = filepath.Join(filterDir, "deleting")
+			if wErr := writeMarkerAtomic(deletingPath, name+"\n"); wErr == nil {
+				wroteDeleting = true
 			}
 		}
 	}
-	rmRes, rmErr := a.destroySandbox(ctx, name, flushProfile)
+	rmRes, rmErr := a.destroySandbox(ctx, name, flushProfile, filterDir != "")
 	var tdErr error
 	if filterDir != "" {
 		if _, sErr := os.Stat(filterDir); sErr == nil {
 			tdErr = mounttab.TeardownFilterDir(filterDir, a.MountCtl)
+			if tdErr != nil && wroteDeleting {
+				_ = os.Remove(deletingPath)
+			}
 		}
 	}
 	if rmErr != nil {

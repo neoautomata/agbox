@@ -2085,6 +2085,41 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 	if !foundSrvRM {
 		t.Error("expected failed --persist -d --serve startup to delete agbox-srvfail with msb rm -f")
 	}
+
+	// 7. Concurrent `agbox stop` writes a `deleting` marker so foreground `--persist` exit
+	// skips suspendSandboxOnExit and duplicate `msb rm -f`.
+	stopRaceDir := filepath.Join(app.Env.DataDir, "run", "stoprace")
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" && strings.Contains(strings.Join(req.Args, " "), "exec sh -c") {
+			if err := os.WriteFile(filepath.Join(stopRaceDir, "deleting"), []byte("agbox-stoprace\n"), 0o600); err != nil {
+				return msb.CommandResult{}, err
+			}
+		}
+		return msb.CommandResult{}, nil
+	}
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "stoprace", "--cmd", "sleep 300", "opencode", projA}); rc != 0 {
+		t.Fatalf("foreground --persist run during deleting race failed: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(stopRaceDir, "suspended")); !os.IsNotExist(err) {
+		t.Errorf("expected foreground --persist run with deleting marker not to write suspended marker, err=%v", err)
+	}
+	for _, c := range runner.calls {
+		if len(c.Args) >= 2 && c.Args[0] == "stop" && c.Args[len(c.Args)-1] == "agbox-stoprace" {
+			t.Fatalf("foreground --persist run with deleting marker unexpectedly called msb stop: %v", c.Args)
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-stoprace"}) {
+			t.Fatalf("foreground --persist run with deleting marker unexpectedly called msb rm -f: %v", c.Args)
+		}
+	}
+	runner.handler = nil
 }
 
 func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
@@ -2206,6 +2241,57 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 	if manualStopIdx < 0 || manualRMIdx <= manualStopIdx {
 		t.Fatalf("expected agbox stop on profile sandbox to run stop -t 10 before rm -f (stopIdx=%d rmIdx=%d)", manualStopIdx, manualRMIdx)
 	}
+
+	// Simulate check_32 concurrent deletion race: `agbox stop` writes `deleting`, stops the
+	// profile sandbox, and tolerates `sandbox not found` if foreground cleanup already ran `msb rm -f`.
+	raceRunDir := filepath.Join(app.Env.DataDir, "run", "ephem-race")
+	if err := config.SaveRunMeta(filepath.Join(raceRunDir, "run.meta"), config.RunMeta{
+		Sandbox: "agbox-ephem-race",
+		Profile: "workprof",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prevRaceHandler := runner.handler
+	sawDeletingBeforeStop := false
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 3 && req.Args[0] == "stop" && req.Args[len(req.Args)-1] == "agbox-ephem-race" {
+			if _, sErr := os.Stat(filepath.Join(raceRunDir, "deleting")); sErr == nil {
+				sawDeletingBeforeStop = true
+			}
+			return msb.CommandResult{}, nil
+		}
+		if slices.Equal(req.Args, []string{"rm", "-f", "agbox-ephem-race"}) {
+			return msb.CommandResult{ExitCode: 1, Stderr: "error: sandbox not found: agbox-ephem-race\n"}, errors.New("exit status 1")
+		}
+		return prevRaceHandler(req)
+	}
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"stop", "agbox-ephem-race"}); rc != 0 {
+		t.Fatalf("agbox stop with concurrent rm -f race failed: %s", stderr.String())
+	}
+	if !sawDeletingBeforeStop {
+		t.Error("expected agbox stop to write deleting marker before msb stop")
+	}
+	if _, err := os.Stat(raceRunDir); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be deleted after stop race, err=%v", raceRunDir, err)
+	}
+
+	// Stopping an unknown sandbox without a run directory must still surface `sandbox not found`.
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if slices.Equal(req.Args, []string{"rm", "-f", "agbox-nonexistent"}) {
+			return msb.CommandResult{ExitCode: 1, Stderr: "error: sandbox not found: agbox-nonexistent\n"}, errors.New("exit status 1")
+		}
+		return prevRaceHandler(req)
+	}
+	stderr.Reset()
+	if rc := app.Dispatch(ctx, []string{"stop", "agbox-nonexistent"}); rc == 0 {
+		t.Fatal("expected agbox stop on nonexistent sandbox to fail")
+	}
+	if _, err := os.Stat(filepath.Join(app.Env.DataDir, "run", "nonexistent")); !os.IsNotExist(err) {
+		t.Errorf("expected agbox stop on nonexistent sandbox not to create run dir, err=%v", err)
+	}
+	runner.handler = prevRaceHandler
 
 	// Verify `msb volume inspect` path overrides the MSB_HOME fallback when present.
 	prevHandler := runner.handler
