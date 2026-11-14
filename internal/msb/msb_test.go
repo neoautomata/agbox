@@ -301,11 +301,12 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		Name:     "agbox-run-99",
 		CPUs:     "4",
 		Memory:   "4G",
-		NamedVolumes: []NamedVolumeSpec{
-			{VolumeName: "agbox-profile-work", GuestPath: GuestProfileMount},
+		DiskMounts: []DiskMountSpec{
+			{HostPath: "/home/u/.microsandbox/volumes/agbox-profile-work/disk.raw", GuestPath: GuestProfileMount},
 		},
 		Volumes: []VolumeSpec{
-			{HostPath: "/tmp/mnt0", GuestPath: "/workspace/proj", ReadOnly: false},
+			{HostPath: "/tmp/ws", GuestPath: "/workspace", ReadOnly: false, StatVirt: "off"},
+			{HostPath: "/tmp/mnt0", GuestPath: "/workspace/proj", ReadOnly: false, StatVirt: "relaxed", HostPerms: "mirror"},
 			{HostPath: "/tmp/file.txt", GuestPath: "/workspace/file.txt", ReadOnly: true},
 		},
 		Ports:    []string{"127.0.0.1:4096:3000"},
@@ -321,9 +322,10 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		"snap restore agbox:v2",
 		"--name agbox-run-99 -u agent",
 		"--cpus 4 --memory 4G",
-		"-v agbox-profile-work:/home/agent/.agbox-profile",
-		"-v /tmp/mnt0:/workspace/proj:rw,uid=1000,gid=1000",
-		"-v /tmp/file.txt:/workspace/file.txt:ro,uid=1000,gid=1000",
+		"--mount-disk /home/u/.microsandbox/volumes/agbox-profile-work/disk.raw:/home/agent/.agbox-profile:rw,format=raw,fstype=ext4",
+		"-v /tmp/ws:/workspace:rw,stat-virt=off",
+		"-v /tmp/mnt0:/workspace/proj:rw,stat-virt=relaxed,host-perms=mirror,uid=1000,gid=1000",
+		"-v /tmp/file.txt:/workspace/file.txt:ro,stat-virt=relaxed,uid=1000,gid=1000",
 		"-p 127.0.0.1:4096:3000",
 		"--net-default deny --net-rule allow@dns --net-rule deny@host --net-rule deny@loopback --net-rule deny@private --net-rule deny@link-local --net-rule deny@multicast --net-rule deny@meta",
 		"--net-rule deny@168.63.129.16/32",
@@ -336,6 +338,9 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		if !strings.Contains(joined, substr) {
 			t.Errorf("restoreArgs %q missing %q", joined, substr)
 		}
+	}
+	if strings.Contains(joined, "stat-virt=off,uid=") {
+		t.Errorf("restoreArgs unexpectedly combined stat-virt=off with uid=: %q", joined)
 	}
 
 	defaultNetArgs, err := BuildRestoreArgs(RestoreOpts{
@@ -772,5 +777,86 @@ echo "streamed-stderr-ok" >&2
 	}
 	if !strings.Contains(errBuf.String(), "streamed-stderr-ok") {
 		t.Errorf("expected streamed stderr in writer, got %q", errBuf.String())
+	}
+}
+
+func TestDiskMountAndVolumeInspectPathResolution(t *testing.T) {
+	validFlag, err := (DiskMountSpec{
+		HostPath:  "/var/lib/msb/volumes/work/disk.raw",
+		GuestPath: GuestProfileMount,
+	}).FormatFlag()
+	if err != nil || validFlag != "/var/lib/msb/volumes/work/disk.raw:/home/agent/.agbox-profile:rw,format=raw,fstype=ext4" {
+		t.Fatalf("DiskMountSpec.FormatFlag() = (%q, %v)", validFlag, err)
+	}
+
+	roFlag, err := (DiskMountSpec{
+		HostPath:  "/var/lib/msb/volumes/work/disk.raw",
+		GuestPath: GuestProfileMount,
+		ReadOnly:  true,
+		Format:    "qcow2",
+		FSType:    "xfs",
+	}).FormatFlag()
+	if err != nil || roFlag != "/var/lib/msb/volumes/work/disk.raw:/home/agent/.agbox-profile:ro,format=qcow2,fstype=xfs" {
+		t.Fatalf("DiskMountSpec.FormatFlag(ro) = (%q, %v)", roFlag, err)
+	}
+
+	for _, bad := range []DiskMountSpec{
+		{HostPath: "", GuestPath: GuestProfileMount},
+		{HostPath: "relative/disk.raw", GuestPath: GuestProfileMount},
+		{HostPath: "/tmp/a:b/disk.raw", GuestPath: GuestProfileMount},
+		{HostPath: "/tmp/a,b/disk.raw", GuestPath: GuestProfileMount},
+		{HostPath: "/tmp/a\nb/disk.raw", GuestPath: GuestProfileMount},
+		{HostPath: "/tmp/disk.raw", GuestPath: "relative"},
+	} {
+		if _, err := bad.FormatFlag(); err == nil {
+			t.Errorf("expected DiskMountSpec.FormatFlag error for %+v", bad)
+		}
+	}
+
+	plainInspect := "Volume agbox-profile-work\n  Kind   disk\n  Size   10 GiB\n  Path   /home/alice/.microsandbox/volumes/agbox-profile-work/disk.raw\n"
+	if got := ParseVolumeInspectPath(plainInspect); got != "/home/alice/.microsandbox/volumes/agbox-profile-work/disk.raw" {
+		t.Errorf("ParseVolumeInspectPath(plain) = %q", got)
+	}
+
+	ansiInspect := "\x1b[1mVolume\x1b[0m agbox-profile-work\n  \x1b[36mPath\x1b[0m   \x1b[32m/custom/vol/disk.raw\x1b[0m\n"
+	if got := ParseVolumeInspectPath(ansiInspect); got != "/custom/vol/disk.raw" {
+		t.Errorf("ParseVolumeInspectPath(ansi) = %q", got)
+	}
+
+	tmp := t.TempDir()
+	fakeMSB := filepath.Join(tmp, "msb")
+	script := `#!/bin/sh
+if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then
+  if [ "$3" = "from-inspect" ]; then
+    echo "  Path   /inspected/path/disk.raw"
+    exit 0
+  fi
+  exit 1
+fi
+exit 0
+`
+	if err := os.WriteFile(fakeMSB, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner, err := NewExecRunner(fakeMSB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inspected, err := ResolveVolumeDiskPath(context.Background(), runner, "/fallback/msb", "from-inspect")
+	if err != nil || inspected != "/inspected/path/disk.raw" {
+		t.Errorf("ResolveVolumeDiskPath(from-inspect) = (%q, %v)", inspected, err)
+	}
+
+	fallback, err := ResolveVolumeDiskPath(context.Background(), runner, "/fallback/msb", "agbox-profile-fb")
+	if err != nil || fallback != "/fallback/msb/volumes/agbox-profile-fb/disk.raw" {
+		t.Errorf("ResolveVolumeDiskPath(fallback) = (%q, %v)", fallback, err)
+	}
+
+	if _, err := ResolveVolumeDiskPath(context.Background(), runner, "/bad:msb", "agbox-profile-fb"); err == nil {
+		t.Error("expected error for msbHome containing colon")
+	}
+	if _, err := ResolveVolumeDiskPath(context.Background(), runner, "/fallback/msb", ""); err == nil {
+		t.Error("expected error for empty volume name")
 	}
 }

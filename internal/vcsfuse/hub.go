@@ -133,13 +133,19 @@ func (n *FileShareNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.
 	}
 	out.FromStat(&st)
 	out.Attr.Mode = n.slot.maskMode(out.Attr.Mode, false)
+	n.slot.idMap.applyAttr(&out.Attr)
 	return 0
 }
 
 func (n *FileShareNode) Statx(ctx context.Context, f fs.FileHandle, flags uint32, mask uint32, out *fuse.StatxOut) syscall.Errno {
 	if f != nil {
 		if fga, ok := f.(fs.FileStatxer); ok {
-			return fga.Statx(ctx, flags, mask, out)
+			errno := fga.Statx(ctx, flags, mask, out)
+			if errno == 0 {
+				out.Statx.Mode = uint16(n.slot.maskMode(uint32(out.Statx.Mode), false))
+				n.slot.idMap.applyStatx(out)
+			}
+			return errno
 		}
 	}
 	fd, errno := n.openFileOPath()
@@ -154,6 +160,7 @@ func (n *FileShareNode) Statx(ctx context.Context, f fs.FileHandle, flags uint32
 	}
 	out.FromStatx(&sx)
 	out.Statx.Mode = uint16(n.slot.maskMode(uint32(out.Statx.Mode), false))
+	n.slot.idMap.applyStatx(out)
 	return 0
 }
 
@@ -203,7 +210,7 @@ func (n *FileShareNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.S
 	if n.slot.isReadOnly() {
 		return syscall.EROFS
 	}
-	if errno := validateSetAttrIn(in, n.slot.root.euid, n.slot.root.egid); errno != 0 {
+	if errno := validateSetAttrInWithIDMap(in, n.slot.root.euid, n.slot.root.egid, n.slot.idMap); errno != 0 {
 		return errno
 	}
 	if f != nil {
@@ -245,6 +252,7 @@ func (n *FileShareNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.S
 	}
 	out.FromStat(&st)
 	out.Attr.Mode = n.slot.maskMode(out.Attr.Mode, false)
+	n.slot.idMap.applyAttr(&out.Attr)
 	return 0
 }
 
@@ -348,11 +356,23 @@ type WorkspaceHub struct {
 	dataDir  string
 	euid     uint32
 	egid     uint32
+	idMap    guestIDMap
 	bootTime time.Time
 }
 
+var (
+	_ fs.NodeGetxattrer  = (*WorkspaceHub)(nil)
+	_ fs.NodeListxattrer = (*WorkspaceHub)(nil)
+)
+
 // NewWorkspaceHub creates a WorkspaceHub preloaded with initial shares.
 func NewWorkspaceHub(initial []HubShareConfig, dataDir string) (*WorkspaceHub, error) {
+	return NewWorkspaceHubWithIDMap(initial, dataDir, false, 0, 0)
+}
+
+// NewWorkspaceHubWithIDMap creates a WorkspaceHub preloaded with initial shares
+// and optional mapped guest UID and GID ownership values.
+func NewWorkspaceHubWithIDMap(initial []HubShareConfig, dataDir string, mapGuestIDs bool, guestUID, guestGID uint32) (*WorkspaceHub, error) {
 	homeReal := ""
 	if hDir, err := os.UserHomeDir(); err == nil && hDir != "" {
 		if eval, eErr := filepath.EvalSymlinks(hDir); eErr == nil {
@@ -368,6 +388,7 @@ func NewWorkspaceHub(initial []HubShareConfig, dataDir string) (*WorkspaceHub, e
 		dataDir:  dataDir,
 		euid:     uint32(os.Geteuid()),
 		egid:     uint32(os.Getegid()),
+		idMap:    newGuestIDMap(mapGuestIDs, guestUID, guestGID),
 		bootTime: time.Now(),
 	}
 	for _, cfg := range initial {
@@ -462,7 +483,7 @@ func (h *WorkspaceHub) validateAndPrepareSlot(cfg HubShareConfig) (*shareSlot, f
 			pr.Close()
 			return nil, nil, syscall.Stat_t{}, syscall.Timespec{}, fmt.Errorf("share %q is not a regular file", resolvedHost)
 		}
-		slot := newShareSlot(slotID, guestName, resolvedHost, true, fileName, pr, h.hidden, cfg.ReadOnly, config.VCSMask)
+		slot := newShareSlotWithIDMap(slotID, guestName, resolvedHost, true, fileName, pr, h.hidden, cfg.ReadOnly, config.VCSMask, h.idMap)
 		node := &FileShareNode{slot: slot}
 		return slot, node, st, btime, nil
 	}
@@ -471,7 +492,7 @@ func (h *WorkspaceHub) validateAndPrepareSlot(cfg HubShareConfig) (*shareSlot, f
 	if err != nil {
 		return nil, nil, syscall.Stat_t{}, syscall.Timespec{}, fmt.Errorf("open directory share %q: %w", resolvedHost, err)
 	}
-	slot := newShareSlot(slotID, guestName, resolvedHost, false, "", pr, h.hidden, cfg.ReadOnly, policy)
+	slot := newShareSlotWithIDMap(slotID, guestName, resolvedHost, false, "", pr, h.hidden, cfg.ReadOnly, policy, h.idMap)
 	node := buildRootFilteredNode(resolvedHost, pr, st, slot)
 	return slot, node, st, btime, nil
 }
@@ -709,6 +730,7 @@ func (h *WorkspaceHub) fillHubAttr(attr *fuse.Attr) {
 	attr.Nlink = 2
 	attr.Uid = h.euid
 	attr.Gid = h.egid
+	h.idMap.applyAttr(attr)
 	sec := uint64(h.bootTime.Unix())
 	nsec := uint32(h.bootTime.Nanosecond())
 	attr.Atime = sec
@@ -773,6 +795,7 @@ func (h *WorkspaceHub) Lookup(ctx context.Context, name string, out *fuse.EntryO
 
 	out.Attr.FromStat(&st)
 	out.Attr.Mode = slot.maskMode(out.Attr.Mode, false)
+	slot.idMap.applyAttr(&out.Attr)
 	out.SetEntryTimeout(hubEntryTimeout)
 	out.SetAttrTimeout(hubEntryTimeout)
 
@@ -886,6 +909,16 @@ func (h *WorkspaceHub) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Se
 	return syscall.EROFS
 }
 
+func (h *WorkspaceHub) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	_, _, _ = ctx, attr, dest
+	return 0, unix.ENODATA
+}
+
+func (h *WorkspaceHub) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	_, _ = ctx, dest
+	return 0, 0
+}
+
 func (h *WorkspaceHub) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
 	_, _, _, _ = ctx, attr, data, flags
 	return syscall.EROFS
@@ -899,10 +932,16 @@ func (h *WorkspaceHub) Removexattr(ctx context.Context, attr string) syscall.Err
 // MountWorkspaceHub mounts a multiplexed WorkspaceHub onto mntDir and starts its
 // peer-authenticated control socket at sockPath when sockPath is non-empty.
 func MountWorkspaceHub(mntDir, sockPath string, initial []HubShareConfig, dataDir string) (*WorkspaceHub, *fuse.Server, io.Closer, error) {
+	return MountWorkspaceHubWithIDMap(mntDir, sockPath, initial, dataDir, false, 0, 0)
+}
+
+// MountWorkspaceHubWithIDMap mounts a multiplexed WorkspaceHub onto mntDir with
+// optional mapped guest UID and GID ownership values.
+func MountWorkspaceHubWithIDMap(mntDir, sockPath string, initial []HubShareConfig, dataDir string, mapGuestIDs bool, guestUID, guestGID uint32) (*WorkspaceHub, *fuse.Server, io.Closer, error) {
 	if mntDir == "" {
 		return nil, nil, nil, errors.New("workspace hub mount directory is required")
 	}
-	hub, err := NewWorkspaceHub(initial, dataDir)
+	hub, err := NewWorkspaceHubWithIDMap(initial, dataDir, mapGuestIDs, guestUID, guestGID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1056,8 +1095,11 @@ func handleHubControlConn(conn *net.UnixConn, hub *WorkspaceHub, expectedUID uin
 }
 
 type hubBootstrapSpec struct {
-	DataDir string           `json:"data_dir,omitempty"`
-	Shares  []HubShareConfig `json:"shares"`
+	DataDir     string           `json:"data_dir,omitempty"`
+	MapGuestIDs bool             `json:"map_guest_ids,omitempty"`
+	GuestUID    uint32           `json:"guest_uid,omitempty"`
+	GuestGID    uint32           `json:"guest_gid,omitempty"`
+	Shares      []HubShareConfig `json:"shares"`
 }
 
 func runHubDaemonFromFlags(mntDir, sockPath string, specFD int, specFile string) error {
@@ -1089,7 +1131,7 @@ func runHubDaemonFromFlags(mntDir, sockPath string, specFD int, specFile string)
 		}
 	}
 
-	hub, server, ln, err := MountWorkspaceHub(mntDir, sockPath, spec.Shares, spec.DataDir)
+	hub, server, ln, err := MountWorkspaceHubWithIDMap(mntDir, sockPath, spec.Shares, spec.DataDir, spec.MapGuestIDs, spec.GuestUID, spec.GuestGID)
 	if err != nil {
 		return err
 	}
@@ -1129,8 +1171,11 @@ func StartHubSubprocess(exePath, mntDir, sockPath, pidFile string, initial []Hub
 	}
 
 	specBytes, err := json.Marshal(hubBootstrapSpec{
-		DataDir: dataDir,
-		Shares:  initial,
+		DataDir:     dataDir,
+		MapGuestIDs: true,
+		GuestUID:    1000,
+		GuestGID:    1000,
+		Shares:      initial,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("marshal hub bootstrap spec: %w", err)

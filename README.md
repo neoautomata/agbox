@@ -102,7 +102,7 @@ ______________________________________________________________________
    - The filter rejects absolute symlinks, symlinks that escape the share root, and symlinks that reference VCS names (`EPERM`).
    - The filter blocks FIFOs, sockets, device nodes, `setuid`/`setgid` bits, ownership changes, raw host `ioctl` calls, and non-`user.*` extended attributes (`EPERM`).
 1. **Non-Root Guest User (`agent`, `1000:1000`) with Passwordless `sudo`:**
-   The guest runs agents and commands as user `agent` (`1000:1000`). `agbox` mounts shared volumes with `uid=1000,gid=1000` to match standard Linux file ownership. Passwordless `sudo` lets the agent install packages inside the microVM.
+   The guest runs agents and commands as user `agent` (`1000:1000`). The FUSE Workspace Hub presents shared workspace files as `1000:1000` inside `/workspace` (`stat-virt=off`), avoiding host extended attribute writes. Read-only host caches (`skills`, `rules`, and `agents`) mount with `uid=1000,gid=1000` (`stat-virt=relaxed`). Passwordless `sudo` lets the agent install packages inside the microVM.
 1. **Secret Delivery Over `stdin`:**
    `agbox` never stores host API keys in the base snapshot or on the host disk. `agbox` never passes secrets in CLI arguments where local processes can read `/proc/<pid>/cmdline`. Instead, `agbox` streams secrets over `stdin` into `/home/agent/.agbox-keys.sh` (`0600`) inside the microVM.
 
@@ -210,12 +210,12 @@ agbox/
 go test -v -race ./...
 ```
 
-Run the automated verification harness from the repository root:
+Run the automated verification harness (`./test.sh`) from the repository root. By default, `./test.sh` runs completely unattended, leaves existing binaries, images, sandboxes, and configuration untouched (verified by `99-verify-host-unchanged`), continues testing remaining checks if an error occurs, and writes per-check logs to `/tmp/agbox-test-logs-*`:
 
-- `./test.sh`: Quick non-disruptive run that preserves existing binaries, images, sandboxes, and configuration
-- `./test.sh --full`: Extended non-disruptive run that adds firewall, FD revocation, lock contention, HTTP serve, live update, and isolated lifecycle checks
-- `./test.sh --skip-vm`: Offline unit, CLI contract, and FUSE Workspace Hub checks for environments without KVM or `msb`
-- `./test.sh --disruptive`: Clean-slate test that clears and reinstalls default host state, verifies fresh setup, and cleans up before exit
-- `./test.sh --full --disruptive`: Maximum coverage combining the extended checks with the clean-slate host lifecycle
+- `./test.sh`: Quick non-disruptive run covering static checks, race-tested unit tests, FUSE Workspace Hub, and core microVM workflows
+- `./test.sh --full`: Extended non-disruptive run adding firewall, FD revocation, lock contention, authenticated `--serve`, live update, and isolated lifecycle checks
+- `./test.sh --skip-vm`: Offline unit, style, CLI security contract, fake-`msb` validation, and FUSE Workspace Hub checks for environments without KVM or `msb`
+- `./test.sh --disruptive`: Clean-slate test that backs up host state, clears and reinstalls default host binaries and snapshots, verifies fresh setup, and restores original host state on exit
+- `./test.sh --full --disruptive`: Maximum end-to-end coverage combining the extended suite with the clean-slate host lifecycle
 
-Run `./test.sh --help` for filtering, logging, and root options.
+Prerequisites: Go, `msb`, `/dev/kvm`, and FUSE for full runs (only Go and FUSE, or root for direct FUSE mounts without `fusermount`, for `--skip-vm`). Run `./test.sh --help` for filtering, logging, and root options, and see [`AGENTS.md`](AGENTS.md) for `test.sh` authoring rules and integration contracts.

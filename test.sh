@@ -1182,6 +1182,19 @@ assert_not_contains() {
   fi
 }
 
+run_capture() {
+  local __var_name="$1"
+  shift
+  local __out=""
+  local __rc=0
+  __out="$("$@" 2>&1)" || __rc=$?
+  printf -v "${__var_name}" '%s' "${__out}"
+  if [[ "${__rc}" -ne 0 ]]; then
+    printf '%s\n' "${__out}" >&2
+  fi
+  return "${__rc}"
+}
+
 run_check() {
   local id="$1"
   local desc="$2"
@@ -1533,14 +1546,20 @@ EOF
   if [[ -r /dev/kvm && -w /dev/kvm ]]; then
     local cmd_fake_bin="${TEST_ROOT}/fake-msb-cmd-bin"
     local cmd_data="${TEST_ROOT}/cmd-stream-data"
-    rm -rf "${cmd_fake_bin}" "${cmd_data}"
-    mkdir -p "${cmd_fake_bin}" "${cmd_data}"
-    chmod 0700 "${cmd_fake_bin}" "${cmd_data}"
+    local cmd_msb="${TEST_ROOT}/cmd-msb-home"
+    local cmd_snap_log="${TEST_ROOT}/fake-msb-snap-restore.log"
+    rm -rf "${cmd_fake_bin}" "${cmd_data}" "${cmd_msb}" "${cmd_snap_log}"
+    mkdir -p "${cmd_fake_bin}" "${cmd_data}/skills/s1" "${cmd_msb}/volumes/agbox-profile-fakeprof"
+    chmod 0700 "${cmd_fake_bin}" "${cmd_data}" "${cmd_msb}"
     cat > "${cmd_data}/config" <<'EOF'
 agent=both
 snapshot=agbox:v1
 EOF
     chmod 0600 "${cmd_data}/config"
+    printf 'FAKE_DISK' > "${cmd_msb}/volumes/agbox-profile-fakeprof/disk.raw"
+    chmod 0600 "${cmd_msb}/volumes/agbox-profile-fakeprof/disk.raw"
+    printf '# skill\n' > "${cmd_data}/skills/s1/SKILL.md"
+    chmod 0600 "${cmd_data}/skills/s1/SKILL.md"
 
     cat > "${cmd_fake_bin}/msb" <<'EOF'
 #!/usr/bin/env bash
@@ -1551,8 +1570,32 @@ case "${sub}" in
     exit 0
     ;;
   snap)
+    if [[ "${1:-}" == "restore" ]]; then
+      if [[ -n "${FAKE_MSB_SNAP_LOG:-}" ]]; then
+        printf '%s\n' "$*" >> "${FAKE_MSB_SNAP_LOG}"
+      fi
+      exit 0
+    fi
     echo "agbox:v1 1m 100M"
     exit 0
+    ;;
+  volume)
+    vsub="${1:-}"
+    shift || true
+    case "${vsub}" in
+      ls)
+        echo "agbox-profile-fakeprof disk 128M"
+        exit 0
+        ;;
+      inspect)
+        vname="${1:-agbox-profile-fakeprof}"
+        printf 'Name: %s\nKind: disk\nPath: %s/volumes/%s/disk.raw\n' "${vname}" "${MSB_HOME}" "${vname}"
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
     ;;
   exec)
     has_stream=0
@@ -1603,13 +1646,37 @@ EOF
 
     local cmd_stdout="${TEST_ROOT}/fake-cmd.stdout"
     local cmd_stderr="${TEST_ROOT}/fake-cmd.stderr"
-    PATH="${cmd_fake_bin}:${PATH}" AGBOX_DATA_DIR="${cmd_data}" agbox_exec "${TEST_BIN}" run --no-net --cmd "echo hi" </dev/null >"${cmd_stdout}" 2>"${cmd_stderr}"
+    PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" FAKE_MSB_SNAP_LOG="${cmd_snap_log}" \
+      agbox_exec "${TEST_BIN}" run --no-net --profile fakeprof --cmd "echo hi" </dev/null >"${cmd_stdout}" 2>"${cmd_stderr}"
     assert_contains "$(cat "${cmd_stdout}")" "FAKE_CMD_STDOUT_OK" "fake msb --cmd stdout"
     assert_not_contains "$(cat "${cmd_stdout}")" "FAKE_CMD_STDERR_OK" "fake msb --cmd stdout excludes stderr"
     assert_contains "$(cat "${cmd_stderr}")" "FAKE_CMD_STDERR_OK" "fake msb --cmd stderr"
 
+    local snap_log=""
+    snap_log="$(cat "${cmd_snap_log}")"
+    assert_contains "${snap_log}" "--mount-disk ${cmd_msb}/volumes/agbox-profile-fakeprof/disk.raw:/home/agent/.agbox-profile:rw,format=raw,fstype=ext4" "fake msb --profile mount-disk"
+    assert_not_contains "${snap_log}" "-v agbox-profile-" "fake msb --profile omits dir volume flag"
+    assert_contains "${snap_log}" ":ro,stat-virt=relaxed,uid=1000,gid=1000" "fake msb skills ro stat-virt=relaxed"
+    assert_not_contains "${snap_log}" "stat-virt=off,uid=" "fake msb never combines stat-virt=off with uid"
+
+    local fm_bin=""
+    fm_bin="$(resolve_fusermount_bin 2>/dev/null || true)"
+    if [[ -r /dev/fuse && -w /dev/fuse ]] && [[ "${EUID_VAL}" -eq 0 || -n "${fm_bin}" ]]; then
+      local cmd_ws="${TEST_ROOT}/cmd-ws"
+      rm -rf "${cmd_ws}"
+      mkdir -p "${cmd_ws}"
+      chmod 0700 "${cmd_ws}"
+      : > "${cmd_snap_log}"
+      PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" FAKE_MSB_SNAP_LOG="${cmd_snap_log}" \
+        agbox_exec "${TEST_BIN}" run --no-net --cmd "echo hi" "${cmd_ws}" </dev/null >/dev/null
+      snap_log="$(cat "${cmd_snap_log}")"
+      assert_contains "${snap_log}" ":/workspace:rw,stat-virt=off" "fake msb workspace hub rw stat-virt=off"
+      assert_not_contains "${snap_log}" "stat-virt=off,uid=" "fake msb workspace hub omits uid with stat-virt=off"
+    fi
+
     local pipe_out=""
-    pipe_out="$(printf 'piped-hello\n' | PATH="${cmd_fake_bin}:${PATH}" AGBOX_DATA_DIR="${cmd_data}" agbox_exec "${TEST_BIN}" run --no-net --cmd "cat" 2>&1)"
+    PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" run_capture pipe_out \
+      agbox_exec "${TEST_BIN}" run --no-net --cmd "cat" <<< 'piped-hello'
     assert_contains "${pipe_out}" "FAKE_CMD_PIPED:piped-hello" "fake msb --cmd piped stdin"
   else
     echo "/dev/kvm not accessible. Skipping CLI fake-msb --cmd streaming subcheck (covered by Go unit test)."
@@ -1817,7 +1884,7 @@ check_09_kvm_and_msb_preflight() {
 check_10_agbox_setup() {
   build_test_binaries
   local out=""
-  out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 agbox_exec "${ACTIVE_BIN}" setup 2>&1)"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 agbox_exec "${ACTIVE_BIN}" setup
   printf '%s\n' "${out}"
   assert_contains "${out}" "Smoke test: OK" "agbox setup output"
 }
@@ -1839,7 +1906,7 @@ check_10_disruptive_clean_pre() {
   DISRUPTIVE_SETUP_DONE=1
   MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 120 agbox_exec "${TEST_BIN}" remove --yes
   local st_out=""
-  st_out="$(MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" agbox_exec "${TEST_BIN}" status)"
+  MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" run_capture st_out agbox_exec "${TEST_BIN}" status
   printf '%s\n' "${st_out}"
   assert_contains "${st_out}" "(none - run create-base)" "status after pre-clean remove"
 }
@@ -1869,16 +1936,16 @@ check_12_disruptive_create_and_edit_base() {
     load_base_info_from_config "${ORIG_DATA_DIR}/config"
     assert_contains "${BASE_SNAP}" "agbox:v2" "config snapshot after edit-base"
 
-    base_cmd_out="$(MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-ebchk" --cmd \
-      'command -v mdformat >/dev/null && command -v shellcheck >/dev/null && command -v jq >/dev/null && command -v go >/dev/null && command -v hugo >/dev/null && grep -qx e2e-v2 /etc/agbox-e2e-v2 && test ! -e /etc/agbox-unsnapped && echo BASE_CMD_STDOUT_OK' 2>&1)"
+    MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" run_capture base_cmd_out with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-ebchk" --cmd \
+      'command -v mdformat >/dev/null && command -v shellcheck >/dev/null && command -v jq >/dev/null && command -v go >/dev/null && command -v hugo >/dev/null && grep -qx e2e-v2 /etc/agbox-e2e-v2 && test ! -e /etc/agbox-unsnapped && echo BASE_CMD_STDOUT_OK'
     printf '%s\n' "${base_cmd_out}"
     assert_contains "${base_cmd_out}" "BASE_CMD_STDOUT_OK" "check_12 --cmd stdout"
   else
     MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 900 agbox_exec "${ACTIVE_BIN}" create-base both
     load_base_info_from_config "${ORIG_DATA_DIR}/config"
     [[ -n "${BASE_SNAP}" ]] || { echo "Missing snapshot in config" >&2; return 1; }
-    base_cmd_out="$(MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-basechk" --cmd \
-      'command -v mdformat >/dev/null && command -v shellcheck >/dev/null && echo BASE_CMD_STDOUT_OK' 2>&1)"
+    MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" run_capture base_cmd_out with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-basechk" --cmd \
+      'command -v mdformat >/dev/null && command -v shellcheck >/dev/null && echo BASE_CMD_STDOUT_OK'
     printf '%s\n' "${base_cmd_out}"
     assert_contains "${base_cmd_out}" "BASE_CMD_STDOUT_OK" "check_12 --cmd stdout"
   fi
@@ -1966,8 +2033,8 @@ echo "GUEST_EPH_OK"
 '
 
   local out=""
-  out="$(OPENAI_API_KEY="sk-e2e-stream-test" MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-eph" --share "${docs}:ro,as=docs" --cmd "${guest_script}" "${proj}" 2>&1)"
+  OPENAI_API_KEY="sk-e2e-stream-test" MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-eph" --share "${docs}:ro,as=docs" --cmd "${guest_script}" "${proj}"
   printf '%s\n' "${out}"
   assert_contains "${out}" "GUEST_EPH_OK" "ephemeral guest verification"
   [[ "$(cat "${proj}/src/app.txt")" == "modified-in-vm" ]] || { echo "Expected guest write to persist to host" >&2; return 1; }
@@ -1992,8 +2059,8 @@ echo "GUEST_EPH_OK"
   assert_contains "$(cat "${io_stderr}")" "LIVE_STDERR_LINE" "live --cmd stderr"
 
   local pipe_out=""
-  pipe_out="$(printf 'LIVE_STDIN_PAYLOAD\n' | MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout_stdin 120 \
-    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-pipe" --cmd 'cat' 2>&1)"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture pipe_out with_timeout_stdin 120 \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-pipe" --cmd 'cat' <<< 'LIVE_STDIN_PAYLOAD'
   printf '%s\n' "${pipe_out}"
   assert_contains "${pipe_out}" "LIVE_STDIN_PAYLOAD" "live --cmd piped stdin"
 
@@ -2044,7 +2111,7 @@ EOF
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" profile create --size 128M "${prof}"
 
   local st_out=""
-  st_out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 30 agbox_exec "${ACTIVE_BIN}" status)"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture st_out with_timeout 30 agbox_exec "${ACTIVE_BIN}" status
   assert_contains "${st_out}" "antigravity" "status auth"
   assert_contains "${st_out}" "e2e-skill" "status skills"
   assert_contains "${st_out}" "always" "status rules"
@@ -2074,8 +2141,8 @@ printf "oc-history-ok\n" > /home/agent/.local/share/opencode/hist.txt
 echo "PERSIST_RUN1_OK"
 '
   local out1=""
-  out1="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-    agbox_exec "${ACTIVE_BIN}" run --no-net --profile "${prof}" --name "${SUITE_ID}-pr1" --cmd "${script1}" "${proj}")"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out1 with_timeout 180 \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --profile "${prof}" --name "${SUITE_ID}-pr1" --cmd "${script1}" "${proj}"
   printf '%s\n' "${out1}"
   assert_contains "${out1}" "PERSIST_RUN1_OK" "persist run 1"
 
@@ -2093,8 +2160,8 @@ fi
 echo "PERSIST_RUN2_OK"
 '
   local out2=""
-  out2="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-    agbox_exec "${ACTIVE_BIN}" run --no-net --profile "${prof}" --no-skills --no-rules --no-auth --no-agent-cache --name "${SUITE_ID}-pr2" --cmd "${script2}")"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out2 with_timeout 180 \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --profile "${prof}" --no-skills --no-rules --no-auth --no-agent-cache --name "${SUITE_ID}-pr2" --cmd "${script2}"
   printf '%s\n' "${out2}"
   assert_contains "${out2}" "PERSIST_RUN2_OK" "persist run 2 opt-out"
 
@@ -2148,8 +2215,8 @@ check_22_persist_remote_control_shares_suspend_resume() {
     wait_for_sandbox_gone "${RUNTIME_MSB_HOME}" "${fail_sbx}" 15 || { echo "Expected failed rc sandbox ${fail_sbx} to be cleaned up" >&2; return 1; }
 
     # Boot detached persistent Remote Control with auth + skill + rule + agent cache.
-    out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-      agbox_exec "${ACTIVE_BIN}" run --persist --name "${sbx_name}" -d --remote-control "${proj}" 2>&1)"
+    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
+      agbox_exec "${ACTIVE_BIN}" run --persist --name "${sbx_name}" -d --remote-control "${proj}"
     printf '%s\n' "${out}"
     assert_contains "${out}" "Remote Control active (${sbx})" "remote-control status output"
     assert_contains "${out}" "agbox suspend ${sbx}" "detached suspend hint"
@@ -2161,8 +2228,8 @@ check_22_persist_remote_control_shares_suspend_resume() {
     [[ "${rc}" -ne 0 ]] || return 1
     assert_contains "${rej_out}" "[agbox] ERROR:" "opencode base rejects remote-control"
 
-    out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-      agbox_exec "${ACTIVE_BIN}" run --persist --name "${sbx_name}" -d --serve "${proj}" 2>&1)"
+    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
+      agbox_exec "${ACTIVE_BIN}" run --persist --name "${sbx_name}" -d --serve "${proj}"
     printf '%s\n' "${out}"
     assert_contains "${out}" "agbox suspend ${sbx}" "detached serve suspend hint"
   fi
@@ -2170,7 +2237,7 @@ check_22_persist_remote_control_shares_suspend_resume() {
   wait_for_sandbox_running "${RUNTIME_MSB_HOME}" "${sbx}" 20 || { echo "Expected ${sbx} running" >&2; return 1; }
 
   # Live dynamic share list / add (ro,mask default) / set (rw,vcs) / rm.
-  out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 30 agbox_exec "${ACTIVE_BIN}" share list "${sbx}")"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 30 agbox_exec "${ACTIVE_BIN}" share list "${sbx}"
   assert_contains "${out}" "/workspace/proj1" "share list initial"
   assert_contains "${out}" "mode=rw" "share list initial mode"
   assert_contains "${out}" "vcs=mask" "share list initial vcs"
@@ -2227,8 +2294,8 @@ check_23_serve_loopback_probe() {
   fi
   prepare_shared_test_dirs
   local out=""
-  out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-    agbox_exec "${ACTIVE_BIN}" run --name "${SUITE_ID}-probe" --serve --probe "${TEST_ROOT}/proj1" 2>&1)"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
+    agbox_exec "${ACTIVE_BIN}" run --name "${SUITE_ID}-probe" --serve --probe "${TEST_ROOT}/proj1"
   printf '%s\n' "${out}"
   assert_contains "${out}" "OpenCode web UI: http://127.0.0.1:" "--serve URL output"
   assert_contains "${out}" "--probe: UI verified" "--probe verification message"
@@ -2259,8 +2326,8 @@ done
 echo "BLOCKED_RANGES_OK"
 '
   local out=""
-  out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-    agbox_exec "${ACTIVE_BIN}" run --name "${SUITE_ID}-pubfw" --cmd "${net_script}" 2>&1)"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
+    agbox_exec "${ACTIVE_BIN}" run --name "${SUITE_ID}-pubfw" --cmd "${net_script}"
   printf '%s\n' "${out}"
   assert_contains "${out}" "BLOCKED_RANGES_OK" "guest firewall check"
 
@@ -2293,7 +2360,11 @@ check_31_share_open_fd_revocation() {
     agbox_exec "${ACTIVE_BIN}" run --no-net --persist --name "${sbx_name}" --share "${proj}:rw" --cmd "sleep 300" >"${TEST_ROOT}/fd-run.log" 2>&1 </dev/null &
   bg_pid=$!
 
-  wait_for_sandbox_running "${RUNTIME_MSB_HOME}" "${sbx}" 40 || { echo "Timeout waiting for ${sbx}" >&2; return 1; }
+  wait_for_sandbox_running "${RUNTIME_MSB_HOME}" "${sbx}" 40 || {
+    echo "Timeout waiting for ${sbx}" >&2
+    cat "${TEST_ROOT}/fd-run.log" >&2 || true
+    return 1
+  }
   local sock="${RUNTIME_DATA_DIR}/run/${sbx_name}/ws.sock"
   local i=0
   while [[ ! -S "${sock}" && "${i}" -lt 30 ]]; do
@@ -2316,7 +2387,7 @@ check_31_share_open_fd_revocation() {
   done
 
   local sl_out=""
-  sl_out="$(MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 20 agbox_exec "${ACTIVE_BIN}" share list "${sbx}")"
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture sl_out with_timeout 20 agbox_exec "${ACTIVE_BIN}" share list "${sbx}"
   assert_contains "${sl_out}" "open_writable=1" "open_writable=1 reported"
 
   local rc=0
@@ -2400,7 +2471,11 @@ check_32_profile_lock_and_orphan_reaping() {
     agbox_exec "${ACTIVE_BIN}" run --no-net --profile "${prof}" --name "${sbx_name}" --cmd "sleep 300" >"${TEST_ROOT}/lkp.log" 2>&1 </dev/null &
   bg_pid=$!
 
-  wait_for_sandbox_running "${RUNTIME_MSB_HOME}" "${sbx}" 40 || { echo "Timeout waiting for ${sbx}" >&2; return 1; }
+  wait_for_sandbox_running "${RUNTIME_MSB_HOME}" "${sbx}" 40 || {
+    echo "Timeout waiting for ${sbx}" >&2
+    cat "${TEST_ROOT}/lkp.log" >&2 || true
+    return 1
+  }
 
   local rc=0
   local err_out=""
@@ -2469,8 +2544,8 @@ check_33_serve_detached_basic_auth_lifecycle() {
   trap cleanup_33 RETURN
 
   local out=""
-  out="$(OPENCODE_SERVER_PASSWORD="${pass}" MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 180 \
-    agbox_exec "${ACTIVE_BIN}" run --persist --name "${sbx_name}" -d --serve "${TEST_ROOT}/proj1" 2>&1)"
+  OPENCODE_SERVER_PASSWORD="${pass}" MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
+    agbox_exec "${ACTIVE_BIN}" run --persist --name "${sbx_name}" -d --serve "${TEST_ROOT}/proj1"
   printf '%s\n' "${out}"
 
   local url=""
@@ -2509,7 +2584,7 @@ check_34_live_agent_update() {
 
   MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 600 agbox_exec "${ACTIVE_BIN}" update both
   local st=""
-  st="$(AGBOX_DATA_DIR="${ORIG_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" update status)"
+  AGBOX_DATA_DIR="${ORIG_DATA_DIR}" run_capture st agbox_exec "${ACTIVE_BIN}" update status
   assert_contains "${st}" "antigravity: version=" "live update status antigravity"
   assert_contains "${st}" "opencode: version=" "live update status opencode"
 
@@ -2562,7 +2637,7 @@ check_40_isolated_full_lifecycle() {
 
   MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" with_timeout 600 agbox_exec "${ibin}" update both
   local up_st=""
-  up_st="$(AGBOX_DATA_DIR="${iso_data}" agbox_exec "${ibin}" update status)"
+  AGBOX_DATA_DIR="${iso_data}" run_capture up_st agbox_exec "${ibin}" update status
   assert_contains "${up_st}" "antigravity: version=" "iso update status"
   assert_contains "${up_st}" "opencode: version=" "iso update status"
   AGBOX_DATA_DIR="${iso_data}" agbox_exec "${ibin}" update clear all

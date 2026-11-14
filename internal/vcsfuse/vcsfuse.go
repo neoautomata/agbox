@@ -336,6 +336,37 @@ func uint32ToVCSPolicy(v uint32) config.VCSPolicy {
 	}
 }
 
+type guestIDMap struct {
+	enabled bool
+	uid     uint32
+	gid     uint32
+}
+
+func newGuestIDMap(enabled bool, uid, gid uint32) guestIDMap {
+	if !enabled {
+		return guestIDMap{}
+	}
+	return guestIDMap{
+		enabled: true,
+		uid:     uid,
+		gid:     gid,
+	}
+}
+
+func (m guestIDMap) applyAttr(a *fuse.Attr) {
+	if m.enabled && a != nil {
+		a.Uid = m.uid
+		a.Gid = m.gid
+	}
+}
+
+func (m guestIDMap) applyStatx(out *fuse.StatxOut) {
+	if m.enabled && out != nil {
+		out.Statx.Uid = m.uid
+		out.Statx.Gid = m.gid
+	}
+}
+
 // shareSlot holds dynamic permission state, open file handles, and the pinned
 // host directory descriptor for one mounted share.
 type shareSlot struct {
@@ -346,6 +377,7 @@ type shareSlot struct {
 	fileName  string
 	root      *pinnedRoot
 	hidden    map[string]struct{}
+	idMap     guestIDMap
 
 	readOnly  atomic.Bool
 	vcsPolicy atomic.Uint32
@@ -359,6 +391,10 @@ type shareSlot struct {
 }
 
 func newShareSlot(slotID uint64, guestName, hostPath string, isFile bool, fileName string, pr *pinnedRoot, hidden map[string]struct{}, readOnly bool, policy config.VCSPolicy) *shareSlot {
+	return newShareSlotWithIDMap(slotID, guestName, hostPath, isFile, fileName, pr, hidden, readOnly, policy, guestIDMap{})
+}
+
+func newShareSlotWithIDMap(slotID uint64, guestName, hostPath string, isFile bool, fileName string, pr *pinnedRoot, hidden map[string]struct{}, readOnly bool, policy config.VCSPolicy, idMap guestIDMap) *shareSlot {
 	s := &shareSlot{
 		slotID:    slotID,
 		guestName: guestName,
@@ -367,6 +403,7 @@ func newShareSlot(slotID uint64, guestName, hostPath string, isFile bool, fileNa
 		fileName:  fileName,
 		root:      pr,
 		hidden:    hidden,
+		idMap:     idMap,
 		files:     make(map[*safeFile]struct{}),
 	}
 	s.readOnly.Store(readOnly)
@@ -524,7 +561,15 @@ type FilteredNode struct {
 	root   *pinnedRoot
 	slot   *shareSlot
 	hidden map[string]struct{}
+	idMap  guestIDMap
 	isRoot bool
+}
+
+func (n *FilteredNode) activeIDMap() guestIDMap {
+	if n.slot != nil {
+		return n.slot.idMap
+	}
+	return n.idMap
 }
 
 func (n *FilteredNode) OnForget() {
@@ -720,6 +765,7 @@ func (n *FilteredNode) applyAttrMask(attr *fuse.Attr, rel string) {
 	if n.slot != nil {
 		attr.Mode = n.slot.maskMode(attr.Mode, n.isHookProtectedRel(rel))
 	}
+	n.activeIDMap().applyAttr(attr)
 }
 
 func (n *FilteredNode) newChildInode(ctx context.Context, name string, st *syscall.Stat_t, btime *syscall.Timespec) *fs.Inode {
@@ -728,6 +774,7 @@ func (n *FilteredNode) newChildInode(ctx context.Context, name string, st *sysca
 		root:         n.root,
 		slot:         n.slot,
 		hidden:       n.hidden,
+		idMap:        n.activeIDMap(),
 	}
 	_ = name
 	return n.NewInode(ctx, child, n.stableAttr(st, btime))
@@ -799,16 +846,28 @@ func sanitizeCreateMode(mode uint32) uint32 {
 }
 
 func validateSetAttrIn(in *fuse.SetAttrIn, euid, egid int) syscall.Errno {
+	return validateSetAttrInWithIDMap(in, euid, egid, guestIDMap{})
+}
+
+func validateSetAttrInWithIDMap(in *fuse.SetAttrIn, euid, egid int, idMap guestIDMap) syscall.Errno {
 	if m, ok := in.GetMode(); ok {
 		if m&uint32(syscall.S_ISUID|syscall.S_ISGID) != 0 {
 			return syscall.EPERM
 		}
 	}
-	if uid, ok := in.GetUID(); ok && int(uid) != euid {
-		return syscall.EPERM
+	if uid, ok := in.GetUID(); ok {
+		uidMatchesHost := euid >= 0 && uid == uint32(euid)
+		uidMatchesGuest := idMap.enabled && uid == idMap.uid
+		if !uidMatchesHost && !uidMatchesGuest {
+			return syscall.EPERM
+		}
 	}
-	if gid, ok := in.GetGID(); ok && int(gid) != egid {
-		return syscall.EPERM
+	if gid, ok := in.GetGID(); ok {
+		gidMatchesHost := egid >= 0 && gid == uint32(egid)
+		gidMatchesGuest := idMap.enabled && gid == idMap.gid
+		if !gidMatchesHost && !gidMatchesGuest {
+			return syscall.EPERM
+		}
 	}
 	return 0
 }
@@ -822,18 +881,31 @@ type safeFile struct {
 	osFile     *os.File
 	raw        *fs.LoopbackFile
 	slot       *shareSlot
+	idMap      guestIDMap
 	writable   bool
 	revokedErr syscall.Errno
 	euid       int
 	egid       int
 }
 
+func (f *safeFile) activeIDMap() guestIDMap {
+	if f.slot != nil {
+		return f.slot.idMap
+	}
+	return f.idMap
+}
+
 func newRegisteredSafeFile(fd int, slot *shareSlot, writable bool, euid, egid int) (*safeFile, syscall.Errno) {
 	osf := os.NewFile(uintptr(fd), "")
+	var idMap guestIDMap
+	if slot != nil {
+		idMap = slot.idMap
+	}
 	sf := &safeFile{
 		osFile:   osf,
 		raw:      fs.NewLoopbackFileFromOS(osf),
 		slot:     slot,
+		idMap:    idMap,
 		writable: writable,
 		euid:     euid,
 		egid:     egid,
@@ -1005,8 +1077,11 @@ func (f *safeFile) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno
 		return syscall.EBADF
 	}
 	errno := f.raw.Getattr(ctx, out)
-	if errno == 0 && f.slot != nil && f.slot.isReadOnly() {
-		out.Mode = f.slot.maskMode(out.Mode, false)
+	if errno == 0 {
+		if f.slot != nil && f.slot.isReadOnly() {
+			out.Mode = f.slot.maskMode(out.Mode, false)
+		}
+		f.activeIDMap().applyAttr(&out.Attr)
 	}
 	return errno
 }
@@ -1050,12 +1125,16 @@ func (f *safeFile) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.At
 	if f.raw == nil {
 		return syscall.EBADF
 	}
-	if errno := validateSetAttrIn(in, f.euid, f.egid); errno != 0 {
+	if errno := validateSetAttrInWithIDMap(in, f.euid, f.egid, f.activeIDMap()); errno != 0 {
 		return errno
 	}
 	cleanIn := *in
 	cleanIn.Valid &^= fuse.FATTR_UID | fuse.FATTR_GID
-	return f.raw.Setattr(ctx, &cleanIn, out)
+	errno := f.raw.Setattr(ctx, &cleanIn, out)
+	if errno == 0 {
+		f.activeIDMap().applyAttr(&out.Attr)
+	}
+	return errno
 }
 
 func (n *FilteredNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
@@ -1287,6 +1366,7 @@ func (n *FilteredNode) Symlink(ctx context.Context, target, name string, out *fu
 		return nil, fs.ToErrno(err)
 	}
 	out.Attr.FromStat(&st)
+	n.activeIDMap().applyAttr(&out.Attr)
 	return n.newChildInode(ctx, name, &st, &btime), 0
 }
 
@@ -1453,7 +1533,14 @@ func (n *FilteredNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.A
 func (n *FilteredNode) Statx(ctx context.Context, f fs.FileHandle, flags uint32, mask uint32, out *fuse.StatxOut) syscall.Errno {
 	if f != nil {
 		if fga, ok := f.(fs.FileStatxer); ok {
-			return fga.Statx(ctx, flags, mask, out)
+			errno := fga.Statx(ctx, flags, mask, out)
+			if errno == 0 {
+				if n.slot != nil {
+					out.Statx.Mode = uint16(n.slot.maskMode(uint32(out.Statx.Mode), n.isHookProtectedRel(n.relPath())))
+				}
+				n.activeIDMap().applyStatx(out)
+			}
+			return errno
 		}
 	}
 	fd, rel, errno := n.openNodeOPath()
@@ -1470,6 +1557,7 @@ func (n *FilteredNode) Statx(ctx context.Context, f fs.FileHandle, flags uint32,
 	if n.slot != nil {
 		out.Statx.Mode = uint16(n.slot.maskMode(uint32(out.Statx.Mode), n.isHookProtectedRel(rel)))
 	}
+	n.activeIDMap().applyStatx(out)
 	return 0
 }
 
@@ -1481,7 +1569,7 @@ func (n *FilteredNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Se
 	if mutErr != 0 {
 		return mutErr
 	}
-	if errno := validateSetAttrIn(in, n.root.euid, n.root.egid); errno != 0 {
+	if errno := validateSetAttrInWithIDMap(in, n.root.euid, n.root.egid, n.activeIDMap()); errno != 0 {
 		return errno
 	}
 	if f != nil {
@@ -1528,6 +1616,7 @@ func (n *FilteredNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Se
 			}
 		}
 		out.FromStat(&st)
+		n.activeIDMap().applyAttr(&out.Attr)
 		return 0
 	}
 
@@ -1872,6 +1961,10 @@ func (f *filteredStream) Close() {
 }
 
 func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t, slot *shareSlot) *FilteredNode {
+	var idMap guestIDMap
+	if slot != nil {
+		idMap = slot.idMap
+	}
 	rootData := &fs.LoopbackRoot{
 		Path: resolvedSrc,
 		Dev:  uint64(st.Dev),
@@ -1882,6 +1975,7 @@ func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t
 			root:         pr,
 			slot:         slot,
 			hidden:       slot.hidden,
+			idMap:        idMap,
 		}
 	}
 	root := &FilteredNode{
@@ -1889,6 +1983,7 @@ func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t
 		root:         pr,
 		slot:         slot,
 		hidden:       slot.hidden,
+		idMap:        idMap,
 		isRoot:       true,
 	}
 	rootData.RootNode = root
@@ -1898,6 +1993,12 @@ func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t
 // Mount mounts a VCS-filtered loopback view of srcDir onto mntDir and returns
 // the running FUSE server. Call server.Unmount() and server.Wait() to stop it.
 func Mount(srcDir, mntDir string, hiddenEntries []string) (*fuse.Server, error) {
+	return MountWithIDMap(srcDir, mntDir, hiddenEntries, false, 0, 0)
+}
+
+// MountWithIDMap mounts a VCS-filtered loopback view of srcDir onto mntDir
+// while optionally presenting mapped guest UID and GID ownership values.
+func MountWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs bool, guestUID, guestGID uint32) (*fuse.Server, error) {
 	if srcDir == "" || mntDir == "" {
 		return nil, errors.New("both source and mount directories are required")
 	}
@@ -1910,7 +2011,7 @@ func Mount(srcDir, mntDir string, hiddenEntries []string) (*fuse.Server, error) 
 		return nil, fmt.Errorf("open source directory %q: %w", resolvedSrc, err)
 	}
 	hidden := buildHiddenSet(hiddenEntries)
-	slot := newShareSlot(0, "", resolvedSrc, false, "", pr, hidden, false, config.VCSMask)
+	slot := newShareSlotWithIDMap(0, "", resolvedSrc, false, "", pr, hidden, false, config.VCSMask, newGuestIDMap(mapGuestIDs, guestUID, guestGID))
 	root := buildRootFilteredNode(resolvedSrc, pr, st, slot)
 
 	sec := time.Second
@@ -1982,7 +2083,13 @@ func CheckHostSupport(parentDir string) error {
 // RunDaemon mounts srcDir onto mntDir and blocks until the filesystem is
 // unmounted or a termination signal (SIGINT, SIGTERM, SIGHUP) arrives.
 func RunDaemon(srcDir, mntDir string, hiddenEntries []string) error {
-	server, err := Mount(srcDir, mntDir, hiddenEntries)
+	return RunDaemonWithIDMap(srcDir, mntDir, hiddenEntries, false, 0, 0)
+}
+
+// RunDaemonWithIDMap mounts srcDir onto mntDir with optional guest UID/GID
+// presentation mapping and blocks until unmount or termination signal.
+func RunDaemonWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs bool, guestUID, guestGID uint32) error {
+	server, err := MountWithIDMap(srcDir, mntDir, hiddenEntries, mapGuestIDs, guestUID, guestGID)
 	if err != nil {
 		return err
 	}
@@ -2008,6 +2115,9 @@ func RunMain(args []string) int {
 	sock := fsFlags.String("sock", "", "Control socket path for Workspace Hub")
 	specFD := fsFlags.Int("spec-fd", -1, "Open file descriptor containing initial Hub JSON spec")
 	specFile := fsFlags.String("spec", "", "Path to JSON file containing initial Hub spec")
+	mapGuestIDs := fsFlags.Bool("map-guest-ids", false, "Present mapped guest UID/GID ownership")
+	guestUID := fsFlags.Uint("guest-uid", 1000, "Mapped guest UID when -map-guest-ids is set")
+	guestGID := fsFlags.Uint("guest-gid", 1000, "Mapped guest GID when -map-guest-ids is set")
 	if err := fsFlags.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "agbox %s: %v\n", SubcommandName, err)
 		return 2
@@ -2027,7 +2137,7 @@ func RunMain(args []string) int {
 		fmt.Fprintf(os.Stderr, "Usage: agbox %s -src <dir> -mnt <dir>\n", SubcommandName)
 		return 2
 	}
-	if err := RunDaemon(*src, *mnt, DefaultHiddenEntries); err != nil {
+	if err := RunDaemonWithIDMap(*src, *mnt, DefaultHiddenEntries, *mapGuestIDs, uint32(*guestUID), uint32(*guestGID)); err != nil {
 		fmt.Fprintf(os.Stderr, "agbox %s: %v\n", SubcommandName, err)
 		return 1
 	}
@@ -2049,7 +2159,7 @@ func StartSubprocess(exePath, srcDir, mntDir, pidFile string, dieWithParent bool
 		return 0, fmt.Errorf("prepare pidfile directory: %w", err)
 	}
 
-	cmd := exec.Command(exePath, SubcommandName, "-src", srcDir, "-mnt", mntDir)
+	cmd := exec.Command(exePath, SubcommandName, "-src", srcDir, "-mnt", mntDir, "-map-guest-ids", "-guest-uid", "1000", "-guest-gid", "1000")
 	cmd.Stdout = nil
 	cmd.Stderr = os.Stderr
 	if dieWithParent {

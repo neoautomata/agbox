@@ -32,6 +32,12 @@ const GuestUser = "agent"
 // GuestUIDGid is the numeric UID:GID of GuestUser inside the microVM.
 const GuestUIDGid = "1000:1000"
 
+// GuestUID is the numeric UID of GuestUser inside the microVM.
+const GuestUID = 1000
+
+// GuestGID is the numeric GID of GuestUser inside the microVM.
+const GuestGID = 1000
+
 // GuestHome is the home directory of GuestUser inside the microVM.
 const GuestHome = "/home/agent"
 
@@ -721,16 +727,32 @@ type VolumeSpec struct {
 	HostPath  string
 	GuestPath string
 	ReadOnly  bool
+	StatVirt  string
+	HostPerms string
 }
 
-// FormatFlag renders the `-v` value with `uid=1000,gid=1000` so the non-root
-// guest user can read and write shared files regardless of host file modes.
+// FormatFlag renders the `-v` value with explicit stat virtualization and owner
+// mapping options compatible with upstream msb.
 func (v VolumeSpec) FormatFlag() string {
 	mode := "rw"
 	if v.ReadOnly {
 		mode = "ro"
 	}
-	return fmt.Sprintf("%s:%s:%s,uid=1000,gid=1000", v.HostPath, v.GuestPath, mode)
+	statVirt := v.StatVirt
+	if statVirt == "" && v.ReadOnly {
+		statVirt = "relaxed"
+	}
+	opts := []string{mode}
+	if statVirt != "" {
+		opts = append(opts, "stat-virt="+statVirt)
+	}
+	if v.HostPerms != "" && statVirt != "off" {
+		opts = append(opts, "host-perms="+v.HostPerms)
+	}
+	if statVirt != "off" {
+		opts = append(opts, fmt.Sprintf("uid=%d", GuestUID), fmt.Sprintf("gid=%d", GuestGID))
+	}
+	return fmt.Sprintf("%s:%s:%s", v.HostPath, v.GuestPath, strings.Join(opts, ","))
 }
 
 // CreateOpts holds parameters for `msb create`.
@@ -783,30 +805,67 @@ func BuildCreateArgs(opts CreateOpts) ([]string, error) {
 	return args, nil
 }
 
-// NamedVolumeSpec describes an msb named volume (such as a disk-backed profile volume).
-// Disk-backed ext4 volumes use block-device semantics and omit virtiofs uid/gid flags.
-type NamedVolumeSpec struct {
-	VolumeName string
-	GuestPath  string
+// DiskMountSpec describes an explicit raw or qcow2 disk image attached via
+// `msb snap restore --mount-disk`.
+type DiskMountSpec struct {
+	HostPath  string
+	GuestPath string
+	ReadOnly  bool
+	Format    string
+	FSType    string
 }
 
-// FormatFlag renders the `-v` value (`<volume>:<guest_path>`) for a named volume.
-func (v NamedVolumeSpec) FormatFlag() string {
-	return fmt.Sprintf("%s:%s", v.VolumeName, v.GuestPath)
+func hasInvalidMountPath(p string) bool {
+	if p == "" || !strings.HasPrefix(p, "/") {
+		return true
+	}
+	if strings.ContainsAny(p, ":,") {
+		return true
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// FormatFlag renders `<host_path>:<guest_path>:<ro|rw>,format=<fmt>,fstype=<fs>`
+// for `msb --mount-disk`.
+func (d DiskMountSpec) FormatFlag() (string, error) {
+	if hasInvalidMountPath(d.HostPath) {
+		return "", fmt.Errorf("invalid disk mount host path %q: must be an absolute path without colons, commas, or control characters", d.HostPath)
+	}
+	if hasInvalidMountPath(d.GuestPath) {
+		return "", fmt.Errorf("invalid disk mount guest path %q: must be an absolute path without colons, commas, or control characters", d.GuestPath)
+	}
+	mode := "rw"
+	if d.ReadOnly {
+		mode = "ro"
+	}
+	format := d.Format
+	if format == "" {
+		format = "raw"
+	}
+	fsType := d.FSType
+	if fsType == "" {
+		fsType = "ext4"
+	}
+	return fmt.Sprintf("%s:%s:%s,format=%s,fstype=%s", d.HostPath, d.GuestPath, mode, format, fsType), nil
 }
 
 // RestoreOpts holds parameters for `msb snap restore`.
 type RestoreOpts struct {
-	Snapshot     string
-	Name         string
-	User         string
-	CPUs         string
-	Memory       string
-	NamedVolumes []NamedVolumeSpec
-	Volumes      []VolumeSpec
-	Ports        []string // e.g. "127.0.0.1:4096:3000"
-	NoNet        bool
-	NetSpecs     []string
+	Snapshot   string
+	Name       string
+	User       string
+	CPUs       string
+	Memory     string
+	DiskMounts []DiskMountSpec
+	Volumes    []VolumeSpec
+	Ports      []string // e.g. "127.0.0.1:4096:3000"
+	NoNet      bool
+	NetSpecs   []string
 }
 
 // BuildRestoreArgs constructs the CLI argument list for `msb snap restore`.
@@ -832,11 +891,15 @@ func BuildRestoreArgs(opts RestoreOpts) ([]string, error) {
 	if opts.Memory != "" {
 		args = append(args, "--memory", opts.Memory)
 	}
-	for _, nv := range opts.NamedVolumes {
-		args = append(args, "-v", nv.FormatFlag())
-	}
 	for _, v := range opts.Volumes {
 		args = append(args, "-v", v.FormatFlag())
+	}
+	for _, dm := range opts.DiskMounts {
+		flagVal, err := dm.FormatFlag()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--mount-disk", flagVal)
 	}
 	for _, p := range opts.Ports {
 		args = append(args, "-p", p)
@@ -1308,4 +1371,52 @@ func VolumeExists(ctx context.Context, runner Runner, target string) (bool, erro
 		return false, fmt.Errorf("msb volume ls: %w (%s)", err, strings.TrimSpace(res.Stderr))
 	}
 	return slices.Contains(ParseVolumeList(res.Stdout), target), nil
+}
+
+var ansiCSIPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+// ParseVolumeInspectPath extracts the host Path field from `msb volume inspect` output.
+func ParseVolumeInspectPath(out string) string {
+	clean := ansiCSIPattern.ReplaceAllString(out, "")
+	for _, rawLine := range strings.Split(clean, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		var rest string
+		switch {
+		case strings.HasPrefix(line, "Path:"):
+			rest = strings.TrimSpace(strings.TrimPrefix(line, "Path:"))
+		case strings.HasPrefix(line, "Path") && len(line) > len("Path") && (line[len("Path")] == ' ' || line[len("Path")] == '\t'):
+			rest = strings.TrimSpace(line[len("Path"):])
+		default:
+			continue
+		}
+		if strings.HasPrefix(rest, "/") {
+			return rest
+		}
+	}
+	return ""
+}
+
+// ResolveVolumeDiskPath determines the backing disk.raw path for a named disk
+// volume using `msb volume inspect`, falling back to msbHome/volumes/<vol>/disk.raw.
+func ResolveVolumeDiskPath(ctx context.Context, runner Runner, msbHome, volName string) (string, error) {
+	if strings.TrimSpace(volName) == "" {
+		return "", errors.New("volume name is required")
+	}
+	var diskPath string
+	if runner != nil {
+		res, err := runner.Run(ctx, CommandRequest{Args: []string{"volume", "inspect", volName}})
+		if err == nil {
+			diskPath = ParseVolumeInspectPath(res.Stdout)
+		}
+	}
+	if diskPath == "" && msbHome != "" {
+		diskPath = filepath.Join(msbHome, "volumes", volName, "disk.raw")
+	}
+	if hasInvalidMountPath(diskPath) {
+		return "", fmt.Errorf("resolved disk path %q for volume %q is invalid or empty", diskPath, volName)
+	}
+	return diskPath, nil
 }

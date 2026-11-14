@@ -1813,6 +1813,15 @@ func parseSizeBytes(spec string) (int64, bool) {
 	return n * mult, true
 }
 
+func supportsUserXattr(path string, isDir bool) bool {
+	checkPath := path
+	if !isDir {
+		checkPath = filepath.Dir(path)
+	}
+	_, err := unix.Getxattr(checkPath, "user.agbox.probe", nil)
+	return err == nil || errors.Is(err, unix.ENODATA) || errors.Is(err, syscall.ERANGE)
+}
+
 // Run restores an ephemeral or persistent microVM from the base snapshot.
 // It validates and mounts host paths, streams saved login and API keys over stdin, and starts the agent.
 // On exit, Run deletes the microVM and unmounts FUSE shares unless persistent, suspended, or detached.
@@ -1927,7 +1936,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	}
 
 	var profLock *persist.ProfileLock
-	var namedVolumes []msb.NamedVolumeSpec
+	var diskMounts []msb.DiskMountSpec
 	if opts.Profile != "" {
 		var lErr error
 		profLock, lErr = persist.LockProfile(a.Env.DataDir, opts.Profile)
@@ -1943,9 +1952,16 @@ func (a *App) Run(ctx context.Context, args []string) error {
 		if vErr != nil {
 			return vErr
 		}
-		namedVolumes = append(namedVolumes, msb.NamedVolumeSpec{
-			VolumeName: volName,
-			GuestPath:  msb.GuestProfileMount,
+		diskPath, dErr := msb.ResolveVolumeDiskPath(ctx, a.MSB, a.Env.MSBHome, volName)
+		if dErr != nil {
+			return dErr
+		}
+		diskMounts = append(diskMounts, msb.DiskMountSpec{
+			HostPath:  diskPath,
+			GuestPath: msb.GuestProfileMount,
+			ReadOnly:  false,
+			Format:    "raw",
+			FSType:    "ext4",
 		})
 	}
 
@@ -2078,6 +2094,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 					HostPath:  wsDir,
 					GuestPath: msb.GuestWorkspace,
 					ReadOnly:  false,
+					StatVirt:  "off",
 				})
 				for i, target := range validated {
 					masked := target.IsDir && target.VCSPolicy == config.VCSMask
@@ -2110,10 +2127,25 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	if !workspaceHubActive {
 		for i, target := range validated {
 			guestPath := msb.GuestWorkspace + "/" + target.GuestName
+			statVirt := "relaxed"
+			hostPerms := ""
+			if !target.ReadOnly {
+				euid := os.Geteuid()
+				if a.GetEUID != nil {
+					euid = a.GetEUID()
+				}
+				if (euid == config.GuestUID && os.Getegid() == config.GuestGID) || !supportsUserXattr(target.HostPath, target.IsDir) {
+					statVirt = "off"
+				} else {
+					hostPerms = "mirror"
+				}
+			}
 			volumes = append(volumes, msb.VolumeSpec{
 				HostPath:  target.HostPath,
 				GuestPath: guestPath,
 				ReadOnly:  target.ReadOnly,
+				StatVirt:  statVirt,
+				HostPerms: hostPerms,
 			})
 			if target.IsDir {
 				directCount++
@@ -2144,6 +2176,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			HostPath:  skillsDir,
 			GuestPath: msb.GuestSkillsMount,
 			ReadOnly:  true,
+			StatVirt:  "relaxed",
 		})
 	}
 	if rulesMounted {
@@ -2151,6 +2184,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			HostPath:  rulesDir,
 			GuestPath: msb.GuestRulesMount,
 			ReadOnly:  true,
+			StatVirt:  "relaxed",
 		})
 	}
 	if agentsMounted {
@@ -2158,6 +2192,7 @@ func (a *App) Run(ctx context.Context, args []string) error {
 			HostPath:  agentsDir,
 			GuestPath: msb.GuestAgentsMount,
 			ReadOnly:  true,
+			StatVirt:  "relaxed",
 		})
 	}
 
@@ -2199,16 +2234,16 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	}
 
 	restoreArgs, err := msb.BuildRestoreArgs(msb.RestoreOpts{
-		Snapshot:     baseState.Snapshot,
-		Name:         runSandbox,
-		User:         config.GuestUser,
-		CPUs:         defaultStr(opts.CPUs, a.Env.CPUs),
-		Memory:       defaultStr(opts.Memory, a.Env.Memory),
-		Volumes:      volumes,
-		NamedVolumes: namedVolumes,
-		Ports:        portArgs,
-		NoNet:        opts.NoNet,
-		NetSpecs:     opts.NetSpecs,
+		Snapshot:   baseState.Snapshot,
+		Name:       runSandbox,
+		User:       config.GuestUser,
+		CPUs:       defaultStr(opts.CPUs, a.Env.CPUs),
+		Memory:     defaultStr(opts.Memory, a.Env.Memory),
+		Volumes:    volumes,
+		DiskMounts: diskMounts,
+		Ports:      portArgs,
+		NoNet:      opts.NoNet,
+		NetSpecs:   opts.NetSpecs,
 	})
 	if err != nil {
 		return err

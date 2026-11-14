@@ -857,7 +857,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 			foundRestore = true
 			for _, want := range []string{
 				"--name agbox-sec1",
-				"/run/sec1/ws:/workspace:rw",
+				"/run/sec1/ws:/workspace:rw,stat-virt=off",
 				"--net-default deny --net-rule allow@dns --net-rule deny@host --net-rule deny@loopback --net-rule deny@private --net-rule deny@link-local --net-rule deny@multicast --net-rule deny@meta",
 				"--net-rule deny@168.63.129.16/32",
 				"--net-rule deny@100.100.100.200/32",
@@ -1818,7 +1818,7 @@ func TestPersistentSkillsAndProjectWorkingDirectory(t *testing.T) {
 	if rc := app.Dispatch(ctx, []string{"run", "antigravity", proj1}); rc != 0 {
 		t.Fatalf("run antigravity proj1 failed: %s", stderr.String())
 	}
-	wantSkillsVol := filepath.Join(app.Env.DataDir, "skills") + ":" + msb.GuestSkillsMount + ":ro,uid=1000,gid=1000"
+	wantSkillsVol := filepath.Join(app.Env.DataDir, "skills") + ":" + msb.GuestSkillsMount + ":ro,stat-virt=relaxed,uid=1000,gid=1000"
 	foundSkillsVol := false
 	foundSkillsBind := false
 	foundProjCWD := false
@@ -2080,14 +2080,15 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 	if rc := app.Dispatch(ctx, []string{"run", "--name", "ephem1", "--profile", "workprof", "--conversation", "1c2a8c1e", "antigravity", proj}); rc != 0 {
 		t.Fatalf("run --profile failed: %s", stderr.String())
 	}
-	foundNamedVol := false
+	wantDiskFlag := filepath.Join(app.Env.MSBHome, "volumes", "agbox-profile-workprof", "disk.raw") + ":" + msb.GuestProfileMount + ":rw,format=raw,fstype=ext4"
+	foundDiskMount := false
 	foundProfileBind := false
 	foundConv := false
 	foundEphemeralRM := false
 	for _, c := range runner.calls {
 		joined := strings.Join(c.Args, " ")
-		if strings.HasPrefix(joined, "snap restore ") && slices.Contains(c.Args, "agbox-profile-workprof:"+msb.GuestProfileMount) {
-			foundNamedVol = true
+		if strings.HasPrefix(joined, "snap restore ") && strings.Contains(joined, "--mount-disk "+wantDiskFlag) {
+			foundDiskMount = true
 		}
 		if strings.Contains(joined, ".agbox-profile/agy-cli") {
 			foundProfileBind = true
@@ -2099,9 +2100,34 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 			foundEphemeralRM = true
 		}
 	}
-	if !foundNamedVol || !foundProfileBind || !foundConv || !foundEphemeralRM {
-		t.Fatalf("profile run checks: vol=%v bind=%v conv=%v rm=%v", foundNamedVol, foundProfileBind, foundConv, foundEphemeralRM)
+	if !foundDiskMount || !foundProfileBind || !foundConv || !foundEphemeralRM {
+		t.Fatalf("profile run checks: disk=%v bind=%v conv=%v rm=%v", foundDiskMount, foundProfileBind, foundConv, foundEphemeralRM)
 	}
+
+	// Verify `msb volume inspect` path overrides the MSB_HOME fallback when present.
+	prevHandler := runner.handler
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 3 && req.Args[0] == "volume" && req.Args[1] == "inspect" {
+			return msb.CommandResult{Stdout: "  Kind   disk\n  Path   /custom/msb/volumes/" + req.Args[2] + "/disk.raw\n"}, nil
+		}
+		return prevHandler(req)
+	}
+	runner.calls = nil
+	if rc := app.Dispatch(ctx, []string{"run", "--name", "ephem-insp", "--profile", "workprof", "antigravity", proj}); rc != 0 {
+		t.Fatalf("run --profile with volume inspect failed: %s", stderr.String())
+	}
+	wantInspectedDisk := "--mount-disk /custom/msb/volumes/agbox-profile-workprof/disk.raw:" + msb.GuestProfileMount + ":rw,format=raw,fstype=ext4"
+	foundInspectedDisk := false
+	for _, c := range runner.calls {
+		joined := strings.Join(c.Args, " ")
+		if strings.HasPrefix(joined, "snap restore ") && strings.Contains(joined, wantInspectedDisk) {
+			foundInspectedDisk = true
+		}
+	}
+	if !foundInspectedDisk {
+		t.Fatalf("expected snap restore to use inspected disk path %q", wantInspectedDisk)
+	}
+	runner.handler = prevHandler
 
 	// 3. Concurrent host flock blocks overlapping --profile runs before restoring snapshot.
 	heldLock, err := persist.LockProfile(app.Env.DataDir, "workprof")
@@ -2349,7 +2375,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 	if err := os.MkdirAll(proj, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	wantRulesVol := filepath.Join(app.Env.DataDir, "rules") + ":" + msb.GuestRulesMount + ":ro,uid=1000,gid=1000"
+	wantRulesVol := filepath.Join(app.Env.DataDir, "rules") + ":" + msb.GuestRulesMount + ":ro,stat-virt=relaxed,uid=1000,gid=1000"
 
 	runner.calls = nil
 	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "rulesvm", "antigravity", proj}); rc != 0 {
@@ -2686,7 +2712,7 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 	if err := os.MkdirAll(proj, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	wantAgentsVol := filepath.Join(app.Env.DataDir, "agents") + ":" + msb.GuestAgentsMount + ":ro,uid=1000,gid=1000"
+	wantAgentsVol := filepath.Join(app.Env.DataDir, "agents") + ":" + msb.GuestAgentsMount + ":ro,stat-virt=relaxed,uid=1000,gid=1000"
 
 	runner.calls = nil
 	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "agy --version", "antigravity", proj}); rc != 0 {

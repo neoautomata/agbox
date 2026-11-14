@@ -16,6 +16,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 )
 
 func TestIsProtectedXattr(t *testing.T) {
@@ -1204,5 +1205,189 @@ func TestWorkspaceHubControlSocketPermissionsAndRevocation(t *testing.T) {
 	// Cross-share rename returns EXDEV.
 	if err := os.Rename(filepath.Join(mntDir, "repo", "main.go"), filepath.Join(mntDir, "hooksrepo", "main.go")); !errors.Is(err, syscall.EXDEV) {
 		t.Errorf("cross-share Rename = %v, want EXDEV", err)
+	}
+}
+
+func TestWorkspaceHubXattrAndGuestIDMapping(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "data")
+	projDir := filepath.Join(base, "proj")
+	dynDir := filepath.Join(base, "dyn")
+	cfgFile := filepath.Join(base, "config.yml")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dynDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dynDir, "extra.txt"), []byte("extra\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgFile, []byte("ok: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const mappedUID = uint32(2000)
+	const mappedGID = uint32(2000)
+
+	initial := []HubShareConfig{
+		{GuestName: "proj", HostPath: projDir, ReadOnly: false, VCSPolicy: config.VCSMask},
+		{GuestName: "config.yml", HostPath: cfgFile, IsFile: true, ReadOnly: false, VCSPolicy: config.VCSMask},
+	}
+	hub, err := NewWorkspaceHubWithIDMap(initial, dataDir, true, mappedUID, mappedGID)
+	if err != nil {
+		t.Fatalf("NewWorkspaceHubWithIDMap: %v", err)
+	}
+	defer hub.CloseAll()
+	_ = fs.NewNodeFS(hub, &fs.Options{})
+
+	// Hub root reports mapped IDs, ENODATA on Getxattr, 0 on Listxattr, and EROFS on Setxattr.
+	var hubAttr fuse.AttrOut
+	if errno := hub.Getattr(ctx, nil, &hubAttr); errno != 0 {
+		t.Fatalf("hub.Getattr = %v", errno)
+	}
+	if hubAttr.Uid != mappedUID || hubAttr.Gid != mappedGID {
+		t.Errorf("hub.Getattr uid:gid = %d:%d, want %d:%d", hubAttr.Uid, hubAttr.Gid, mappedUID, mappedGID)
+	}
+	if _, errno := hub.Getxattr(ctx, "user.msb.test", nil); errno != unix.ENODATA {
+		t.Errorf("hub.Getxattr = %v, want ENODATA", errno)
+	}
+	if sz, errno := hub.Listxattr(ctx, nil); errno != 0 || sz != 0 {
+		t.Errorf("hub.Listxattr = (%d, %v), want (0, 0)", sz, errno)
+	}
+	if errno := hub.Setxattr(ctx, "user.msb._probe", []byte("1"), 0); errno != syscall.EROFS {
+		t.Errorf("hub.Setxattr = %v, want EROFS", errno)
+	}
+
+	var eOut fuse.EntryOut
+	projIno, errno := hub.Lookup(ctx, "proj", &eOut)
+	if errno != 0 {
+		t.Fatalf("hub.Lookup(proj) = %v", errno)
+	}
+	if eOut.Attr.Uid != mappedUID || eOut.Attr.Gid != mappedGID {
+		t.Errorf("hub.Lookup(proj) uid:gid = %d:%d, want %d:%d", eOut.Attr.Uid, eOut.Attr.Gid, mappedUID, mappedGID)
+	}
+	cfgIno, errno := hub.Lookup(ctx, "config.yml", &eOut)
+	if errno != 0 {
+		t.Fatalf("hub.Lookup(config.yml) = %v", errno)
+	}
+	if eOut.Attr.Uid != mappedUID || eOut.Attr.Gid != mappedGID {
+		t.Errorf("hub.Lookup(config.yml) uid:gid = %d:%d, want %d:%d", eOut.Attr.Uid, eOut.Attr.Gid, mappedUID, mappedGID)
+	}
+
+	// FileShareNode Lookup/Getattr/Statx/Setattr all report mapped IDs and accept mapped UID/GID in Setattr.
+	cfgNode := cfgIno.Operations().(*FileShareNode)
+	var aOut fuse.AttrOut
+	if errno := cfgNode.Getattr(ctx, nil, &aOut); errno != 0 {
+		t.Fatalf("FileShareNode.Getattr = %v", errno)
+	}
+	if aOut.Uid != mappedUID || aOut.Gid != mappedGID {
+		t.Errorf("FileShareNode.Getattr uid:gid = %d:%d, want %d:%d", aOut.Uid, aOut.Gid, mappedUID, mappedGID)
+	}
+	var sxOut fuse.StatxOut
+	if errno := cfgNode.Statx(ctx, nil, 0, unix.STATX_BASIC_STATS, &sxOut); errno != 0 {
+		t.Fatalf("FileShareNode.Statx = %v", errno)
+	}
+	if sxOut.Statx.Uid != mappedUID || sxOut.Statx.Gid != mappedGID {
+		t.Errorf("FileShareNode.Statx uid:gid = %d:%d, want %d:%d", sxOut.Statx.Uid, sxOut.Statx.Gid, mappedUID, mappedGID)
+	}
+	chownMappedIn := &fuse.SetAttrIn{}
+	chownMappedIn.Valid = fuse.FATTR_UID | fuse.FATTR_GID | fuse.FATTR_MODE
+	chownMappedIn.Uid = mappedUID
+	chownMappedIn.Gid = mappedGID
+	chownMappedIn.Mode = 0o600
+	if errno := cfgNode.Setattr(ctx, nil, chownMappedIn, &aOut); errno != 0 {
+		t.Fatalf("FileShareNode.Setattr(mapped) = %v", errno)
+	}
+	if aOut.Uid != mappedUID || aOut.Gid != mappedGID {
+		t.Errorf("FileShareNode.Setattr uid:gid = %d:%d, want %d:%d", aOut.Uid, aOut.Gid, mappedUID, mappedGID)
+	}
+	chownBadIn := &fuse.SetAttrIn{}
+	chownBadIn.Valid = fuse.FATTR_UID
+	chownBadIn.Uid = 9999
+	if errno := cfgNode.Setattr(ctx, nil, chownBadIn, &aOut); errno != syscall.EPERM {
+		t.Errorf("FileShareNode.Setattr(9999) = %v, want EPERM", errno)
+	}
+
+	// Directory FilteredNode and safeFile operations report mapped IDs across Lookup, Create, Mkdir, Symlink, Statx, Setattr.
+	projRoot := projIno.Operations().(*FilteredNode)
+
+	if _, errno := projRoot.Lookup(ctx, "main.go", &eOut); errno != 0 {
+		t.Fatalf("projRoot.Lookup(main.go) = %v", errno)
+	}
+	if eOut.Attr.Uid != mappedUID || eOut.Attr.Gid != mappedGID {
+		t.Errorf("projRoot.Lookup uid:gid = %d:%d, want %d:%d", eOut.Attr.Uid, eOut.Attr.Gid, mappedUID, mappedGID)
+	}
+	if _, errno := projRoot.Mkdir(ctx, "sub", 0o755, &eOut); errno != 0 {
+		t.Fatalf("projRoot.Mkdir = %v", errno)
+	}
+	if eOut.Attr.Uid != mappedUID || eOut.Attr.Gid != mappedGID {
+		t.Errorf("projRoot.Mkdir uid:gid = %d:%d, want %d:%d", eOut.Attr.Uid, eOut.Attr.Gid, mappedUID, mappedGID)
+	}
+	if _, errno := projRoot.Symlink(ctx, "main.go", "main-link.go", &eOut); errno != 0 {
+		t.Fatalf("projRoot.Symlink = %v", errno)
+	}
+	if eOut.Attr.Uid != mappedUID || eOut.Attr.Gid != mappedGID {
+		t.Errorf("projRoot.Symlink uid:gid = %d:%d, want %d:%d", eOut.Attr.Uid, eOut.Attr.Gid, mappedUID, mappedGID)
+	}
+	_, createdFH, _, errno := projRoot.Create(ctx, "created.txt", syscall.O_RDWR, 0o644, &eOut)
+	if errno != 0 {
+		t.Fatalf("projRoot.Create = %v", errno)
+	}
+	if eOut.Attr.Uid != mappedUID || eOut.Attr.Gid != mappedGID {
+		t.Errorf("projRoot.Create uid:gid = %d:%d, want %d:%d", eOut.Attr.Uid, eOut.Attr.Gid, mappedUID, mappedGID)
+	}
+	sf := createdFH.(*safeFile)
+	if errno := sf.Getattr(ctx, &aOut); errno != 0 {
+		t.Fatalf("safeFile.Getattr = %v", errno)
+	}
+	if aOut.Uid != mappedUID || aOut.Gid != mappedGID {
+		t.Errorf("safeFile.Getattr uid:gid = %d:%d, want %d:%d", aOut.Uid, aOut.Gid, mappedUID, mappedGID)
+	}
+	if errno := sf.Setattr(ctx, chownMappedIn, &aOut); errno != 0 {
+		t.Fatalf("safeFile.Setattr(mapped) = %v", errno)
+	}
+	if aOut.Uid != mappedUID || aOut.Gid != mappedGID {
+		t.Errorf("safeFile.Setattr uid:gid = %d:%d, want %d:%d", aOut.Uid, aOut.Gid, mappedUID, mappedGID)
+	}
+	if errno := sf.Setattr(ctx, chownBadIn, &aOut); errno != syscall.EPERM {
+		t.Errorf("safeFile.Setattr(9999) = %v, want EPERM", errno)
+	}
+	_ = sf.Release(ctx)
+
+	if errno := projRoot.Statx(ctx, nil, 0, unix.STATX_BASIC_STATS, &sxOut); errno != 0 {
+		t.Fatalf("projRoot.Statx = %v", errno)
+	}
+	if sxOut.Statx.Uid != mappedUID || sxOut.Statx.Gid != mappedGID {
+		t.Errorf("projRoot.Statx uid:gid = %d:%d, want %d:%d", sxOut.Statx.Uid, sxOut.Statx.Gid, mappedUID, mappedGID)
+	}
+
+	// Dynamically added share inherits mapped IDs.
+	sockPath := filepath.Join(base, "filter", "ws.sock")
+	ln, err := ServeControlSocket(sockPath, hub)
+	if err != nil {
+		t.Fatalf("ServeControlSocket: %v", err)
+	}
+	defer ln.Close()
+	if _, err := AddHubShare(sockPath, HubShareConfig{
+		GuestName: "dyn",
+		HostPath:  dynDir,
+		ReadOnly:  true,
+		VCSPolicy: config.VCSMask,
+	}); err != nil {
+		t.Fatalf("AddHubShare(dyn): %v", err)
+	}
+	if _, errno := hub.Lookup(ctx, "dyn", &eOut); errno != 0 {
+		t.Fatalf("hub.Lookup(dyn) = %v", errno)
+	}
+	if eOut.Attr.Uid != mappedUID || eOut.Attr.Gid != mappedGID {
+		t.Errorf("hub.Lookup(dyn) uid:gid = %d:%d, want %d:%d", eOut.Attr.Uid, eOut.Attr.Gid, mappedUID, mappedGID)
 	}
 }
