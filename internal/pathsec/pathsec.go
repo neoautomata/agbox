@@ -1,4 +1,4 @@
-// Package pathsec validates host paths before agbox shares them into a microVM.
+// Package pathsec validates host paths before agbox shares them into a sandbox.
 //
 // Security properties:
 //   - ValidateShare resolves all symlinks and rejects missing or dangling paths.
@@ -6,8 +6,8 @@
 //   - ValidateShare restricts shares to $HOME unless AllowOutsideHome is true.
 //   - DefaultBlocklist blocks credentials, agent state, VCS configs, shell startup
 //     files, system paths, parent directories of blocked paths, and symlink targets.
-//   - ContainsVCSComponent blocks direct shares of any VCS directory, subdirectory,
-//     or working-tree control file (case-insensitive).
+//   - ContainsVCSComponent reports whether a path contains a VCS directory or
+//     control file component (case-insensitive). ValidateShare blocks matching paths.
 //   - ValidateShare rejects non-regular files and writable files with st_nlink != 1.
 package pathsec
 
@@ -52,19 +52,21 @@ func DefaultVCSNames() []string {
 }
 
 // DefaultBlocklist returns the host paths that agbox never shares into a guest.
-// agbox also blocks any parent directory that contains a blocklisted path.
+// ValidateShare also blocks any parent directory that contains a blocked path.
 func DefaultBlocklist(homeReal, dataDir, msbHome string) []string {
 	h := filepath.Clean(homeReal)
 	list := []string{
 		filepath.Join(h, ".ssh"),
 		filepath.Join(h, ".gnupg"),
 		filepath.Join(h, ".gpg"),
+		filepath.Join(h, ".pki"),
 		filepath.Join(h, ".aws"),
 		filepath.Join(h, ".azure"),
 		filepath.Join(h, ".kube"),
 		filepath.Join(h, ".docker"),
 		filepath.Join(h, ".config", "gcloud"),
 		filepath.Join(h, ".config", "gh"),
+		filepath.Join(h, ".config", "rclone"),
 		filepath.Join(h, ".config", "opencode"),
 		filepath.Join(h, ".local", "share", "opencode"),
 		filepath.Join(h, ".local", "state", "opencode"),
@@ -77,6 +79,12 @@ func DefaultBlocklist(homeReal, dataDir, msbHome string) []string {
 		filepath.Join(h, ".npmrc"),
 		filepath.Join(h, ".netrc"),
 		filepath.Join(h, ".pypirc"),
+		filepath.Join(h, ".pgpass"),
+		filepath.Join(h, ".my.cnf"),
+		filepath.Join(h, ".vault-token"),
+		filepath.Join(h, ".terraform.d"),
+		filepath.Join(h, ".gem", "credentials"),
+		filepath.Join(h, ".m2", "settings.xml"),
 		filepath.Join(h, ".git-credentials"),
 		filepath.Join(h, ".local", "share", "keyrings"),
 		filepath.Join(h, ".password-store"),
@@ -100,12 +108,14 @@ func DefaultBlocklist(homeReal, dataDir, msbHome string) []string {
 		filepath.Join(h, ".bash_history"),
 		filepath.Join(h, ".zsh_history"),
 		filepath.Join(h, ".profile"),
+		filepath.Join(h, ".pam_environment"),
 		filepath.Join(h, ".zshrc"),
 		filepath.Join(h, ".zshenv"),
 		filepath.Join(h, ".zprofile"),
 		filepath.Join(h, ".zlogin"),
 		filepath.Join(h, ".config", "zsh"),
 		filepath.Join(h, ".config", "fish"),
+		filepath.Join(h, ".local", "share", "fish"),
 		filepath.Join(h, ".gitconfig"),
 		filepath.Join(h, ".gitattributes"),
 		filepath.Join(h, ".gitignore"),
@@ -127,7 +137,9 @@ func DefaultBlocklist(homeReal, dataDir, msbHome string) []string {
 		filepath.Join(h, ".vimrc"),
 		filepath.Join(h, ".vim"),
 		filepath.Join(h, ".config", "nvim"),
+		filepath.Join(h, ".emacs"),
 		filepath.Join(h, ".emacs.d"),
+		filepath.Join(h, ".config", "emacs"),
 		filepath.Join(h, ".tmux.conf"),
 		filepath.Join(h, ".screenrc"),
 		filepath.Join(h, ".xinitrc"),
@@ -162,8 +174,8 @@ func DefaultBlocklist(homeReal, dataDir, msbHome string) []string {
 	return list
 }
 
-// IsSubpath reports whether candidate is equal to root or resides inside root.
-// Both paths are cleaned before comparison.
+// IsSubpath reports whether candidate equals root or resides inside root.
+// It cleans both paths before comparison.
 func IsSubpath(candidate, root string) bool {
 	if candidate == "" || root == "" {
 		return false
@@ -201,11 +213,14 @@ func hasControlChar(s string) bool {
 		if r < 0x20 || r == 0x7f {
 			return true
 		}
+		if (r >= 0x200B && r <= 0x200F) || (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0xFEFF {
+			return true
+		}
 	}
 	return false
 }
 
-// Policy defines the security rules applied by ValidateShare.
+// Policy defines the security rules that ValidateShare enforces.
 type Policy struct {
 	HomeReal         string
 	AllowOutsideHome bool
@@ -214,8 +229,7 @@ type Policy struct {
 	VCSNames         []string
 }
 
-// ShareTarget represents a validated host filesystem entry to be mounted at
-// /workspace/<GuestName> inside the guest.
+// ShareTarget describes a validated host entry for mounting at /workspace/<GuestName>.
 type ShareTarget struct {
 	HostPath      string
 	BaseName      string
@@ -236,7 +250,7 @@ type ShareSpec struct {
 	GuestAlias   string
 }
 
-// ResolveOpts defines default share permissions and conflict locks when resolving ShareSpecs.
+// ResolveOpts sets default share permissions and conflict locks for ResolveShareSpecs.
 type ResolveOpts struct {
 	Policy     Policy
 	DefaultRO  bool
@@ -245,7 +259,7 @@ type ResolveOpts struct {
 	LockVCS    bool
 }
 
-// ValidateGuestAlias checks a custom guest mount name (`as=<name>` or `--as <name>`).
+// ValidateGuestAlias validates a guest mount name (`as=<name>` or `--as <name>`).
 func ValidateGuestAlias(name string) (string, error) {
 	if name == "" {
 		return "", errors.New("guest share name must not be empty")
@@ -263,8 +277,12 @@ func ValidateGuestAlias(name string) (string, error) {
 }
 
 // ParseShareSpec splits `<path>[:<mod1>,<mod2>,...]` and validates share modifiers.
-// Conflicting, duplicate, or unknown modifiers return an error.
+// It returns an error on conflicting, duplicate, or unknown modifiers.
 func ParseShareSpec(raw string) (ShareSpec, error) {
+	return parseShareSpecWithStat(raw, os.Lstat)
+}
+
+func parseShareSpecWithStat(raw string, lstat func(string) (os.FileInfo, error)) (ShareSpec, error) {
 	if raw == "" {
 		return ShareSpec{}, errors.New("share path must not be empty")
 	}
@@ -276,8 +294,10 @@ func ParseShareSpec(raw string) (ShareSpec, error) {
 	if colonIdx < 0 {
 		return ShareSpec{RawPath: raw}, nil
 	}
-	if _, err := os.Lstat(raw); err == nil {
-		return ShareSpec{}, fmt.Errorf("refusing to share path containing ':' (conflicts with share modifier syntax): %s", raw)
+	if lstat != nil {
+		if _, err := lstat(raw); err == nil {
+			return ShareSpec{}, fmt.Errorf("refusing to share path containing ':' (conflicts with share modifier syntax): %s", raw)
+		}
 	}
 
 	rawPath := raw[:colonIdx]
@@ -350,15 +370,15 @@ func ParseShareSpec(raw string) (ShareSpec, error) {
 	return spec, nil
 }
 
-// ResolveShareSpecs validates ShareSpecs against host filesystem policies, resolves
-// defaults, rejects conflicting options or overlapping host paths, and assigns guest names.
+// ResolveShareSpecs validates ShareSpecs against host policies and assigns guest names.
+// It rejects conflicting options and overlapping host paths.
 func ResolveShareSpecs(specs []ShareSpec, opts ResolveOpts) ([]ShareTarget, error) {
 	defaultVCS := opts.DefaultVCS
 	if defaultVCS == "" {
 		defaultVCS = config.VCSMask
 	}
-	if opts.DefaultRO && defaultVCS == config.VCSAllowHooks {
-		return nil, errors.New("conflicting options: read-only mode cannot be combined with vcs-hooks")
+	if opts.LockRO && opts.DefaultRO && defaultVCS == config.VCSAllowHooks {
+		return nil, errors.New("conflicting options: cannot combine --ro and --vcs-hooks")
 	}
 
 	targets := make([]ShareTarget, 0, len(specs))
@@ -411,8 +431,7 @@ func ResolveShareSpecs(specs []ShareSpec, opts ResolveOpts) ([]ShareTarget, erro
 	return AssignGuestNamesChecked(targets)
 }
 
-// CheckDisjointHostPaths rejects duplicate or nested host share paths so one share
-// cannot bypass another share's read-only or VCS-masking restrictions.
+// CheckDisjointHostPaths rejects duplicate or nested host share paths.
 func CheckDisjointHostPaths(targets []ShareTarget) error {
 	for i := 0; i < len(targets); i++ {
 		for j := i + 1; j < len(targets); j++ {
@@ -422,18 +441,18 @@ func CheckDisjointHostPaths(targets []ShareTarget) error {
 				return fmt.Errorf("duplicate share path: %s", a)
 			}
 			if IsSubpath(a, b) || IsSubpath(b, a) {
-				return fmt.Errorf("overlapping share paths %s and %s: nested shares are forbidden", a, b)
+				return fmt.Errorf("overlapping share paths %s and %s: shares must not nest", a, b)
 			}
 		}
 	}
 	return nil
 }
 
-// ValidateShare resolves symlinks on rawPath and verifies that it satisfies all
-// path containment, blocklist, character, VCS, and hardlink invariants.
+// ValidateShare resolves symlinks on rawPath and validates containment, blocklists,
+// characters, VCS names, and hardlink counts.
 func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 	if rawPath == "" {
-		return ShareTarget{}, fmt.Errorf("share path must not be empty")
+		return ShareTarget{}, errors.New("share path must not be empty")
 	}
 	if hasControlChar(rawPath) {
 		return ShareTarget{}, fmt.Errorf("refusing path containing control character: %q", rawPath)
@@ -441,7 +460,7 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 
 	resolved, err := filepath.EvalSymlinks(rawPath)
 	if err != nil {
-		return ShareTarget{}, fmt.Errorf("path does not exist (or resolves through a dangling link): %s", rawPath)
+		return ShareTarget{}, fmt.Errorf("resolve share path %s: %w", rawPath, err)
 	}
 	resolved = filepath.Clean(resolved)
 	base := filepath.Base(resolved)
@@ -454,7 +473,8 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 	}
 
 	if !pol.AllowOutsideHome {
-		if pol.HomeReal == "" || !IsSubpath(resolved, pol.HomeReal) {
+		homeClean := filepath.Clean(pol.HomeReal)
+		if pol.HomeReal == "" || !filepath.IsAbs(homeClean) || !IsSubpath(resolved, homeClean) {
 			return ShareTarget{}, fmt.Errorf("refusing to share path outside $HOME: %s (set AGBOX_ALLOW_OUTSIDE_HOME=1 to override)", resolved)
 		}
 	}
@@ -467,8 +487,7 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 		if IsSubpath(resolved, cleanItem) || IsSubpath(cleanItem, resolved) {
 			return ShareTarget{}, fmt.Errorf("refusing to share a sensitive path: %s (matches blocklist entry %s)", resolved, cleanItem)
 		}
-		// If the blocklisted entry is a symlink, also block the resolved target
-		// and its parent directories.
+		// Block the resolved target and its parents when a blocklisted entry is a symlink.
 		if evalItem, err := filepath.EvalSymlinks(cleanItem); err == nil {
 			evalItem = filepath.Clean(evalItem)
 			if IsSubpath(resolved, evalItem) || IsSubpath(evalItem, resolved) {
@@ -510,7 +529,7 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 			return ShareTarget{}, fmt.Errorf("cannot inspect link count for %s", resolved)
 		}
 		if st.Nlink != 1 {
-			return ShareTarget{}, fmt.Errorf("refusing writable single-file share with multiple hard links (nlink=%d): %s (use --ro or break extra links)", st.Nlink, resolved)
+			return ShareTarget{}, fmt.Errorf("refusing writable single-file share with multiple hard links (nlink=%d): %s (use --ro or remove extra links)", st.Nlink, resolved)
 		}
 	}
 
@@ -522,34 +541,7 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 	}, nil
 }
 
-// AssignGuestNames returns a new slice of ShareTargets where duplicate
-// BaseNames receive collision-free suffixes ("foo", "foo-2", "foo-3", ...).
-func AssignGuestNames(targets []ShareTarget) []ShareTarget {
-	out, err := AssignGuestNamesChecked(targets)
-	if err != nil {
-		// Fallback for callers that did not set ExplicitAlias.
-		out = make([]ShareTarget, len(targets))
-		used := make(map[string]bool, len(targets))
-		for idx, t := range targets {
-			base := t.BaseName
-			if base == "" {
-				base = filepath.Base(t.HostPath)
-			}
-			name := base
-			for suffix := 2; used[name]; suffix++ {
-				name = fmt.Sprintf("%s-%d", base, suffix)
-			}
-			used[name] = true
-			t.BaseName = base
-			t.GuestName = name
-			out[idx] = t
-		}
-	}
-	return out
-}
-
-// AssignGuestNamesChecked assigns collision-free guest names while rejecting
-// duplicate ExplicitAlias values.
+// AssignGuestNamesChecked assigns unique guest names and validates every name.
 func AssignGuestNamesChecked(targets []ShareTarget) ([]ShareTarget, error) {
 	out := make([]ShareTarget, len(targets))
 	used := make(map[string]bool, len(targets))
@@ -557,6 +549,9 @@ func AssignGuestNamesChecked(targets []ShareTarget) ([]ShareTarget, error) {
 	for idx, t := range targets {
 		if !t.ExplicitAlias {
 			continue
+		}
+		if _, err := ValidateGuestAlias(t.GuestName); err != nil {
+			return nil, err
 		}
 		if used[t.GuestName] {
 			return nil, fmt.Errorf("duplicate guest share name %q", t.GuestName)
@@ -580,20 +575,13 @@ func AssignGuestNamesChecked(targets []ShareTarget) ([]ShareTarget, error) {
 		for suffix := 2; used[name]; suffix++ {
 			name = fmt.Sprintf("%s-%d", base, suffix)
 		}
+		if _, err := ValidateGuestAlias(name); err != nil {
+			return nil, fmt.Errorf("invalid guest share name %q for %s: %w (use as=<name> to set a valid alias)", name, t.HostPath, err)
+		}
 		used[name] = true
 		t.BaseName = base
 		t.GuestName = name
 		out[idx] = t
 	}
 	return out, nil
-}
-
-// FormatVolumeSpec formats an `msb -v` volume argument mapping hostSource to
-// /workspace/<guestName> with the given read/write mode and guest UID/GID.
-func FormatVolumeSpec(hostSource, guestName string, readOnly bool, uid, gid int) string {
-	mode := "rw"
-	if readOnly {
-		mode = "ro"
-	}
-	return fmt.Sprintf("%s:/workspace/%s:%s,uid=%d,gid=%d", hostSource, guestName, mode, uid, gid)
 }

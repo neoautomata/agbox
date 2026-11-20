@@ -1,5 +1,5 @@
 // Command agbox runs OpenCode or Google Antigravity CLI inside an isolated
-// hardware-virtualized microVM with embedded FUSE VCS filtering.
+// microVM with an embedded FUSE filter for VCS files.
 package main
 
 import (
@@ -9,9 +9,16 @@ import (
 	"agbox/internal/vcsfuse"
 )
 
-func main() {
-	if len(os.Args) > 1 && os.Args[1] == vcsfuse.SubcommandName {
-		os.Exit(vcsfuse.RunMain(os.Args[2:]))
+func run(args []string, filterMain, cliMain func([]string) int) int {
+	if len(args) == 0 {
+		return cliMain(nil)
 	}
-	os.Exit(cli.Main(os.Args[1:]))
+	if len(args) > 1 && args[1] == vcsfuse.SubcommandName {
+		return filterMain(args[2:])
+	}
+	return cliMain(args[1:])
+}
+
+func main() {
+	os.Exit(run(os.Args, vcsfuse.RunMain, cli.Main))
 }

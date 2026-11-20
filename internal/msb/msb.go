@@ -1,13 +1,11 @@
-// Package msb provides argument builders, output parsers, and a Runner interface
-// for the microsandbox (msb) CLI.
+// Package msb builds CLI arguments, parses output, and runs commands for microsandbox (msb).
 //
 // Security properties:
-//   - BuildNetArgs defaults to default-deny egress (--net-default deny). It places
-//     deny rules for host, loopback, private, link-local, multicast, and cloud-config
-//     endpoints before any allow rule under msb first-match-wins evaluation.
+//   - buildNetArgs defaults to default-deny egress (--net-default deny).
+//   - buildNetArgs places host, loopback, private, link-local, multicast, and metadata
+//     denies before allow rules under msb first-match-wins evaluation.
 //   - validateNetRuleToken rejects whitespace, control characters, and malformed rules.
-//   - FormatEnvExports and ShellQuote build POSIX-quoted secret scripts for stdin
-//     delivery so secrets never appear in CLI arguments or host files.
+//   - FormatEnvExports and ShellQuote quote secrets for stdin delivery.
 package msb
 
 import (
@@ -24,25 +22,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"agbox/internal/config"
 )
-
-// GuestUser is the non-root username inside the microVM.
-const GuestUser = "agent"
-
-// GuestUIDGid is the numeric UID:GID of GuestUser inside the microVM.
-const GuestUIDGid = "1000:1000"
-
-// GuestUID is the numeric UID of GuestUser inside the microVM.
-const GuestUID = 1000
-
-// GuestGID is the numeric GID of GuestUser inside the microVM.
-const GuestGID = 1000
-
-// GuestHome is the home directory of GuestUser inside the microVM.
-const GuestHome = "/home/agent"
-
-// GuestKeysFile is the path inside the microVM where host API keys are written.
-const GuestKeysFile = "/home/agent/.agbox-keys.sh"
 
 // GuestSkillsMount is the read-only virtiofs mountpoint for host global skills.
 const GuestSkillsMount = "/home/agent/.agbox-skills"
@@ -53,14 +35,13 @@ const GuestRulesMount = "/home/agent/.agbox-rules"
 // GuestAgentsMount is the read-only virtiofs mountpoint for cached agent binaries.
 const GuestAgentsMount = "/home/agent/.agbox-agents"
 
-// GuestProfileMount is the ext4 disk volume mountpoint for conversation profiles.
+// GuestProfileMount is the ext4 disk mountpoint for conversation profiles.
 const GuestProfileMount = "/home/agent/.agbox-profile"
 
-// GuestWorkspace is the directory inside the microVM where host shares are mounted.
+// GuestWorkspace is the guest directory where agbox mounts host shares.
 const GuestWorkspace = "/workspace"
 
-// DefaultPassthroughEnvVars lists the host environment variables forwarded into
-// the microVM when non-empty on the host.
+// DefaultPassthroughEnvVars lists host environment variables forwarded when non-empty.
 var DefaultPassthroughEnvVars = []string{
 	"ANTHROPIC_API_KEY",
 	"OPENAI_API_KEY",
@@ -95,25 +76,6 @@ var DefaultPassthroughEnvVars = []string{
 	"COLORTERM",
 }
 
-// DefaultBlockedCIDRRules lists local, broadcast, link-local, and cloud-config
-// CIDR rules evaluated before any allow rule:
-//   - 0.0.0.0/8: "this host" local network (RFC 1122).
-//   - 100.100.100.200/32: Alibaba Cloud IMDS (resides inside CGNAT 100.64.0.0/10).
-//   - 168.63.129.16/32: Microsoft Azure WireServer/IMDS (resides in public IPv4).
-//   - 169.254.0.0/16: IPv4 link-local and AWS/GCP/Azure/OpenStack IMDS (169.254.169.254).
-//   - 240.0.0.0/4: IPv4 reserved space and limited broadcast (255.255.255.255).
-//   - [fe80::/10]: IPv6 link-local range.
-//   - [fd00:ec2::254/128]: AWS IPv6 IMDS (resides inside IPv6 ULA fc00::/7).
-var DefaultBlockedCIDRRules = []string{
-	"deny@0.0.0.0/8",
-	"deny@100.100.100.200/32",
-	"deny@168.63.129.16/32",
-	"deny@169.254.0.0/16",
-	"deny@240.0.0.0/4",
-	"deny@[fe80::/10]",
-	"deny@[fd00:ec2::254/128]",
-}
-
 var nonDNSBlockHostRules = []string{
 	"deny@host:tcp:0-52",
 	"deny@host:tcp:54-65535",
@@ -123,27 +85,21 @@ var nonDNSBlockHostRules = []string{
 	"deny@host:icmpv6",
 }
 
-// TranslateNetSpec converts one network profile name or msb rule into CLI flags.
-//
-// The default "public" profile enforces default-deny egress. It blocks host,
-// loopback, private, link-local, multicast, and cloud-config endpoints before
-// allowing public internet destinations.
-func TranslateNetSpec(spec string) ([]string, error) {
-	return BuildNetArgs(false, []string{spec})
-}
-
-// BuildNetArgs compiles network flags from noNet and one or more --net specs.
-// Because microsandbox evaluates --net-rule flags with first-match-wins,
-// BuildNetArgs places deny rules before allow rules while permitting DNS queries
-// appropriately for the selected profile or narrow allowlist.
-func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
+func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 	if noNet {
+		for _, raw := range specs {
+			if strings.TrimSpace(raw) != "" {
+				return nil, errors.New("conflicting network options: cannot combine --no-net with --net rules")
+			}
+		}
 		return []string{"--no-net"}, nil
 	}
 	if len(specs) == 0 {
 		specs = []string{"public"}
 	}
 
+	sawNone := false
+	sawNonNone := false
 	allowAll := false
 	hasRestrictiveProfile := false
 	hasGroupAllow := false
@@ -159,33 +115,39 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 
 	var userDenies []string
 	var hostScopedAllows []string
+	var groupScopedAllows []string
 	var userAllows []string
 
 	for _, rawSpec := range specs {
 		s := strings.TrimSpace(rawSpec)
 		switch s {
 		case "", "public", "public-only":
+			sawNonNone = true
 			hasRestrictiveProfile = true
 			hasGroupAllow = true
 			userAllows = appendUnique(userAllows, "allow@public")
 		case "none", "deny":
-			return []string{"--no-net"}, nil
+			sawNone = true
 		case "private":
+			sawNonNone = true
 			hasRestrictiveProfile = true
 			hasGroupAllow = true
 			allowPrivate = true
 			userAllows = appendUnique(userAllows, "allow@public")
 			userAllows = appendUnique(userAllows, "allow@private")
 		case "host":
+			sawNonNone = true
 			hasRestrictiveProfile = true
 			hasGroupAllow = true
 			allowHost = true
 			userAllows = appendUnique(userAllows, "allow@public")
 		case "all", "allow":
+			sawNonNone = true
 			allowAll = true
 		default:
+			sawNonNone = true
 			if !strings.Contains(s, "@") {
-				return nil, fmt.Errorf("unsupported --net value %q (use: public, none, private, host, all, or an msb rule like 'allow@example.com:tcp:443')", rawSpec)
+				return nil, fmt.Errorf("unsupported --net value %q (use: public, none, private, host, all, or a rule like 'allow@example.com:tcp:443')", rawSpec)
 			}
 			for _, tok := range strings.Split(s, ",") {
 				trimmed := strings.TrimSpace(tok)
@@ -195,7 +157,7 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 				}
 				if action == "deny" {
 					userDenies = appendUnique(userDenies, rule)
-					if (dir == "egress" || dir == "any") && isFullDNSRight(right) {
+					if dir == "egress" && isFullDNSRight(right) {
 						denyDNS = true
 					}
 					continue
@@ -205,8 +167,12 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 					userAllows = appendUnique(userAllows, rule)
 					continue
 				}
+				targetGroup, _, hasPortScope := strings.Cut(right, ":")
 				switch {
 				case right == "any" || right == "public":
+					hasGroupAllow = true
+					userAllows = appendUnique(userAllows, rule)
+				case hasPortScope && (targetGroup == "any" || targetGroup == "public"):
 					hasGroupAllow = true
 					userAllows = appendUnique(userAllows, rule)
 				case right == "private":
@@ -233,8 +199,10 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 				case right == "dns" || strings.HasPrefix(right, "dns:"):
 					hasExplicitAllowDNS = true
 					hostScopedAllows = appendUnique(hostScopedAllows, rule)
-				case strings.HasPrefix(right, "host:"):
+				case targetGroup == "host" && hasPortScope:
 					hostScopedAllows = appendUnique(hostScopedAllows, rule)
+				case hasPortScope && (targetGroup == "private" || targetGroup == "loopback" || targetGroup == "link-local" || targetGroup == "multicast" || targetGroup == "meta"):
+					groupScopedAllows = appendUnique(groupScopedAllows, rule)
 				default:
 					userAllows = appendUnique(userAllows, rule)
 				}
@@ -242,7 +210,16 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 		}
 	}
 
-	if allowAll && !hasRestrictiveProfile {
+	if sawNone {
+		if sawNonNone {
+			return nil, errors.New("conflicting network options: cannot combine --net none with other network rules")
+		}
+		return []string{"--no-net"}, nil
+	}
+	if allowAll {
+		if hasRestrictiveProfile {
+			return nil, errors.New("conflicting network options: cannot combine --net all with restrictive profiles or allow rules")
+		}
 		args := []string{"--net-default", "allow"}
 		for _, d := range userDenies {
 			args = append(args, "--net-rule", d)
@@ -277,13 +254,16 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 		if denyDNS {
 			args = append(args, "--net-rule", "deny@host")
 		} else {
-			// Block non-53 host traffic before user allows so narrow domain rules can resolve DNS
-			// without opening arbitrary DNS lookups on port 53.
+			// Block non-53 host ports before domain allows so DNS resolves without opening arbitrary ports.
 			for _, r := range nonDNSBlockHostRules {
 				args = append(args, "--net-rule", r)
 			}
 			trailingDenyHost = true
 		}
+	}
+
+	for _, r := range groupScopedAllows {
+		args = append(args, "--net-rule", r)
 	}
 
 	var denies []string
@@ -305,6 +285,9 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 	if !allowLoopback {
 		denies = appendUnique(denies, "deny@0.0.0.0/8")
 	}
+	if !allowPrivate {
+		denies = appendUnique(denies, "deny@100.64.0.0/10")
+	}
 	if !allowMetadata {
 		denies = appendUnique(denies, "deny@100.100.100.200/32")
 		denies = appendUnique(denies, "deny@168.63.129.16/32")
@@ -315,6 +298,9 @@ func BuildNetArgs(noNet bool, specs []string) ([]string, error) {
 	if !allowMulticast {
 		denies = appendUnique(denies, "deny@240.0.0.0/4")
 	}
+	denies = appendUnique(denies, "deny@[::/128]")
+	denies = appendUnique(denies, "deny@[::ffff:0:0/96]")
+	denies = appendUnique(denies, "deny@[64:ff9b::/96]")
 	if !allowLinkLocal {
 		denies = appendUnique(denies, "deny@[fe80::/10]")
 	}
@@ -365,12 +351,12 @@ func parseAndNormalizeNetRule(raw string) (normalized, action, direction, right 
 	}
 	for _, r := range raw {
 		if r <= 0x20 || r == 0x7f {
-			return "", "", "", "", fmt.Errorf("invalid --net-rule %q: whitespace and control characters are forbidden", raw)
+			return "", "", "", "", fmt.Errorf("invalid --net-rule %q: omit whitespace and control characters", raw)
 		}
 	}
 	leftRaw, rightRaw, ok := strings.Cut(raw, "@")
 	if !ok {
-		return "", "", "", "", fmt.Errorf("invalid --net-rule %q: rule must use <action>[:<direction>]@<target> syntax", raw)
+		return "", "", "", "", fmt.Errorf("invalid --net-rule %q: use <action>[:<direction>]@<target> syntax", raw)
 	}
 	left := strings.ToLower(leftRaw)
 	right = strings.ToLower(rightRaw)
@@ -383,8 +369,8 @@ func parseAndNormalizeNetRule(raw string) (normalized, action, direction, right 
 		return "", "", "", "", err
 	}
 
-	// Map the legacy "metadata" target name to the msb "meta" group keyword while leaving
-	// hostnames such as metadata.google.internal and domain=metadata untouched.
+	// Map the target name "metadata" to the msb group keyword "meta".
+	// Keep hostnames such as metadata.google.internal and domain=metadata unchanged.
 	if right == "metadata" {
 		right = "meta"
 	} else if strings.HasPrefix(right, "metadata:") {
@@ -417,6 +403,9 @@ func parseAndNormalizeNetRule(raw string) (normalized, action, direction, right 
 		}
 	}
 	if portsRaw != "" {
+		if protoRaw == "icmpv4" || protoRaw == "icmpv6" {
+			return "", "", "", "", fmt.Errorf("invalid --net-rule %q: %s does not accept ports", raw, protoRaw)
+		}
 		if err := validateNetPorts(portsRaw, raw); err != nil {
 			return "", "", "", "", err
 		}
@@ -445,7 +434,7 @@ func parseActionAndDirection(left, fullToken string) (string, string, error) {
 
 func validateDNSRuleRight(right, dir, fullToken string) error {
 	if dir != "egress" {
-		return fmt.Errorf("invalid --net-rule %q: the dns target only supports egress rules", fullToken)
+		return fmt.Errorf("invalid --net-rule %q: dns target supports only egress rules", fullToken)
 	}
 	parts := strings.Split(right, ":")
 	if len(parts) > 3 {
@@ -475,6 +464,9 @@ func parseBracketedNetTarget(right, fullToken string) (protoRaw, portsRaw string
 		return "", "", fmt.Errorf("invalid --net-rule %q: unclosed '[' in IPv6 target", fullToken)
 	}
 	inner := afterOpen[:closeIdx]
+	if inner == "" {
+		return "", "", fmt.Errorf("invalid --net-rule %q: empty IPv6 target in brackets", fullToken)
+	}
 	afterClose := afterOpen[closeIdx+1:]
 
 	if strings.Contains(inner, "/") {
@@ -484,6 +476,9 @@ func parseBracketedNetTarget(right, fullToken string) (protoRaw, portsRaw string
 		}
 		if !pfx.Addr().Is6() {
 			return "", "", fmt.Errorf("invalid --net-rule %q: bracketed target %q must be IPv6", fullToken, inner)
+		}
+		if pfx.Masked() != pfx {
+			return "", "", fmt.Errorf("invalid --net-rule %q: non-canonical IPv6 CIDR %q", fullToken, inner)
 		}
 	} else {
 		addr, addrErr := netip.ParseAddr(inner)
@@ -506,12 +501,12 @@ func parseBracketedNetTarget(right, fullToken string) (protoRaw, portsRaw string
 		return "", "", fmt.Errorf("invalid --net-rule %q: trailing fields after port", fullToken)
 	}
 	if suffixParts[0] == "" {
-		return "", "", fmt.Errorf("invalid --net-rule %q: protocol cannot be empty after ':'", fullToken)
+		return "", "", fmt.Errorf("invalid --net-rule %q: empty protocol after ':'", fullToken)
 	}
 	protoRaw = suffixParts[0]
 	if len(suffixParts) == 2 {
 		if suffixParts[1] == "" {
-			return "", "", fmt.Errorf("invalid --net-rule %q: port cannot be empty after ':'", fullToken)
+			return "", "", fmt.Errorf("invalid --net-rule %q: empty port after ':'", fullToken)
 		}
 		portsRaw = suffixParts[1]
 	}
@@ -520,11 +515,11 @@ func parseBracketedNetTarget(right, fullToken string) (protoRaw, portsRaw string
 
 func parseUnbracketedNetTarget(right, fullToken string) (protoRaw, portsRaw string, err error) {
 	if strings.Contains(right, "::") {
-		return "", "", fmt.Errorf("invalid --net-rule %q: IPv6 targets must be enclosed in brackets (for example, deny@[fe80::/10])", fullToken)
+		return "", "", fmt.Errorf("invalid --net-rule %q: wrap IPv6 targets in square brackets", fullToken)
 	}
 	parts := strings.SplitN(right, ":", 4)
 	if len(parts) == 4 {
-		return "", "", fmt.Errorf("invalid --net-rule %q: trailing fields or unbracketed IPv6 address (wrap IPv6 in [...])", fullToken)
+		return "", "", fmt.Errorf("invalid --net-rule %q: trailing fields or unbracketed IPv6 address", fullToken)
 	}
 	target := parts[0]
 	if len(parts) >= 2 {
@@ -533,13 +528,13 @@ func parseUnbracketedNetTarget(right, fullToken string) (protoRaw, portsRaw stri
 			return "", "", fmt.Errorf("invalid --net-rule %q: port %q is in protocol position, use <target>:<proto>:<ports>", fullToken, protoRaw)
 		}
 		if protoRaw == "" {
-			return "", "", fmt.Errorf("invalid --net-rule %q: protocol cannot be empty after ':'", fullToken)
+			return "", "", fmt.Errorf("invalid --net-rule %q: empty protocol after ':'", fullToken)
 		}
 	}
 	if len(parts) == 3 {
 		portsRaw = parts[2]
 		if portsRaw == "" {
-			return "", "", fmt.Errorf("invalid --net-rule %q: port cannot be empty after ':'", fullToken)
+			return "", "", fmt.Errorf("invalid --net-rule %q: empty port after ':'", fullToken)
 		}
 	}
 	if err := validateUnbracketedTarget(target, fullToken); err != nil {
@@ -580,23 +575,23 @@ func validateUnbracketedTarget(target, fullToken string) error {
 			return fmt.Errorf("invalid --net-rule %q: invalid CIDR %q", fullToken, target)
 		}
 		if pfx.Addr().Is6() {
-			return fmt.Errorf("invalid --net-rule %q: IPv6 CIDRs must be enclosed in brackets (for example, deny@[%s])", fullToken, target)
+			return fmt.Errorf("invalid --net-rule %q: wrap IPv6 CIDR %s in square brackets", fullToken, target)
 		}
 		return nil
 	}
 	if addr, err := netip.ParseAddr(target); err == nil {
 		if addr.Is6() || addr.Zone() != "" {
-			return fmt.Errorf("invalid --net-rule %q: IPv6 addresses must be enclosed in brackets (for example, allow@[%s])", fullToken, target)
+			return fmt.Errorf("invalid --net-rule %q: wrap IPv6 address %s in square brackets", fullToken, target)
 		}
 		return nil
 	}
 	if strings.Contains(target, ".") {
 		if !isValidNetDomain(target, true) {
-			return fmt.Errorf("invalid --net-rule %q: invalid domain name %q", fullToken, target)
+			return fmt.Errorf("invalid --net-rule %q: invalid domain or IPv4 address %q", fullToken, target)
 		}
 		return nil
 	}
-	return fmt.Errorf("invalid --net-rule %q: %q is ambiguous (use domain=%s or a group keyword such as public, private, loopback, link-local, meta, multicast, or host)", fullToken, target, target)
+	return fmt.Errorf("invalid --net-rule %q: %q is ambiguous (use domain=%s or a group keyword)", fullToken, target, target)
 }
 
 func isValidNetDomain(s string, requireMultiLabel bool) bool {
@@ -622,6 +617,21 @@ func isValidNetDomain(s string, requireMultiLabel bool) bool {
 			}
 		}
 	}
+	if len(labels) >= 2 && isAllDigits(labels[len(labels)-1]) {
+		return false
+	}
+	return true
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
 	return true
 }
 
@@ -636,13 +646,8 @@ func looksLikePortSpec(s string) bool {
 }
 
 func isValidUint16Digits(s string) bool {
-	if s == "" {
+	if !isAllDigits(s) {
 		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
 	}
 	_, err := strconv.ParseUint(s, 10, 16)
 	return err == nil
@@ -654,7 +659,7 @@ func validateNetProto(proto, dir, fullToken string) error {
 		return nil
 	case "icmpv4", "icmpv6":
 		if dir == "ingress" || dir == "any" {
-			return fmt.Errorf("invalid --net-rule %q: %s is only supported on egress rules", fullToken, proto)
+			return fmt.Errorf("invalid --net-rule %q: %s supports only egress rules", fullToken, proto)
 		}
 		return nil
 	default:
@@ -690,22 +695,21 @@ func appendUnique(list []string, item string) []string {
 	return append(list, item)
 }
 
-// ShellQuote wraps s in POSIX single quotes, escaping any embedded single quote
-// as `'\”`. The resulting token is safe against all shell expansion (`$`, “ ` “,
-// `\`, globbing, and newlines).
+// ShellQuote wraps s in POSIX single quotes and escapes embedded single quotes
+// as the 4-character sequence close-quote, backslash, quote, open-quote.
+// The quoted token prevents shell expansion, globbing, and word splitting.
 func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// FormatEnvExports builds the shell script for GuestKeysFile from non-empty
-// environment variables in keys. It uses lookup to read host values and returns
-// the script text and the number of exported variables.
+// FormatEnvExports builds the shell script for GuestKeysFile from non-empty keys.
+// It uses lookup to read host values and returns the script and export count.
 func FormatEnvExports(lookup func(string) string, keys []string) (string, int) {
 	var b strings.Builder
-	b.WriteString("# Auto-generated by agbox. Exists only inside this disposable microVM.\n")
+	b.WriteString("# Generated by agbox inside the guest sandbox.\n")
 	count := 0
 	for _, k := range keys {
-		if k == "" {
+		if k == "" || lookup == nil {
 			continue
 		}
 		val := lookup(k)
@@ -722,7 +726,7 @@ func FormatEnvExports(lookup func(string) string, keys []string) (string, int) {
 	return b.String(), count
 }
 
-// VolumeSpec describes a single host-to-guest virtiofs mount.
+// VolumeSpec describes one host-to-guest virtiofs mount.
 type VolumeSpec struct {
 	HostPath  string
 	GuestPath string
@@ -731,31 +735,40 @@ type VolumeSpec struct {
 	HostPerms string
 }
 
-// FormatFlag renders the `-v` value with explicit stat virtualization and owner
-// mapping options compatible with upstream msb.
-func (v VolumeSpec) FormatFlag() string {
+func (v VolumeSpec) validate() error {
+	if hasInvalidMountPath(v.HostPath) {
+		return fmt.Errorf("invalid volume host path %q: use an absolute path without colons, commas, or control characters", v.HostPath)
+	}
+	if hasInvalidMountPath(v.GuestPath) {
+		return fmt.Errorf("invalid volume guest path %q: use an absolute path without colons, commas, or control characters", v.GuestPath)
+	}
+	return nil
+}
+
+func (v VolumeSpec) formatFlag() string {
 	mode := "rw"
 	if v.ReadOnly {
 		mode = "ro"
 	}
 	statVirt := v.StatVirt
-	if statVirt == "" && v.ReadOnly {
-		statVirt = "relaxed"
+	if statVirt == "" {
+		if v.ReadOnly {
+			statVirt = "relaxed"
+		} else {
+			statVirt = "off"
+		}
 	}
-	opts := []string{mode}
-	if statVirt != "" {
-		opts = append(opts, "stat-virt="+statVirt)
-	}
+	opts := []string{mode, "stat-virt=" + statVirt}
 	if v.HostPerms != "" && statVirt != "off" {
 		opts = append(opts, "host-perms="+v.HostPerms)
 	}
 	if statVirt != "off" {
-		opts = append(opts, fmt.Sprintf("uid=%d", GuestUID), fmt.Sprintf("gid=%d", GuestGID))
+		opts = append(opts, fmt.Sprintf("uid=%d", config.GuestUID), fmt.Sprintf("gid=%d", config.GuestGID))
 	}
 	return fmt.Sprintf("%s:%s:%s", v.HostPath, v.GuestPath, strings.Join(opts, ","))
 }
 
-// CreateOpts holds parameters for `msb create`.
+// CreateOpts holds parameters for msb create.
 type CreateOpts struct {
 	Image    string
 	Name     string
@@ -767,21 +780,21 @@ type CreateOpts struct {
 	NetSpecs []string
 }
 
-// BuildCreateArgs constructs the CLI argument list for `msb create`.
+// BuildCreateArgs builds the CLI argument list for msb create.
 func BuildCreateArgs(opts CreateOpts) ([]string, error) {
 	if opts.Image == "" {
-		return nil, errors.New("image is required")
+		return nil, errors.New("specify an image")
 	}
 	if opts.Name == "" {
-		return nil, errors.New("sandbox name is required")
+		return nil, errors.New("specify a sandbox name")
 	}
 	cpus := opts.CPUs
 	if cpus == "" {
-		cpus = "4"
+		cpus = config.DefaultCPUs
 	}
 	mem := opts.Memory
 	if mem == "" {
-		mem = "8G"
+		mem = config.DefaultMemory
 	}
 	args := []string{
 		"create", opts.Image,
@@ -795,18 +808,15 @@ func BuildCreateArgs(opts CreateOpts) ([]string, error) {
 	if opts.Workdir != "" {
 		args = append(args, "--workdir", opts.Workdir, "--mkdir", opts.Workdir)
 	}
-	if opts.NoNet || len(opts.NetSpecs) > 0 {
-		netArgs, err := BuildNetArgs(opts.NoNet, opts.NetSpecs)
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, netArgs...)
+	netArgs, err := buildNetArgs(opts.NoNet, opts.NetSpecs)
+	if err != nil {
+		return nil, err
 	}
+	args = append(args, netArgs...)
 	return args, nil
 }
 
-// DiskMountSpec describes an explicit raw or qcow2 disk image attached via
-// `msb snap restore --mount-disk`.
+// DiskMountSpec describes a raw or qcow2 disk image attached via msb --mount-disk.
 type DiskMountSpec struct {
 	HostPath  string
 	GuestPath string
@@ -822,22 +832,34 @@ func hasInvalidMountPath(p string) bool {
 	if strings.ContainsAny(p, ":,") {
 		return true
 	}
-	for i := 0; i < len(p); i++ {
-		if p[i] < 0x20 || p[i] == 0x7f {
+	return hasControlChars(p)
+}
+
+func hasControlChars(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
 			return true
 		}
 	}
 	return false
 }
 
-// FormatFlag renders `<host_path>:<guest_path>:<ro|rw>,format=<fmt>,fstype=<fs>`
-// for `msb --mount-disk`.
-func (d DiskMountSpec) FormatFlag() (string, error) {
+func (d DiskMountSpec) formatFlag() (string, error) {
 	if hasInvalidMountPath(d.HostPath) {
-		return "", fmt.Errorf("invalid disk mount host path %q: must be an absolute path without colons, commas, or control characters", d.HostPath)
+		return "", fmt.Errorf("invalid disk mount host path %q: use an absolute path without colons, commas, or control characters", d.HostPath)
 	}
 	if hasInvalidMountPath(d.GuestPath) {
-		return "", fmt.Errorf("invalid disk mount guest path %q: must be an absolute path without colons, commas, or control characters", d.GuestPath)
+		return "", fmt.Errorf("invalid disk mount guest path %q: use an absolute path without colons, commas, or control characters", d.GuestPath)
+	}
+	switch d.Format {
+	case "", "raw", "qcow2":
+	default:
+		return "", fmt.Errorf("invalid disk mount format %q: expected raw or qcow2", d.Format)
+	}
+	switch d.FSType {
+	case "", "ext4", "xfs":
+	default:
+		return "", fmt.Errorf("invalid disk mount filesystem type %q: expected ext4 or xfs", d.FSType)
 	}
 	mode := "rw"
 	if d.ReadOnly {
@@ -854,7 +876,7 @@ func (d DiskMountSpec) FormatFlag() (string, error) {
 	return fmt.Sprintf("%s:%s:%s,format=%s,fstype=%s", d.HostPath, d.GuestPath, mode, format, fsType), nil
 }
 
-// RestoreOpts holds parameters for `msb snap restore`.
+// RestoreOpts holds parameters for msb snap restore.
 type RestoreOpts struct {
 	Snapshot   string
 	Name       string
@@ -863,22 +885,22 @@ type RestoreOpts struct {
 	Memory     string
 	DiskMounts []DiskMountSpec
 	Volumes    []VolumeSpec
-	Ports      []string // e.g. "127.0.0.1:4096:3000"
+	Ports      []string
 	NoNet      bool
 	NetSpecs   []string
 }
 
-// BuildRestoreArgs constructs the CLI argument list for `msb snap restore`.
+// BuildRestoreArgs builds the CLI argument list for msb snap restore.
 func BuildRestoreArgs(opts RestoreOpts) ([]string, error) {
 	if opts.Snapshot == "" {
-		return nil, errors.New("snapshot reference is required")
+		return nil, errors.New("specify a snapshot reference")
 	}
 	if opts.Name == "" {
-		return nil, errors.New("sandbox name is required")
+		return nil, errors.New("specify a sandbox name")
 	}
 	user := opts.User
 	if user == "" {
-		user = GuestUser
+		user = config.GuestUser
 	}
 	args := []string{
 		"snap", "restore", opts.Snapshot,
@@ -892,29 +914,34 @@ func BuildRestoreArgs(opts RestoreOpts) ([]string, error) {
 		args = append(args, "--memory", opts.Memory)
 	}
 	for _, v := range opts.Volumes {
-		args = append(args, "-v", v.FormatFlag())
+		if err := v.validate(); err != nil {
+			return nil, err
+		}
+		args = append(args, "-v", v.formatFlag())
 	}
 	for _, dm := range opts.DiskMounts {
-		flagVal, err := dm.FormatFlag()
+		flagVal, err := dm.formatFlag()
 		if err != nil {
 			return nil, err
 		}
 		args = append(args, "--mount-disk", flagVal)
 	}
+	ingressRules := make([]string, 0, len(opts.Ports))
 	for _, p := range opts.Ports {
+		rule, err := ingressRuleForPublishedPort(p)
+		if err != nil {
+			return nil, err
+		}
 		args = append(args, "-p", p)
+		ingressRules = append(ingressRules, rule)
 	}
-	netArgs, err := BuildNetArgs(opts.NoNet, opts.NetSpecs)
+	netArgs, err := buildNetArgs(opts.NoNet, opts.NetSpecs)
 	if err != nil {
 		return nil, err
 	}
 	args = append(args, netArgs...)
-	if len(opts.Ports) > 0 && !(len(netArgs) >= 2 && netArgs[0] == "--net-default" && netArgs[1] == "allow") {
-		for _, p := range opts.Ports {
-			rule, err := ingressRuleForPublishedPort(p)
-			if err != nil {
-				return nil, err
-			}
+	if len(netArgs) >= 2 && netArgs[0] == "--net-default" && netArgs[1] == "deny" {
+		for _, rule := range ingressRules {
 			if !hasNetRule(args, rule) {
 				args = append(args, "--net-rule", rule)
 			}
@@ -939,7 +966,7 @@ func ingressRuleForPublishedPort(spec string) (string, error) {
 	}
 	for _, r := range trimmed {
 		if r <= 0x20 || r == 0x7f {
-			return "", fmt.Errorf("invalid published port spec %q: whitespace and control characters are forbidden", spec)
+			return "", fmt.Errorf("invalid published port spec %q: omit whitespace and control characters", spec)
 		}
 	}
 	base, protoRaw, hasProto := strings.Cut(trimmed, "/")
@@ -958,8 +985,12 @@ func ingressRuleForPublishedPort(spec string) (string, error) {
 			return "", fmt.Errorf("invalid published port spec %q: unclosed '[' in bind address", spec)
 		}
 		bindIP := base[1:closeIdx]
-		if addr, err := netip.ParseAddr(bindIP); err != nil || addr.Zone() != "" {
+		addr, err := netip.ParseAddr(bindIP)
+		if err != nil || addr.Zone() != "" {
 			return "", fmt.Errorf("invalid published port spec %q: invalid bind IP %q", spec, bindIP)
+		}
+		if addr != netip.IPv6Loopback() {
+			return "", fmt.Errorf("invalid published port spec %q: bind IP %q must be 127.0.0.1 or [::1]", spec, bindIP)
 		}
 		after := base[closeIdx+1:]
 		if !strings.HasPrefix(after, ":") {
@@ -967,26 +998,22 @@ func ingressRuleForPublishedPort(spec string) (string, error) {
 		}
 		parts := strings.Split(after[1:], ":")
 		if len(parts) != 2 {
-			return "", fmt.Errorf("invalid published port spec %q: expected [bindIP]:hostPort:guestPort", spec)
+			return "", fmt.Errorf("invalid published port spec %q: expected [::1]:hostPort:guestPort", spec)
 		}
 		hostStr, guestStr = parts[0], parts[1]
 	} else {
 		parts := strings.Split(base, ":")
-		switch len(parts) {
-		case 2:
-			hostStr, guestStr = parts[0], parts[1]
-		case 3:
-			if addr, err := netip.ParseAddr(parts[0]); err != nil || addr.Zone() != "" {
-				return "", fmt.Errorf("invalid published port spec %q: invalid bind IP %q", spec, parts[0])
-			}
-			hostStr, guestStr = parts[1], parts[2]
-		default:
-			return "", fmt.Errorf("invalid published port spec %q: expected [bindIP:]hostPort:guestPort[/proto]", spec)
+		if len(parts) != 3 {
+			return "", fmt.Errorf("invalid published port spec %q: expected 127.0.0.1:hostPort:guestPort[/proto]", spec)
 		}
+		if parts[0] != "127.0.0.1" {
+			return "", fmt.Errorf("invalid published port spec %q: bind IP %q must be 127.0.0.1 or [::1]", spec, parts[0])
+		}
+		hostStr, guestStr = parts[1], parts[2]
 	}
 
 	if !isValidPort1To65535(hostStr) || !isValidPort1To65535(guestStr) {
-		return "", fmt.Errorf("invalid published port spec %q: host and guest ports must be integers in 1..65535", spec)
+		return "", fmt.Errorf("invalid published port spec %q: host and guest ports must be in 1..65535", spec)
 	}
 	return fmt.Sprintf("allow:ingress@loopback:%s:%s", proto, guestStr), nil
 }
@@ -999,7 +1026,7 @@ func isValidPort1To65535(s string) bool {
 	return err == nil && v >= 1
 }
 
-// ExecCmdOpts holds parameters for `msb exec`.
+// ExecCmdOpts holds parameters for msb exec.
 type ExecCmdOpts struct {
 	Sandbox  string
 	Workdir  string
@@ -1009,11 +1036,11 @@ type ExecCmdOpts struct {
 	NoTTY    bool
 	Stream   bool
 	NoStdin  bool
-	Env      []string // KEY=VAL pairs
+	Env      []string
 	Command  []string
 }
 
-// BuildExecArgs constructs the CLI argument list for `msb exec`.
+// BuildExecArgs builds the CLI argument list for msb exec.
 func BuildExecArgs(opts ExecCmdOpts) []string {
 	args := []string{"exec"}
 	if opts.Detached {
@@ -1032,9 +1059,11 @@ func BuildExecArgs(opts ExecCmdOpts) []string {
 	if opts.Workdir != "" {
 		args = append(args, "-w", opts.Workdir)
 	}
-	if opts.User != "" {
-		args = append(args, "-u", opts.User)
+	user := opts.User
+	if user == "" {
+		user = config.GuestUser
 	}
+	args = append(args, "-u", user)
 	for _, kv := range opts.Env {
 		args = append(args, "-e", kv)
 	}
@@ -1043,29 +1072,24 @@ func BuildExecArgs(opts ExecCmdOpts) []string {
 	return args
 }
 
-// GuestEnvFlags returns the standard environment key=value pairs passed to
-// guest `msb exec` invocations for the non-root `agent` user. Setting
-// SSH_CONNECTION=1 instructs `agy` to use its remote SSH OAuth flow (printing
-// a browser URL and prompting for the verification code) inside the microVM.
+// GuestEnvFlags returns environment variables for guest msb exec calls as user agent.
+// SSH_CONNECTION=1 tells agy to print its remote OAuth URL and prompt for a code.
 func GuestEnvFlags() []string {
 	return []string{
-		"HOME=" + GuestHome,
-		"USER=" + GuestUser,
-		"LOGNAME=" + GuestUser,
-		"PATH=" + GuestDefaultPath,
+		"HOME=" + config.GuestHome,
+		"USER=" + config.GuestUser,
+		"LOGNAME=" + config.GuestUser,
+		"PATH=" + guestDefaultPath,
 		"SSH_CONNECTION=1",
 	}
 }
 
-// KeyLoaderPrefix is the POSIX sh command that sources GuestKeysFile if it exists.
-// In POSIX sh (dash), a failed '.' command aborts a non-interactive shell.
-// Guarding with 'test -f' prevents shell termination when no keys file exists.
-const KeyLoaderPrefix = "test -f " + GuestKeysFile + " && . " + GuestKeysFile + ";"
+// KeyLoaderPrefix sources GuestKeysFile in POSIX sh when that file exists.
+// Checking test -f prevents dash from aborting a non-interactive shell when absent.
+const KeyLoaderPrefix = "test -f " + config.GuestKeysFile + " && . " + config.GuestKeysFile + ";"
 
-// ProvisionGuestUserScript returns an idempotent bash script that creates the
-// non-root user 'agent' (1000:1000) with passwordless sudo. It handles both
-// node:24-bookworm-slim (where UID 1000 is 'node') and debian:bookworm-slim
-// (where UID 1000 does not exist).
+// ProvisionGuestUserScript returns a bash script that prepares user agent (1000:1000) with sudo.
+// It handles node:24-bookworm-slim (UID 1000 is node) and debian:bookworm-slim.
 func ProvisionGuestUserScript() string {
 	return `set -euo pipefail
 if ! command -v sudo >/dev/null 2>&1; then
@@ -1126,14 +1150,14 @@ su - "agent" -c "sudo -n true"
 `
 }
 
-// SandboxInfo represents a single row from `msb ls`.
+// SandboxInfo represents one row from msb ls.
 type SandboxInfo struct {
 	Name    string
 	Running bool
 	RawLine string
 }
 
-// ParseSandboxList parses the tabular output of `msb ls`.
+// ParseSandboxList parses the tabular output of msb ls.
 func ParseSandboxList(out string) []SandboxInfo {
 	var result []SandboxInfo
 	for _, raw := range strings.Split(out, "\n") {
@@ -1145,8 +1169,7 @@ func ParseSandboxList(out string) []SandboxInfo {
 		if len(fields) == 0 {
 			continue
 		}
-		lower := strings.ToLower(line)
-		running := strings.Contains(lower, "running")
+		running := len(fields) > 1 && strings.EqualFold(fields[1], "running")
 		result = append(result, SandboxInfo{
 			Name:    fields[0],
 			Running: running,
@@ -1156,7 +1179,7 @@ func ParseSandboxList(out string) []SandboxInfo {
 	return result
 }
 
-// FindSandbox looks up a sandbox by name in a parsed list.
+// FindSandbox finds a sandbox by name in list.
 func FindSandbox(list []SandboxInfo, name string) (SandboxInfo, bool) {
 	for _, sb := range list {
 		if sb.Name == name {
@@ -1166,7 +1189,7 @@ func FindSandbox(list []SandboxInfo, name string) (SandboxInfo, bool) {
 	return SandboxInfo{}, false
 }
 
-// ParseSnapshotList extracts snapshot identifiers (`<group>:<tag>`) from `msb snap ls`.
+// ParseSnapshotList extracts snapshot references (<group>:<tag>) from msb snap ls.
 func ParseSnapshotList(out string) []string {
 	var snaps []string
 	for _, raw := range strings.Split(out, "\n") {
@@ -1182,57 +1205,33 @@ func ParseSnapshotList(out string) []string {
 	return snaps
 }
 
-var versionSuffixRe = regexp.MustCompile(`^v(\d+)$`)
-
-// NextSnapshotVersion inspects existing snapshot identifiers (e.g. `agbox:v1`,
-// `agbox:v2`) and returns the next integer version number for group.
-func NextSnapshotVersion(snaps []string, group string) int {
-	prefix := group + ":"
-	maxVer := 0
-	for _, s := range snaps {
-		if !strings.HasPrefix(s, prefix) {
-			continue
-		}
-		tag := strings.TrimPrefix(s, prefix)
-		m := versionSuffixRe.FindStringSubmatch(tag)
-		if len(m) == 2 {
-			if n, err := strconv.Atoi(m[1]); err == nil && n > maxVer {
-				maxVer = n
-			}
-		}
-	}
-	return maxVer + 1
-}
-
-// CommandRequest describes a single invocation of the `msb` binary.
+// CommandRequest describes one invocation of the msb binary.
 type CommandRequest struct {
 	Args        []string
 	Stdin       io.Reader
 	Stdout      io.Writer
 	Stderr      io.Writer
-	Interactive bool // When true, connect nil Stdin/Stdout/Stderr directly to os.Stdin/os.Stdout/os.Stderr
+	Interactive bool
 }
 
-// CommandResult captures the outcome of a non-interactive `msb` command.
+// CommandResult captures the output and exit code of an msb command.
 type CommandResult struct {
 	Stdout   string
 	Stderr   string
 	ExitCode int
 }
 
-// Runner abstracts execution of the `msb` binary so callers can be unit-tested
-// without launching real Firecracker/libkrun microVMs.
+// Runner executes the msb binary so unit tests run without libkrun microVMs.
 type Runner interface {
 	Run(ctx context.Context, req CommandRequest) (CommandResult, error)
 }
 
-// ExecRunner implements Runner using os/exec against the host `msb` binary.
+// ExecRunner implements Runner with os/exec against the host msb binary.
 type ExecRunner struct {
 	BinaryPath string
 }
 
-// ResolveBinary locates the msb executable from explicit, PATH, ~/.local/bin, or /usr/local/bin.
-func ResolveBinary(explicit string) (string, error) {
+func resolveBinary(explicit string) (string, error) {
 	home, _ := os.UserHomeDir()
 	return resolveBinaryWith(explicit, exec.LookPath, home, []string{"/usr/local/bin/msb"})
 }
@@ -1262,19 +1261,19 @@ func resolveBinaryWith(explicit string, lookPath func(string) (string, error), h
 			}
 		}
 	}
-	return "", errors.New("msb binary not found on PATH or ~/.local/bin/msb (run install.sh or install microsandbox)")
+	return "", errors.New("cannot find msb on PATH, ~/.local/bin/msb, or /usr/local/bin/msb (run install.sh)")
 }
 
-// NewExecRunner locates the `msb` binary and returns an ExecRunner.
+// NewExecRunner locates the msb binary and returns an ExecRunner.
 func NewExecRunner(explicit string) (*ExecRunner, error) {
-	bin, err := ResolveBinary(explicit)
+	bin, err := resolveBinary(explicit)
 	if err != nil {
 		return nil, err
 	}
 	return &ExecRunner{BinaryPath: bin}, nil
 }
 
-// Run executes `msb` with the given arguments and I/O streams.
+// Run executes msb with req.Args and streams or captures I/O.
 func (r *ExecRunner) Run(ctx context.Context, req CommandRequest) (CommandResult, error) {
 	cmd := exec.CommandContext(ctx, r.BinaryPath, req.Args...)
 
@@ -1327,7 +1326,7 @@ func (r *ExecRunner) Run(ctx context.Context, req CommandRequest) (CommandResult
 	return res, nil
 }
 
-// SnapshotExists reports whether target (`<group>:<tag>`) is present in `msb snap ls`.
+// SnapshotExists reports whether target (<group>:<tag>) appears in msb snap ls.
 func SnapshotExists(ctx context.Context, runner Runner, target string) (bool, error) {
 	res, err := runner.Run(ctx, CommandRequest{Args: []string{"snap", "ls"}})
 	if err != nil {
@@ -1337,18 +1336,18 @@ func SnapshotExists(ctx context.Context, runner Runner, target string) (bool, er
 	return slices.Contains(snaps, target), nil
 }
 
-// BuildVolumeCreateDiskArgs constructs the CLI argument list for creating an ext4 disk volume.
+// BuildVolumeCreateDiskArgs builds the CLI argument list to create an ext4 disk volume.
 func BuildVolumeCreateDiskArgs(name, size string) ([]string, error) {
 	if name == "" {
-		return nil, errors.New("volume name is required")
+		return nil, errors.New("specify a volume name")
 	}
 	if size == "" {
-		return nil, errors.New("volume size is required")
+		return nil, errors.New("specify a volume size")
 	}
 	return []string{"volume", "create", name, "--kind", "disk", "--size", size}, nil
 }
 
-// ParseVolumeList extracts named volume identifiers from `msb volume ls`.
+// ParseVolumeList extracts named volume identifiers from msb volume ls.
 func ParseVolumeList(out string) []string {
 	var vols []string
 	for _, raw := range strings.Split(out, "\n") {
@@ -1364,7 +1363,7 @@ func ParseVolumeList(out string) []string {
 	return vols
 }
 
-// VolumeExists reports whether target is present in `msb volume ls`.
+// VolumeExists reports whether target appears in msb volume ls.
 func VolumeExists(ctx context.Context, runner Runner, target string) (bool, error) {
 	res, err := runner.Run(ctx, CommandRequest{Args: []string{"volume", "ls"}})
 	if err != nil {
@@ -1375,8 +1374,7 @@ func VolumeExists(ctx context.Context, runner Runner, target string) (bool, erro
 
 var ansiCSIPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
-// ParseVolumeInspectPath extracts the host Path field from `msb volume inspect` output.
-func ParseVolumeInspectPath(out string) string {
+func parseVolumeInspectPath(out string) string {
 	clean := ansiCSIPattern.ReplaceAllString(out, "")
 	for _, rawLine := range strings.Split(clean, "\n") {
 		line := strings.TrimSpace(rawLine)
@@ -1399,17 +1397,19 @@ func ParseVolumeInspectPath(out string) string {
 	return ""
 }
 
-// ResolveVolumeDiskPath determines the backing disk.raw path for a named disk
-// volume using `msb volume inspect`, falling back to msbHome/volumes/<vol>/disk.raw.
+// ResolveVolumeDiskPath finds the disk.raw path for volName via msb volume inspect or msbHome.
 func ResolveVolumeDiskPath(ctx context.Context, runner Runner, msbHome, volName string) (string, error) {
 	if strings.TrimSpace(volName) == "" {
-		return "", errors.New("volume name is required")
+		return "", errors.New("specify a volume name")
+	}
+	if volName == "." || volName == ".." || filepath.Base(volName) != volName || strings.ContainsAny(volName, "/\\") || hasControlChars(volName) {
+		return "", fmt.Errorf("invalid volume name %q: omit path traversal characters", volName)
 	}
 	var diskPath string
 	if runner != nil {
 		res, err := runner.Run(ctx, CommandRequest{Args: []string{"volume", "inspect", volName}})
 		if err == nil {
-			diskPath = ParseVolumeInspectPath(res.Stdout)
+			diskPath = parseVolumeInspectPath(res.Stdout)
 		}
 	}
 	if diskPath == "" && msbHome != "" {

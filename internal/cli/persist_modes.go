@@ -5,12 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
-	"syscall"
+	"time"
 
 	"agbox/internal/config"
 	"agbox/internal/mounttab"
@@ -19,108 +17,19 @@ import (
 	"agbox/internal/persist"
 )
 
-// AuthOpts holds parsed arguments for `agbox auth`.
-type AuthOpts struct {
-	Action    string // "login", "status", "logout"
-	Target    string // "antigravity", "opencode", "all", or ""
-	AllowRoot bool
-}
-
-// ParseAuthArgs parses CLI arguments for `agbox auth`.
-func ParseAuthArgs(args []string) (AuthOpts, error) {
-	opts := AuthOpts{Action: "login"}
-	var pos []string
-	for _, a := range args {
-		switch a {
-		case "-h", "--help":
-			return AuthOpts{}, ErrHelp
-		case "--allow-root":
-			opts.AllowRoot = true
-		default:
-			if strings.HasPrefix(a, "-") {
-				return AuthOpts{}, fmt.Errorf("unknown auth option: %s (run 'agbox auth --help')", a)
-			}
-			pos = append(pos, a)
-		}
-	}
-
-	if len(pos) == 0 {
-		return opts, nil
-	}
-
-	switch pos[0] {
-	case "status":
-		if len(pos) > 1 {
-			return AuthOpts{}, errors.New("Usage: agbox auth [--allow-root] status")
-		}
-		opts.Action = "status"
-		return opts, nil
-	case "logout":
-		if len(pos) > 2 {
-			return AuthOpts{}, errors.New("Usage: agbox auth [--allow-root] logout [antigravity|opencode|all]")
-		}
-		opts.Action = "logout"
-		opts.Target = "all"
-		if len(pos) == 2 {
-			switch pos[1] {
-			case "antigravity", "opencode", "all":
-				opts.Target = pos[1]
-			default:
-				return AuthOpts{}, fmt.Errorf("unknown auth logout target %q (expected antigravity, opencode, or all)", pos[1])
-			}
-		}
-		return opts, nil
-	case "login":
-		if len(pos) > 2 {
-			return AuthOpts{}, errors.New("Usage: agbox auth [--allow-root] [login] <antigravity|opencode>")
-		}
-		if len(pos) == 2 {
-			switch pos[1] {
-			case "antigravity", "opencode":
-				opts.Target = pos[1]
-			default:
-				return AuthOpts{}, fmt.Errorf("unknown auth agent %q (expected antigravity or opencode)", pos[1])
-			}
-		}
-		return opts, nil
-	case "antigravity", "opencode":
-		if len(pos) > 1 {
-			return AuthOpts{}, errors.New("Usage: agbox auth [--allow-root] <antigravity|opencode>")
-		}
-		opts.Target = pos[0]
-		return opts, nil
-	default:
-		return AuthOpts{}, fmt.Errorf("unknown auth argument %q (expected antigravity, opencode, status, or logout)", pos[0])
-	}
-}
-
-// AuthUsageText returns the help message for `agbox auth --help`.
-func AuthUsageText() string {
-	return `Usage:
-  agbox auth [--allow-root] [antigravity|opencode]
-      Sign in inside a disposable microVM and save credentials in $DATA_DIR/auth.
-  agbox auth [--allow-root] status
-      Show saved login status for antigravity and opencode.
-  agbox auth [--allow-root] logout [antigravity|opencode|all]
-      Delete saved login credentials from $DATA_DIR/auth.
-`
-}
-
-// Auth manages persistent sandbox login credentials stored in $DATA_DIR/auth.
-func (a *App) Auth(ctx context.Context, args []string) error {
-	opts, err := ParseAuthArgs(args)
+func (a *appRuntime) auth(ctx context.Context, args []string) error {
+	opts, err := parseAuthArgs(args)
 	if err != nil {
 		return err
 	}
-	if err := a.verifyUser(opts.AllowRoot); err != nil {
-		return err
-	}
-	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
-		return fmt.Errorf("prepare data dir: %w", err)
-	}
-
 	switch opts.Action {
 	case "status":
+		if err := a.verifyUser(opts.AllowRoot); err != nil {
+			return err
+		}
+		if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+			return fmt.Errorf("prepare data dir: %w", err)
+		}
 		st, err := persist.AuthStatus(a.Env.DataDir)
 		if err != nil {
 			return err
@@ -135,6 +44,12 @@ func (a *App) Auth(ctx context.Context, args []string) error {
 		return nil
 
 	case "logout":
+		if err := a.verifyUser(opts.AllowRoot); err != nil {
+			return err
+		}
+		if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+			return fmt.Errorf("prepare data dir: %w", err)
+		}
 		if err := persist.RemoveAuth(a.Env.DataDir, opts.Target); err != nil {
 			return err
 		}
@@ -144,6 +59,9 @@ func (a *App) Auth(ctx context.Context, args []string) error {
 
 	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
+	}
+	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
+		return fmt.Errorf("prepare data dir: %w", err)
 	}
 	baseState, err := a.requireBase(ctx)
 	if err != nil {
@@ -159,83 +77,26 @@ func (a *App) Auth(ctx context.Context, args []string) error {
 		}
 	}
 	if baseState.Agent != "" && baseState.Agent != "both" && baseState.Agent != agent {
-		return fmt.Errorf("base was built for agent=%s. Rebuild with 'agbox create-base %s' or 'both'", baseState.Agent, agent)
+		return fmt.Errorf("the base snapshot contains only agent=%s. Run 'agbox create-base %s' or 'agbox create-base both'", baseState.Agent, agent)
 	}
 	if a.IsTTY == nil || !a.IsTTY() {
 		return errors.New("agbox auth requires an interactive TTY")
 	}
 
-	a.ReapOrphanRuns(ctx)
-	a.ReapStaleFilterDirs(ctx)
-
-	authName := fmt.Sprintf("auth-%d", a.PID)
-	authSandbox := FormatRunSandboxName(authName, a.PID)
-	runRootDir := filepath.Join(a.Env.DataDir, "run")
-	authRunDir := filepath.Join(runRootDir, authName)
-	if err := config.EnsurePrivateDir(runRootDir); err != nil {
-		return err
-	}
-	if err := config.EnsurePrivateDir(authRunDir); err != nil {
-		return err
-	}
-	meta := config.RunMeta{
-		Sandbox:  authSandbox,
-		OwnerPID: a.PID,
-		Agent:    agent,
-		Mode:     config.RunModeTUI,
-		MaskMode: config.MaskStrict,
-	}
-	if err := config.SaveRunMeta(filepath.Join(authRunDir, "run.meta"), meta); err != nil {
-		return err
-	}
-
-	authCtx, cancelAuth := context.WithCancel(ctx)
-	defer cancelAuth()
-
-	sandboxCreated := false
-	var cleanupOnce sync.Once
-	cleanup := func() {
-		cleanupOnce.Do(func() {
-			if sandboxCreated {
-				_, _ = a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"rm", "-f", authSandbox}})
-			}
-			_ = mounttab.TeardownFilterDir(authRunDir, a.MountCtl)
-		})
-	}
-	defer cleanup()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(sigCh)
-	go func() {
-		select {
-		case <-sigCh:
-			cancelAuth()
-			cleanup()
-		case <-authCtx.Done():
-		}
-	}()
-
-	restoreArgs, err := msb.BuildRestoreArgs(msb.RestoreOpts{
-		Snapshot: baseState.Snapshot,
-		Name:     authSandbox,
-		User:     config.GuestUser,
-		CPUs:     a.Env.CPUs,
-		Memory:   a.Env.Memory,
-	})
+	authCtx, authSandbox, cleanup, err := a.startDisposableVM(
+		ctx,
+		"auth",
+		baseState.Snapshot,
+		agent,
+		config.RunModeTUI,
+		"Booting disposable login microVM %s (zero host shares)...",
+	)
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 
-	a.logf("Booting disposable login microVM %s (zero host shares)...", authSandbox)
-	sandboxCreated = true
-	if res, err := a.MSB.Run(authCtx, msb.CommandRequest{Args: restoreArgs}); err != nil {
-		return formatMSBError("snapshot restore failed", res, err)
-	}
-	if err := a.ensureGuestUser(authCtx, authSandbox); err != nil {
-		return err
-	}
-	// Seed existing saved auth for this agent so multi-provider logins keep prior entries.
+	// Seed saved credentials for this agent so multi-provider logins keep prior entries.
 	if err := a.pushAuth(authCtx, authSandbox, agent); err != nil {
 		return err
 	}
@@ -248,7 +109,7 @@ func (a *App) Auth(ctx context.Context, args []string) error {
 		a.logf("Complete provider login in OpenCode.")
 		loginCmd = msb.KeyLoaderPrefix + " cd /workspace && opencode auth login"
 	} else {
-		a.logf("Open the printed URL, paste the verification code, and run /exit to save credentials.")
+		a.logf("Open the printed URL. Paste the verification code. Run /exit to save credentials.")
 		loginCmd = msb.KeyLoaderPrefix + " cd /workspace && agy"
 	}
 
@@ -263,16 +124,24 @@ func (a *App) Auth(ctx context.Context, args []string) error {
 		Args:        execArgs,
 		Interactive: true,
 	})
+	if authCtx.Err() != nil {
+		return authCtx.Err()
+	}
 
 	capScript, err := persist.BuildAuthCaptureScript(agent)
 	if err != nil {
 		return err
 	}
-	capRes, err := a.MSB.Run(authCtx, msb.CommandRequest{
-		Args: []string{"exec", "-u", config.GuestUser, authSandbox, "--", "sh", "-c", capScript},
+	capArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
+		Sandbox: authSandbox,
+		User:    config.GuestUser,
+		Stream:  true,
+		NoStdin: true,
+		Command: []string{"sh", "-c", capScript},
 	})
+	capRes, err := a.MSB.Run(authCtx, msb.CommandRequest{Args: capArgs})
 	if err != nil {
-		return formatMSBError(fmt.Sprintf("capture %s credentials", agent), capRes, err)
+		return formatMSBStderrOnlyError(fmt.Sprintf("capture %s credentials", agent), capRes.Stderr, err)
 	}
 	bundle, err := persist.ParseAuthCapture(agent, capRes.Stdout)
 	if err != nil {
@@ -285,78 +154,9 @@ func (a *App) Auth(ctx context.Context, args []string) error {
 	return nil
 }
 
-// SkillsOpts holds parsed arguments for `agbox skills`.
-type SkillsOpts struct {
-	Action    string // "list", "add", "rm"
-	Target    string
-	Force     bool
-	AllowRoot bool
-}
-
-// ParseSkillsArgs parses CLI arguments for `agbox skills`.
-func ParseSkillsArgs(args []string) (SkillsOpts, error) {
-	opts := SkillsOpts{Action: "list"}
-	var pos []string
-	for _, a := range args {
-		switch a {
-		case "-h", "--help":
-			return SkillsOpts{}, ErrHelp
-		case "--allow-root":
-			opts.AllowRoot = true
-		case "--force":
-			opts.Force = true
-		default:
-			if strings.HasPrefix(a, "-") {
-				return SkillsOpts{}, fmt.Errorf("unknown skills option: %s (run 'agbox skills --help')", a)
-			}
-			pos = append(pos, a)
-		}
-	}
-	if len(pos) == 0 {
-		return opts, nil
-	}
-	switch pos[0] {
-	case "list", "ls":
-		if len(pos) != 1 {
-			return SkillsOpts{}, errors.New("Usage: agbox skills [--allow-root] [list]")
-		}
-		opts.Action = "list"
-		return opts, nil
-	case "add":
-		if len(pos) != 2 {
-			return SkillsOpts{}, errors.New("Usage: agbox skills [--allow-root] add [--force] <skill-dir-or-SKILL.md>")
-		}
-		opts.Action = "add"
-		opts.Target = pos[1]
-		return opts, nil
-	case "rm", "remove":
-		if len(pos) != 2 {
-			return SkillsOpts{}, errors.New("Usage: agbox skills [--allow-root] rm <skill-name>")
-		}
-		opts.Action = "rm"
-		opts.Target = pos[1]
-		return opts, nil
-	default:
-		return SkillsOpts{}, fmt.Errorf("unknown skills subcommand %q (expected list, add, or rm)", pos[0])
-	}
-}
-
-// SkillsUsageText returns the help message for `agbox skills --help`.
-func SkillsUsageText() string {
-	return `Usage:
-  agbox skills [--allow-root] [list]
-      List global skills stored in $DATA_DIR/skills.
-  agbox skills [--allow-root] add [--force] <path>
-      Validate and copy a skill directory (or SKILL.md) into $DATA_DIR/skills/<name>.
-  agbox skills [--allow-root] rm <name>
-      Delete a global skill from $DATA_DIR/skills/<name>.
-`
-}
-
-// Skills manages host-stored global skills mounted read-only into sandboxes.
-func (a *App) Skills(ctx context.Context, args []string) error {
+func (a *appRuntime) skills(ctx context.Context, args []string) error {
 	_ = ctx
-	opts, err := ParseSkillsArgs(args)
+	opts, err := parseSkillsArgs(args)
 	if err != nil {
 		return err
 	}
@@ -401,120 +201,9 @@ func (a *App) Skills(ctx context.Context, args []string) error {
 	return nil
 }
 
-// RulesOpts holds parsed arguments for `agbox rules`.
-type RulesOpts struct {
-	Action    string // "list", "add", "show", "rm"
-	Target    string
-	Name      string
-	Force     bool
-	All       bool
-	AllowRoot bool
-}
-
-// ParseRulesArgs parses CLI arguments for `agbox rules`.
-func ParseRulesArgs(args []string) (RulesOpts, error) {
-	opts := RulesOpts{Action: "list"}
-	var pos []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if strings.HasPrefix(a, "--name=") {
-			name, err := persist.ValidateRuleName(strings.TrimPrefix(a, "--name="))
-			if err != nil {
-				return RulesOpts{}, err
-			}
-			opts.Name = name
-			continue
-		}
-		switch a {
-		case "-h", "--help":
-			return RulesOpts{}, ErrHelp
-		case "--allow-root":
-			opts.AllowRoot = true
-		case "--force", "-f":
-			opts.Force = true
-		case "--all":
-			opts.All = true
-		case "--name":
-			if i+1 >= len(args) || args[i+1] == "" {
-				return RulesOpts{}, errors.New("--name requires a rule name")
-			}
-			name, err := persist.ValidateRuleName(args[i+1])
-			if err != nil {
-				return RulesOpts{}, err
-			}
-			opts.Name = name
-			i++
-		default:
-			if strings.HasPrefix(a, "-") {
-				return RulesOpts{}, fmt.Errorf("unknown rules option: %s (run 'agbox rules --help')", a)
-			}
-			pos = append(pos, a)
-		}
-	}
-	if len(pos) == 0 {
-		if opts.Name != "" || opts.Force || opts.All {
-			return RulesOpts{}, errors.New("Usage: agbox rules [list|add|show|rm]")
-		}
-		return opts, nil
-	}
-	switch pos[0] {
-	case "list", "ls":
-		if len(pos) != 1 || opts.Name != "" || opts.All {
-			return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] [list]")
-		}
-		opts.Action = "list"
-		return opts, nil
-	case "add":
-		if len(pos) != 2 || opts.All {
-			return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] add [--force] [--name NAME] <file.md>")
-		}
-		opts.Action = "add"
-		opts.Target = pos[1]
-		return opts, nil
-	case "show", "cat":
-		if len(pos) > 2 || opts.Name != "" || opts.Force || opts.All {
-			return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] show [<name>]")
-		}
-		opts.Action = "show"
-		if len(pos) == 2 {
-			opts.Target = pos[1]
-		}
-		return opts, nil
-	case "rm", "remove":
-		if opts.All {
-			if len(pos) != 1 {
-				return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] rm --all")
-			}
-		} else if len(pos) != 2 {
-			return RulesOpts{}, errors.New("Usage: agbox rules [--allow-root] rm <name|--all>")
-		} else {
-			opts.Target = pos[1]
-		}
-		opts.Action = "rm"
-		return opts, nil
-	default:
-		return RulesOpts{}, fmt.Errorf("unknown rules subcommand %q (expected list, add, show, or rm)", pos[0])
-	}
-}
-
-// RulesUsageText returns the help message for `agbox rules --help`.
-func RulesUsageText() string {
-	return `Usage:
-  agbox rules [--allow-root] [list]
-      List global rules stored in $DATA_DIR/rules.
-  agbox rules [--allow-root] add [--force] [--name NAME] <file.md>
-      Validate and save a Markdown rule file in $DATA_DIR/rules/<name>.md.
-  agbox rules [--allow-root] show [<name>]
-      Print one or all global rule files from $DATA_DIR/rules.
-  agbox rules [--allow-root] rm <name|--all>
-      Delete one or all global rules from $DATA_DIR/rules.
-`
-}
-
-// Rules manages host-stored global rules mounted read-only into sandboxes.
-func (a *App) Rules(ctx context.Context, args []string) error {
+func (a *appRuntime) rules(ctx context.Context, args []string) error {
 	_ = ctx
-	opts, err := ParseRulesArgs(args)
+	opts, err := parseRulesArgs(args)
 	if err != nil {
 		return err
 	}
@@ -605,96 +294,8 @@ func (a *App) Rules(ctx context.Context, args []string) error {
 	return nil
 }
 
-// ProfileOpts holds parsed arguments for `agbox profile`.
-type ProfileOpts struct {
-	Action    string // "list", "create", "rm"
-	Name      string
-	Size      string
-	Force     bool
-	AllowRoot bool
-}
-
-// ParseProfileArgs parses CLI arguments for `agbox profile`.
-func ParseProfileArgs(args []string) (ProfileOpts, error) {
-	opts := ProfileOpts{Action: "list"}
-	var pos []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch a {
-		case "-h", "--help":
-			return ProfileOpts{}, ErrHelp
-		case "--allow-root":
-			opts.AllowRoot = true
-		case "--force", "-f":
-			opts.Force = true
-		case "--size":
-			if i+1 >= len(args) || args[i+1] == "" {
-				return ProfileOpts{}, errors.New("--size requires a disk size such as 10G or 2048M")
-			}
-			if !config.IsValidSizeSpec(args[i+1]) {
-				return ProfileOpts{}, fmt.Errorf("invalid --size %q: expected a positive size in M or G (for example, 10G)", args[i+1])
-			}
-			opts.Size = strings.ToUpper(strings.TrimSpace(args[i+1]))
-			i++
-		default:
-			if strings.HasPrefix(a, "-") {
-				return ProfileOpts{}, fmt.Errorf("unknown profile option: %s (run 'agbox profile --help')", a)
-			}
-			pos = append(pos, a)
-		}
-	}
-	if len(pos) == 0 {
-		return opts, nil
-	}
-	switch pos[0] {
-	case "list", "ls":
-		if len(pos) != 1 {
-			return ProfileOpts{}, errors.New("Usage: agbox profile [--allow-root] [list]")
-		}
-		opts.Action = "list"
-		return opts, nil
-	case "create":
-		if len(pos) != 2 {
-			return ProfileOpts{}, errors.New("Usage: agbox profile [--allow-root] create [--size SIZE] <name>")
-		}
-		name, err := persist.ValidateProfileName(pos[1])
-		if err != nil {
-			return ProfileOpts{}, err
-		}
-		opts.Action = "create"
-		opts.Name = name
-		return opts, nil
-	case "rm", "remove":
-		if len(pos) != 2 {
-			return ProfileOpts{}, errors.New("Usage: agbox profile [--allow-root] rm [--force] <name>")
-		}
-		name, err := persist.ValidateProfileName(pos[1])
-		if err != nil {
-			return ProfileOpts{}, err
-		}
-		opts.Action = "rm"
-		opts.Name = name
-		return opts, nil
-	default:
-		return ProfileOpts{}, fmt.Errorf("unknown profile subcommand %q (expected list, create, or rm)", pos[0])
-	}
-}
-
-// ProfileUsageText returns the help message for `agbox profile --help`.
-func ProfileUsageText() string {
-	return `Usage:
-  agbox profile [--allow-root] [list]
-      List persistent conversation profiles and disk volumes.
-  agbox profile [--allow-root] create [--size SIZE] <name>
-      Create an ext4 disk volume (agbox-profile-<name>) for --profile runs.
-  agbox profile [--allow-root] rm [--force] <name>
-      Delete profile disk volume agbox-profile-<name> and its metadata.
-`
-}
-
-// Profile manages persistent ext4 disk profiles for cross-run conversation history.
-func (a *App) Profile(ctx context.Context, args []string) error {
-	opts, err := ParseProfileArgs(args)
+func (a *appRuntime) profile(ctx context.Context, args []string) error {
+	opts, err := parseProfileArgs(args)
 	if err != nil {
 		return err
 	}
@@ -714,30 +315,26 @@ func (a *App) Profile(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		volRes, _ := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"volume", "ls"}})
+		volRes, vErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"volume", "ls"}})
+		if vErr != nil {
+			a.warnf("Could not list msb volumes: %v", formatMSBError("msb volume ls", volRes, vErr))
+		}
 		vols := msb.ParseVolumeList(volRes.Stdout)
-		seen := make(map[string]bool)
+		seen := make(map[string]bool, len(profiles))
 		for _, pm := range profiles {
 			seen[pm.Volume] = true
 			fmt.Fprintf(a.Stdout, "%s\tvolume=%s\tsize=%s\n", pm.Name, pm.Volume, pm.Size)
 		}
+		hasExtra := false
 		for _, v := range vols {
 			if persist.IsProfileVolumeName(v) && !seen[v] {
+				hasExtra = true
 				name := strings.TrimPrefix(v, persist.ProfileVolumePrefix)
 				fmt.Fprintf(a.Stdout, "%s\tvolume=%s\tsize=unknown\n", name, v)
 			}
 		}
-		if len(profiles) == 0 && len(seen) == 0 {
-			hasExtra := false
-			for _, v := range vols {
-				if persist.IsProfileVolumeName(v) {
-					hasExtra = true
-					break
-				}
-			}
-			if !hasExtra {
-				fmt.Fprintln(a.Stdout, "No conversation profiles configured.")
-			}
+		if len(profiles) == 0 && !hasExtra {
+			fmt.Fprintln(a.Stdout, "No conversation profiles configured.")
 		}
 		return nil
 
@@ -753,7 +350,16 @@ func (a *App) Profile(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		a.logf("Profile %q is ready (volume=%s, size=%s).", opts.Name, volName, size)
+		effectiveSize := size
+		if existing, lErr := persist.ListProfiles(a.Env.DataDir); lErr == nil {
+			for _, pm := range existing {
+				if pm.Name == opts.Name && pm.Size != "" {
+					effectiveSize = pm.Size
+					break
+				}
+			}
+		}
+		a.logf("Profile %q is ready (volume=%s, size=%s).", opts.Name, volName, effectiveSize)
 		return nil
 
 	case "rm":
@@ -782,7 +388,6 @@ func (a *App) Profile(ctx context.Context, args []string) error {
 				return formatMSBError("delete volume "+volName, rmRes, err)
 			}
 		}
-		_ = lock.Unlock()
 		if err := persist.RemoveProfileDir(a.Env.DataDir, opts.Name); err != nil {
 			return err
 		}
@@ -792,16 +397,25 @@ func (a *App) Profile(ctx context.Context, args []string) error {
 	return nil
 }
 
-func (a *App) ensureProfileVolume(ctx context.Context, profileName, size string) (string, error) {
+func (a *appRuntime) ensureProfileVolume(ctx context.Context, profileName, size string) (string, error) {
 	volName := persist.FormatProfileVolumeName(profileName)
 	exists, err := msb.VolumeExists(ctx, a.MSB, volName)
 	if err != nil {
 		return "", err
 	}
-	if !exists {
-		if size == "" {
-			size = config.DefaultProfileDisk
+	if exists {
+		if existing, lErr := persist.ListProfiles(a.Env.DataDir); lErr == nil {
+			for _, pm := range existing {
+				if pm.Name == profileName {
+					return volName, nil
+				}
+			}
 		}
+	}
+	if size == "" {
+		size = defaultStr(a.Env.ProfileDisk, config.DefaultProfileDisk)
+	}
+	if !exists {
 		createArgs, err := msb.BuildVolumeCreateDiskArgs(volName, size)
 		if err != nil {
 			return "", err
@@ -812,20 +426,40 @@ func (a *App) ensureProfileVolume(ctx context.Context, profileName, size string)
 		}
 	}
 	if err := persist.SaveProfileMeta(a.Env.DataDir, persist.ProfileMeta{
-		Name:   profileName,
-		Volume: volName,
-		Size:   defaultStr(size, config.DefaultProfileDisk),
+		Name:      profileName,
+		Volume:    volName,
+		Size:      size,
+		CreatedAt: a.now().UTC().Format(time.RFC3339),
 	}); err != nil {
+		if !exists {
+			teardownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			rmRes, rmErr := a.MSB.Run(teardownCtx, msb.CommandRequest{Args: []string{"volume", "rm", volName}})
+			cancel()
+			if rmErr != nil {
+				a.warnf("Could not roll back profile volume %s: %v", volName, formatMSBError("msb volume rm", rmRes, rmErr))
+			}
+		}
 		return "", fmt.Errorf("save profile metadata: %w", err)
 	}
 	return volName, nil
 }
 
-func (a *App) checkProfileNotActive(profileName, currentSandbox string, sandboxes []msb.SandboxInfo) error {
-	runRoot := filepath.Join(a.Env.DataDir, "run")
+func scanRunEntries(dataDir string) ([]os.DirEntry, string, error) {
+	runRoot := filepath.Join(dataDir, "run")
 	entries, err := os.ReadDir(runRoot)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, runRoot, nil
+		}
+		return nil, runRoot, fmt.Errorf("read run directory %s: %w", runRoot, err)
+	}
+	return entries, runRoot, nil
+}
+
+func (a *appRuntime) checkProfileNotActive(profileName, currentSandbox string, sandboxes []msb.SandboxInfo) error {
+	entries, runRoot, err := scanRunEntries(a.Env.DataDir)
+	if err != nil {
+		return err
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -842,17 +476,16 @@ func (a *App) checkProfileNotActive(profileName, currentSandbox string, sandboxe
 	return nil
 }
 
-func (a *App) checkProfileRemovable(profileName string, force bool, sandboxes []msb.SandboxInfo) error {
+func (a *appRuntime) checkProfileRemovable(profileName string, force bool, sandboxes []msb.SandboxInfo) error {
 	if err := a.checkProfileNotActive(profileName, "", sandboxes); err != nil {
 		return err
 	}
 	if force {
 		return nil
 	}
-	runRoot := filepath.Join(a.Env.DataDir, "run")
-	entries, err := os.ReadDir(runRoot)
+	entries, runRoot, err := scanRunEntries(a.Env.DataDir)
 	if err != nil {
-		return nil
+		return err
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -864,13 +497,13 @@ func (a *App) checkProfileRemovable(profileName string, force bool, sandboxes []
 			continue
 		}
 		if _, ok := msb.FindSandbox(sandboxes, meta.Sandbox); ok {
-			return fmt.Errorf("profile %q is referenced by suspended sandbox %s. Run 'agbox stop %s' first or pass --force", profileName, meta.Sandbox, meta.Sandbox)
+			return fmt.Errorf("suspended sandbox %s references profile %q. Run 'agbox stop %s' first or pass --force", meta.Sandbox, profileName, meta.Sandbox)
 		}
 	}
 	return nil
 }
 
-func (a *App) pushAuth(ctx context.Context, sandbox, effectiveAgent string) error {
+func (a *appRuntime) pushAuth(ctx context.Context, sandbox, effectiveAgent string) error {
 	var agents []string
 	switch effectiveAgent {
 	case "antigravity", "opencode":
@@ -889,8 +522,13 @@ func (a *App) pushAuth(ctx context.Context, sandbox, effectiveAgent string) erro
 	if err != nil {
 		return fmt.Errorf("format login restore script: %w", err)
 	}
+	execArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
+		Sandbox: sandbox,
+		User:    config.GuestUser,
+		Command: []string{"sh"},
+	})
 	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args:  []string{"exec", "-u", config.GuestUser, sandbox, "--", "sh"},
+		Args:  execArgs,
 		Stdin: strings.NewReader(script),
 	}); err != nil {
 		return formatMSBError("stream saved login credentials into "+sandbox, res, err)
@@ -899,52 +537,54 @@ func (a *App) pushAuth(ctx context.Context, sandbox, effectiveAgent string) erro
 	return nil
 }
 
-func (a *App) setupGuestSkills(ctx context.Context, sandbox string) error {
-	script := persist.BuildGuestSkillsMountScript()
-	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", script},
-	}); err != nil {
-		return formatMSBError("bind-mount global skills in "+sandbox, res, err)
-	}
-	return nil
+func (a *appRuntime) setupGuestSkills(ctx context.Context, sandbox string) error {
+	_, err := a.runGuestRootScript(ctx, sandbox, "bind-mount global skills in "+sandbox, "sh", persist.BuildGuestSkillsMountScript())
+	return err
 }
 
-func (a *App) setupGuestRules(ctx context.Context, sandbox string) error {
-	script := persist.BuildGuestRulesMountScript()
-	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", script},
-	}); err != nil {
-		return formatMSBError("bind-mount global rules in "+sandbox, res, err)
-	}
-	return nil
+func (a *appRuntime) setupGuestRules(ctx context.Context, sandbox string) error {
+	_, err := a.runGuestRootScript(ctx, sandbox, "bind-mount global rules in "+sandbox, "sh", persist.BuildGuestRulesMountScript())
+	return err
 }
 
-func (a *App) setupGuestProfile(ctx context.Context, sandbox string) error {
-	script := persist.BuildGuestProfileMountScript()
-	if res, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", script},
-	}); err != nil {
-		return formatMSBError("bind-mount conversation profile in "+sandbox, res, err)
-	}
-	return nil
+func (a *appRuntime) setupGuestProfile(ctx context.Context, sandbox string) error {
+	_, err := a.runGuestRootScript(ctx, sandbox, "bind-mount conversation profile in "+sandbox, "sh", persist.BuildGuestProfileMountScript())
+	return err
 }
 
-func (a *App) suspendSandboxOnExit(sandbox, runFilterDir string, meta config.RunMeta) {
+func (a *appRuntime) suspendSandboxOnExit(sandbox, runFilterDir string, meta config.RunMeta) {
+	if hasMarker(filepath.Join(runFilterDir, "deleting")) {
+		return
+	}
+	metaLock, lockErr := lockRunMeta(runFilterDir)
+	if lockErr == nil {
+		defer metaLock.unlock()
+	}
+
 	savedMeta := meta
 	if latest, lErr := config.LoadRunMeta(filepath.Join(runFilterDir, "run.meta")); lErr == nil {
 		savedMeta = latest
 	}
 	savedMeta.Continue = false
 	savedMeta.ContinueSession = ""
+
+	teardownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stopRes, stopErr := a.MSB.Run(teardownCtx, msb.CommandRequest{Args: stopSandboxArgs(sandbox, savedMeta.Profile != "")})
+	if stopErr != nil {
+		a.warnf("Could not stop persistent sandbox %s: %v", sandbox, formatMSBError("msb stop", stopRes, stopErr))
+		return
+	}
+
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
 	if err := config.SaveRunMeta(suspendedPath, savedMeta); err != nil {
 		a.warnf("Could not save suspended metadata for %s: %v", sandbox, err)
-	}
-	if _, err := a.MSB.Run(context.Background(), msb.CommandRequest{Args: []string{"stop", sandbox}}); err != nil {
-		a.warnf("Could not stop persistent sandbox %s: %v", sandbox, err)
+		return
 	}
 	_ = os.Remove(filepath.Join(runFilterDir, "detached"))
-	_ = mounttab.UnmountFilterDir(runFilterDir, a.MountCtl)
+	if uErr := mounttab.UnmountFilterDir(runFilterDir, a.MountCtl); uErr != nil {
+		a.warnf("Could not unmount shares in %s: %v", runFilterDir, uErr)
+	}
 	a.logf("Persisted %s (stopped). Resume with 'agbox resume %s' or delete with 'agbox stop %s'.", sandbox, sandbox, sandbox)
 }
 
@@ -968,8 +608,9 @@ func sharesMatchRecorded(validated []pathsec.ShareTarget, recorded []config.Shar
 	return true
 }
 
-func (a *App) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string, baseState config.State, opts RunOpts, useMask bool) error {
-	suspendedPath := filepath.Join(a.Env.DataDir, "run", dirID, "suspended")
+func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string, baseState config.State, opts runOpts, useMask bool) error {
+	runFilterDir := filepath.Join(a.Env.DataDir, "run", dirID)
+	suspendedPath := filepath.Join(runFilterDir, "suspended")
 	meta, err := config.LoadRunMeta(suspendedPath)
 	if err != nil {
 		return fmt.Errorf("load suspended metadata for %q: %w", runSandbox, err)
@@ -980,8 +621,8 @@ func (a *App) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string
 		if vErr != nil {
 			return vErr
 		}
-		if opts.ReadOnly != meta.ReadOnly || opts.MaskMode != meta.MaskMode || !sharesMatchRecorded(validated, meta.Shares, useMask, meta.ReadOnly) {
-			return fmt.Errorf("persistent sandbox %q has different shared paths or mount flags. Use 'agbox share' to modify shares or 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+		if opts.ReadOnly != meta.ReadOnly || opts.MaskMode != meta.MaskMode || !sharesMatchRecorded(validated, meta.Shares, meta.WorkspaceHub && useMask, meta.ReadOnly) {
+			return fmt.Errorf("persistent sandbox %q has different shared paths or mount flags. Use 'agbox share' to modify shares, or 'agbox stop %s' to recreate it", runSandbox, runSandbox)
 		}
 	}
 
@@ -989,14 +630,14 @@ func (a *App) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string
 	origCmd := meta.Cmd
 
 	if opts.Agent != "" {
-		effAgent, aErr := SelectEffectiveAgent(baseState.Agent, opts)
+		effAgent, aErr := selectEffectiveAgent(baseState.Agent, opts)
 		if aErr != nil {
 			return aErr
 		}
 		meta.Agent = effAgent
 	}
 	if opts.Serve && meta.Port == 0 {
-		return fmt.Errorf("persistent sandbox %q was not created with --serve. Run 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+		return fmt.Errorf("persistent sandbox %q has no --serve port. Run 'agbox stop %s', then start it with --serve", runSandbox, runSandbox)
 	}
 	switch {
 	case opts.Cmd != "":
@@ -1018,7 +659,7 @@ func (a *App) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string
 		return fmt.Errorf("update persistent metadata: %w", err)
 	}
 
-	runErr := a.resumeSandbox(ctx, ResumeOpts{
+	runErr := a.resumeSandbox(ctx, resumeOpts{
 		Sandbox:         runSandbox,
 		AllowRoot:       opts.AllowRoot,
 		Detach:          opts.Detach,
@@ -1034,7 +675,9 @@ func (a *App) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string
 		if latest, lErr := config.LoadRunMeta(suspendedPath); lErr == nil {
 			latest.Mode = origMode
 			latest.Cmd = origCmd
-			_ = config.SaveRunMeta(suspendedPath, latest)
+			if sErr := config.SaveRunMeta(suspendedPath, latest); sErr != nil {
+				a.warnf("Could not restore persistent run mode for %s: %v", runSandbox, sErr)
+			}
 		}
 	}
 	return runErr
@@ -1082,7 +725,7 @@ func buildTUIInvokeCommand(meta config.RunMeta) string {
 	return strings.Join(parts, " ")
 }
 
-func (a *App) printPersistenceStatus(ctx context.Context) {
+func (a *appRuntime) printPersistenceStatus(ctx context.Context) {
 	fmt.Fprintln(a.Stdout, "\n== persistence ==")
 	if authSt, err := persist.AuthStatus(a.Env.DataDir); err == nil {
 		var configured []string

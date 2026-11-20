@@ -15,6 +15,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -29,17 +31,17 @@ import (
 )
 
 func TestParseCreateBaseArgs(t *testing.T) {
-	opts, err := ParseCreateBaseArgs([]string{"--force", "--add", "core,go,rust,esphome", "opencode"})
+	opts, err := parseCreateBaseArgs([]string{"--force", "--add", "core,go,rust,esphome", "opencode"})
 	if err != nil || opts.Agent != "opencode" || !opts.Force || len(opts.Categories) != 4 {
 		t.Fatalf("ParseCreateBaseArgs(--force --add ... opencode) = %+v, %v", opts, err)
 	}
 	for _, agent := range []string{"antigravity", "both"} {
-		opts, err := ParseCreateBaseArgs([]string{agent})
+		opts, err := parseCreateBaseArgs([]string{agent})
 		if err != nil || opts.Agent != agent || opts.Force {
 			t.Fatalf("ParseCreateBaseArgs(%s) = %+v, %v", agent, opts, err)
 		}
 	}
-	if _, err := ParseCreateBaseArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+	if _, err := parseCreateBaseArgs([]string{"--help"}); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 	for _, bad := range [][]string{
@@ -50,22 +52,22 @@ func TestParseCreateBaseArgs(t *testing.T) {
 		{"--add", "badcat", "opencode"},
 		{"opencode", "extra"},
 	} {
-		if _, err := ParseCreateBaseArgs(bad); err == nil {
+		if _, err := parseCreateBaseArgs(bad); err == nil {
 			t.Errorf("expected error for %v", bad)
 		}
 	}
 }
 
 func TestParseEditBaseArgs(t *testing.T) {
-	opts, err := ParseEditBaseArgs([]string{"--add", "core,go", "rust", "esphome", "--cmd", "apt-get install -y jq", "--no-snap"})
+	opts, err := parseEditBaseArgs([]string{"--add", "core,go", "rust", "esphome", "--cmd", "apt-get install -y jq", "--no-snap"})
 	if err != nil || opts.Cmd != "apt-get install -y jq" || !opts.NoSnap || len(opts.Categories) != 4 {
 		t.Fatalf("ParseEditBaseArgs = %+v, %v", opts, err)
 	}
-	listOpts, err := ParseEditBaseArgs([]string{"--list"})
+	listOpts, err := parseEditBaseArgs([]string{"--list"})
 	if err != nil || !listOpts.ListOnly {
 		t.Fatalf("ParseEditBaseArgs(--list) = %+v, %v", listOpts, err)
 	}
-	if _, err := ParseEditBaseArgs([]string{"-h"}); !errors.Is(err, ErrHelp) {
+	if _, err := parseEditBaseArgs([]string{"-h"}); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 	for _, bad := range [][]string{
@@ -75,7 +77,7 @@ func TestParseEditBaseArgs(t *testing.T) {
 		{"--add", "unknown-category"},
 		{"--unknown"},
 	} {
-		if _, err := ParseEditBaseArgs(bad); err == nil {
+		if _, err := parseEditBaseArgs(bad); err == nil {
 			t.Errorf("expected error for %v", bad)
 		}
 	}
@@ -85,7 +87,7 @@ func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 	exists := func(p string) bool { return p == "opencode" }
 
 	// Options appear before paths.
-	opts, err := ParseRunArgs([]string{
+	opts, err := parseRunArgs([]string{
 		"--ro", "--mask-vcs",
 		"--cpus", "4", "--memory", "4G",
 		"--net", "public", "--net-rule", "allow@example.com:tcp:443",
@@ -103,23 +105,23 @@ func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 	}
 
 	// Second "opencode" token after a path when "opencode" exists on disk should be treated as a path.
-	opts2, err := ParseRunArgs([]string{"./proj", "opencode"}, config.MaskAuto, exists)
+	opts2, err := parseRunArgs([]string{"./proj", "opencode"}, config.MaskAuto, exists)
 	if err != nil || opts2.Agent != "" || !slices.Equal(opts2.Paths, []string{"./proj", "opencode"}) {
 		t.Errorf("expected 'opencode' after path to be treated as path when it exists on disk: %+v, %v", opts2, err)
 	}
 
 	// Passing an option after a path must fail.
-	if _, err := ParseRunArgs([]string{"./proj", "--ro"}, config.MaskAuto, nil); err == nil || !strings.Contains(err.Error(), "options must come before paths") {
+	if _, err := parseRunArgs([]string{"./proj", "--ro"}, config.MaskAuto, nil); err == nil || !strings.Contains(err.Error(), "options must come before paths") {
 		t.Errorf("expected error when option follows path, got %v", err)
 	}
 
 	// --port and --probe imply --serve.
-	optsServe, err := ParseRunArgs([]string{"--port", "8080", "--probe", "--no-mask", "--no-net"}, config.MaskAuto, nil)
+	optsServe, err := parseRunArgs([]string{"--port", "8080", "--probe", "--no-mask", "--no-net"}, config.MaskAuto, nil)
 	if err != nil || !optsServe.Serve || !optsServe.Probe || optsServe.Port != 8080 || optsServe.MaskMode != config.MaskOff || !optsServe.NoNet {
 		t.Errorf("unexpected serve opts: %+v, %v", optsServe, err)
 	}
 
-	if _, err := ParseRunArgs([]string{"--help"}, config.MaskAuto, nil); !errors.Is(err, ErrHelp) {
+	if _, err := parseRunArgs([]string{"--help"}, config.MaskAuto, nil); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 
@@ -141,48 +143,54 @@ func TestParseRunArgsAndSelectEffectiveAgent(t *testing.T) {
 		{"--cmd"},
 		{"--unknown-flag"},
 	} {
-		if _, err := ParseRunArgs(bad, config.MaskAuto, nil); err == nil {
+		if _, err := parseRunArgs(bad, config.MaskAuto, nil); err == nil {
 			t.Errorf("expected error for %v", bad)
 		}
 	}
 
-	optsRC, err := ParseRunArgs([]string{"-d", "--remote-control", "./proj"}, config.MaskAuto, nil)
+	optsRC, err := parseRunArgs([]string{"-d", "--remote-control", "./proj"}, config.MaskAuto, nil)
 	if err != nil || !optsRC.RemoteControl || !optsRC.Detach {
 		t.Errorf("unexpected remote-control opts: %+v, %v", optsRC, err)
 	}
 
 	// SelectEffectiveAgent tests.
-	if ag, err := SelectEffectiveAgent("both", RunOpts{Serve: true}); err != nil || ag != "opencode" {
+	if ag, err := selectEffectiveAgent("both", runOpts{Serve: true}); err != nil || ag != "opencode" {
 		t.Errorf("SelectEffectiveAgent(both, Serve) = %q, %v", ag, err)
 	}
-	if ag, err := SelectEffectiveAgent("both", RunOpts{RemoteControl: true}); err != nil || ag != "antigravity" {
+	if ag, err := selectEffectiveAgent("both", runOpts{RemoteControl: true}); err != nil || ag != "antigravity" {
 		t.Errorf("SelectEffectiveAgent(both, RemoteControl) = %q, %v", ag, err)
 	}
-	if _, err := SelectEffectiveAgent("opencode", RunOpts{RemoteControl: true}); err == nil {
+	if _, err := selectEffectiveAgent("opencode", runOpts{RemoteControl: true}); err == nil {
 		t.Error("expected error when --remote-control used with opencode-only base")
 	}
-	if _, err := SelectEffectiveAgent("both", RunOpts{Agent: "opencode", RemoteControl: true}); err == nil {
+	if _, err := selectEffectiveAgent("both", runOpts{Agent: "opencode", RemoteControl: true}); err == nil {
 		t.Error("expected error when --remote-control used with opencode agent")
 	}
-	if _, err := SelectEffectiveAgent("both", RunOpts{}); err == nil {
+	if _, err := selectEffectiveAgent("both", runOpts{}); err == nil {
 		t.Error("expected error when base=both and no agent specified for TUI")
 	}
-	if _, err := SelectEffectiveAgent("antigravity", RunOpts{Serve: true}); err == nil {
+	if _, err := selectEffectiveAgent("both", runOpts{Agent: "antigravity", Serve: true}); err == nil {
+		t.Error("expected error when --serve used with antigravity agent on both base")
+	}
+	if _, err := selectEffectiveAgent("antigravity", runOpts{Agent: "antigravity", Serve: true}); err == nil {
+		t.Error("expected error when --serve used with antigravity agent on antigravity base")
+	}
+	if _, err := selectEffectiveAgent("antigravity", runOpts{Serve: true}); err == nil {
 		t.Error("expected error when --serve used with antigravity-only base")
 	}
-	if _, err := SelectEffectiveAgent("opencode", RunOpts{Agent: "antigravity"}); err == nil {
+	if _, err := selectEffectiveAgent("opencode", runOpts{Agent: "antigravity"}); err == nil {
 		t.Error("expected error when requesting antigravity on opencode-only base")
 	}
-	if ag, err := SelectEffectiveAgent("antigravity", RunOpts{}); err != nil || ag != "antigravity" {
+	if ag, err := selectEffectiveAgent("antigravity", runOpts{}); err != nil || ag != "antigravity" {
 		t.Errorf("SelectEffectiveAgent(antigravity) = %q, %v", ag, err)
 	}
 }
 
 func TestParseStopAndRemoveArgsAndHelpers(t *testing.T) {
-	if name, err := ParseStopArgs([]string{"agbox-run-1234"}); err != nil || name != "agbox-run-1234" {
-		t.Errorf("ParseStopArgs = %q, %v", name, err)
+	if name, allowRoot, err := parseStopOpts([]string{"agbox-run-1234"}); err != nil || name != "agbox-run-1234" || allowRoot {
+		t.Errorf("parseStopOpts = %q, %v, %v", name, allowRoot, err)
 	}
-	if _, err := ParseStopArgs([]string{"-h"}); !errors.Is(err, ErrHelp) {
+	if _, _, err := parseStopOpts([]string{"-h"}); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 	for _, bad := range [][]string{
@@ -190,31 +198,31 @@ func TestParseStopAndRemoveArgsAndHelpers(t *testing.T) {
 		{"agbox-base"},
 		{"other-sandbox"},
 	} {
-		if _, err := ParseStopArgs(bad); err == nil {
+		if _, _, err := parseStopOpts(bad); err == nil {
 			t.Errorf("expected error for %v", bad)
 		}
 	}
 
-	if yes, err := ParseRemoveArgs([]string{"--yes"}); err != nil || !yes {
-		t.Errorf("ParseRemoveArgs(--yes) = %v, %v", yes, err)
+	if yes, allowRoot, err := parseRemoveOpts([]string{"--yes"}); err != nil || !yes || allowRoot {
+		t.Errorf("parseRemoveOpts(--yes) = %v, %v, %v", yes, allowRoot, err)
 	}
-	if yes, err := ParseRemoveArgs(nil); err != nil || yes {
-		t.Errorf("ParseRemoveArgs(nil) = %v, %v", yes, err)
+	if yes, _, err := parseRemoveOpts(nil); err != nil || yes {
+		t.Errorf("parseRemoveOpts(nil) = %v, %v", yes, err)
 	}
-	if _, err := ParseRemoveArgs([]string{"--bad"}); err == nil {
+	if _, _, err := parseRemoveOpts([]string{"--bad"}); err == nil {
 		t.Error("expected error for --bad")
 	}
 
-	if !DataDirSupportsFilter("/home/user/.local/share/agbox") {
+	if !dataDirSupportsFilter("/home/user/.local/share/agbox") {
 		t.Error("expected standard path to support filter")
 	}
-	if DataDirSupportsFilter("/home/user/with space/agbox") || DataDirSupportsFilter(`C:\agbox`) || DataDirSupportsFilter("") {
-		t.Error("expected path with space/backslash/empty to fail DataDirSupportsFilter")
+	if dataDirSupportsFilter("/home/user/with space/agbox") || dataDirSupportsFilter(`C:\agbox`) || dataDirSupportsFilter("") {
+		t.Error("expected path with space/backslash/empty to fail dataDirSupportsFilter")
 	}
 
-	port, err := PickFreeLoopbackPort()
+	port, err := pickFreeLoopbackPort()
 	if err != nil || port < 1 || port > 65535 {
-		t.Fatalf("PickFreeLoopbackPort = %d, %v", port, err)
+		t.Fatalf("pickFreeLoopbackPort = %d, %v", port, err)
 	}
 
 	if sz, ok := parseSizeBytes("50G"); !ok || sz != 50*1024*1024*1024 {
@@ -229,8 +237,10 @@ func TestParseStopAndRemoveArgsAndHelpers(t *testing.T) {
 }
 
 type recordedCall struct {
-	Args  []string
-	Stdin string
+	Args   []string
+	Stdin  string
+	Ctx    context.Context
+	CtxErr error
 }
 
 type fakeMSBRunner struct {
@@ -239,6 +249,7 @@ type fakeMSBRunner struct {
 	snapshots    string
 	defaultUsers map[string]string
 	handler      func(req msb.CommandRequest) (msb.CommandResult, error)
+	ctxHandler   func(ctx context.Context, req msb.CommandRequest) (msb.CommandResult, error)
 }
 
 func parseFakeExecCall(args []string) (sandbox, explicitUser, cmdStr string) {
@@ -335,13 +346,18 @@ func (f *fakeMSBRunner) trackDefaultUsers(args []string) {
 	}
 }
 
-func (f *fakeMSBRunner) Run(_ context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
+func (f *fakeMSBRunner) Run(ctx context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
 	var stdinStr string
 	if req.Stdin != nil {
 		raw, _ := io.ReadAll(req.Stdin)
 		stdinStr = string(raw)
 	}
-	f.calls = append(f.calls, recordedCall{Args: slices.Clone(req.Args), Stdin: stdinStr})
+	f.calls = append(f.calls, recordedCall{
+		Args:   slices.Clone(req.Args),
+		Stdin:  stdinStr,
+		Ctx:    ctx,
+		CtxErr: ctx.Err(),
+	})
 	f.trackDefaultUsers(req.Args)
 
 	if len(req.Args) >= 1 && req.Args[0] == "exec" {
@@ -350,7 +366,7 @@ func (f *fakeMSBRunner) Run(_ context.Context, req msb.CommandRequest) (msb.Comm
 		if effectiveUser == "" {
 			if u, ok := f.defaultUsers[sandbox]; ok {
 				effectiveUser = u
-			} else if IsRunSandboxName(sandbox) {
+			} else if isRunSandboxName(sandbox) {
 				effectiveUser = config.GuestUser
 			} else {
 				effectiveUser = "root"
@@ -364,6 +380,9 @@ func (f *fakeMSBRunner) Run(_ context.Context, req msb.CommandRequest) (msb.Comm
 		}
 	}
 
+	if f.ctxHandler != nil {
+		return f.ctxHandler(ctx, req)
+	}
 	if f.handler != nil {
 		return f.handler(req)
 	}
@@ -392,7 +411,7 @@ func (noopMountCtl) SignalPID(_ int, _ syscall.Signal) error { return nil }
 func (noopMountCtl) Unmount(_ string, _ bool) error          { return nil }
 func (noopMountCtl) Sleep(_ time.Duration)                   {}
 
-func newTestApp(t *testing.T) (*App, *fakeMSBRunner, *bytes.Buffer, *bytes.Buffer) {
+func newTestApp(t *testing.T) (*appRuntime, *fakeMSBRunner, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	root := t.TempDir()
 	home, err := filepath.EvalSymlinks(root)
@@ -411,7 +430,7 @@ func newTestApp(t *testing.T) (*App, *fakeMSBRunner, *bytes.Buffer, *bytes.Buffe
 	}
 	var stdout, stderr bytes.Buffer
 
-	app := &App{
+	app := &appRuntime{
 		Env: config.Env{
 			HomeReal:         home,
 			DataDir:          dataDir,
@@ -437,11 +456,13 @@ func newTestApp(t *testing.T) (*App, *fakeMSBRunner, *bytes.Buffer, *bytes.Buffe
 			}
 			return ""
 		},
-		IsTTY:     func() bool { return true },
-		GetEUID:   func() int { return 1000 },
-		CheckKVM:  func() error { return nil },
-		CheckFUSE: func() error { return nil },
-		PID:       4242,
+		IsTTY:      func() bool { return true },
+		GetEUID:    func() int { return 1000 },
+		GetEGID:    func() int { return 1000 },
+		RunHostCmd: func(context.Context, string, ...string) ([]byte, error) { return nil, nil },
+		CheckKVM:   func() error { return nil },
+		CheckFUSE:  func() error { return nil },
+		PID:        4242,
 		StartFilter: func(_, mntDir, pidFile string, _ bool) (int, error) {
 			_ = os.MkdirAll(mntDir, 0o700)
 			_ = os.WriteFile(pidFile, []byte("9999\n"), 0o600)
@@ -464,13 +485,13 @@ func TestAppLifecycleModes(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Setup
-	if rc := app.Dispatch(ctx, []string{"setup"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"setup"}); rc != 0 {
 		t.Fatalf("Setup failed with rc=%d, stdout=%s", rc, stdout.String())
 	}
 
 	// 2. CreateBase (both)
 	runner.snapshots = "NAME CREATED\n"
-	if rc := app.Dispatch(ctx, []string{"create-base", "--force", "both"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"create-base", "--force", "both"}); rc != 0 {
 		t.Fatalf("CreateBase failed with rc=%d", rc)
 	}
 	st, err := config.LoadFile(app.Env.ConfigFile)
@@ -479,11 +500,11 @@ func TestAppLifecycleModes(t *testing.T) {
 	}
 
 	// 3. EditBase (--add core,go,rust,esphome and --list)
-	if rc := app.Dispatch(ctx, []string{"edit-base", "--list"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"edit-base", "--list"}); rc != 0 {
 		t.Fatalf("EditBase --list failed with rc=%d", rc)
 	}
 	runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
-	if rc := app.Dispatch(ctx, []string{"edit-base", "--add", "core,go,rust,esphome"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"edit-base", "--add", "core,go,rust,esphome"}); rc != 0 {
 		t.Fatalf("EditBase --add failed with rc=%d", rc)
 	}
 	st, err = config.LoadFile(app.Env.ConfigFile)
@@ -498,11 +519,11 @@ func TestAppLifecycleModes(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "id -u", projDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--cmd", "id -u", projDir}); rc != 0 {
 		t.Fatalf("Run --cmd failed with rc=%d", rc)
 	}
 
-	// Verify API key was streamed over stdin (never in CLI args) and VM was cleaned up on exit.
+	// Verify the system streamed the API key over stdin and deleted the microVM on exit.
 	foundKeyStdin := false
 	foundCleanup := false
 	for _, c := range runner.calls {
@@ -528,7 +549,7 @@ func TestAppLifecycleModes(t *testing.T) {
 	// 5. Run (--serve detached when IsTTY=false)
 	app.IsTTY = func() bool { return false }
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--serve", "--port", "4096", projDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--serve", "--port", "4096", projDir}); rc != 0 {
 		t.Fatalf("Run detached --serve failed with rc=%d", rc)
 	}
 	detachedMarker := filepath.Join(app.Env.DataDir, "run", "4242", "detached")
@@ -537,7 +558,7 @@ func TestAppLifecycleModes(t *testing.T) {
 	}
 
 	// 6. Stop the detached sandbox
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-run-4242"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-run-4242"}); rc != 0 {
 		t.Fatalf("Stop failed with rc=%d", rc)
 	}
 	if _, err := os.Stat(filepath.Join(app.Env.DataDir, "run", "4242")); !os.IsNotExist(err) {
@@ -546,23 +567,23 @@ func TestAppLifecycleModes(t *testing.T) {
 
 	// 6b. Run (-d --remote-control detached with TTY=true)
 	app.IsTTY = func() bool { return true }
-	if rc := app.Dispatch(ctx, []string{"run", "-d", "--remote-control", projDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "-d", "--remote-control", projDir}); rc != 0 {
 		t.Fatalf("Run -d --remote-control failed with rc=%d", rc)
 	}
 	if _, err := os.Stat(detachedMarker); err != nil {
 		t.Fatalf("expected detached marker for remote-control at %s: %v", detachedMarker, err)
 	}
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-run-4242"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-run-4242"}); rc != 0 {
 		t.Fatalf("Stop failed with rc=%d", rc)
 	}
 
 	// 7. Status
-	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"status"}); rc != 0 {
 		t.Fatalf("Status failed with rc=%d", rc)
 	}
 
 	// 8. Remove (--yes)
-	if rc := app.Dispatch(ctx, []string{"remove", "--yes"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"remove", "--yes"}); rc != 0 {
 		t.Fatalf("Remove failed with rc=%d", rc)
 	}
 	if _, err := os.Stat(app.Env.DataDir); !os.IsNotExist(err) {
@@ -583,7 +604,7 @@ func TestReapOrphanRunsAndTUIAndServeProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Set up two dead-PID filter dirs: one normal (999991) and one detached (999992).
+	// Configure two dead-PID filter dirs: one normal (999991) and one detached (999992).
 	deadDir := filepath.Join(app.Env.DataDir, "run", "999991")
 	detachedDir := filepath.Join(app.Env.DataDir, "run", "999992")
 	_ = os.MkdirAll(deadDir, 0o700)
@@ -592,8 +613,8 @@ func TestReapOrphanRunsAndTUIAndServeProbe(t *testing.T) {
 
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-run-999991 running\nagbox-run-999992 running\n"
 
-	app.ReapOrphanRuns(ctx)
-	app.ReapStaleFilterDirs(ctx)
+	app.reapOrphanRuns(ctx)
+	app.reapStaleFilterDirs(ctx)
 
 	// Dead non-detached run (999991) must be deleted. Live detached run (999992) must remain.
 	if _, err := os.Stat(deadDir); !os.IsNotExist(err) {
@@ -605,7 +626,7 @@ func TestReapOrphanRunsAndTUIAndServeProbe(t *testing.T) {
 
 	// Test interactive TUI run mode.
 	app.IsTTY = func() bool { return true }
-	if rc := app.Dispatch(ctx, []string{"run", "opencode"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "opencode"}); rc != 0 {
 		t.Fatalf("TUI run failed with rc=%d", rc)
 	}
 
@@ -632,56 +653,56 @@ func TestReapOrphanRunsAndTUIAndServeProbe(t *testing.T) {
 		return ""
 	}
 	app.WaitServeUI = app.defaultWaitServeUI
-	if rc := app.Dispatch(ctx, []string{"run", "--serve", "--probe", "--port", strconv.Itoa(srvPort)}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--serve", "--probe", "--port", strconv.Itoa(srvPort)}); rc != 0 {
 		t.Fatalf("Run --serve --probe failed with rc=%d", rc)
 	}
 
 	// Test EditBase interactive category selection (choosing '1,2' on Stdin) + --no-snap.
 	app.Stdin = strings.NewReader("1,2\n")
-	if rc := app.Dispatch(ctx, []string{"edit-base", "--no-snap"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"edit-base", "--no-snap"}); rc != 0 {
 		t.Fatalf("EditBase interactive selection --no-snap failed with rc=%d", rc)
 	}
 
 	// Test Remove interactive abort when user types 'n'.
 	app.Stdin = strings.NewReader("n\n")
-	if rc := app.Dispatch(ctx, []string{"remove"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"remove"}); rc == 0 {
 		t.Error("expected Remove to abort when user enters 'n'")
 	}
 
 	// Help and unknown mode dispatch.
-	if rc := app.Dispatch(ctx, nil); rc != 0 {
+	if rc := app.dispatch(ctx, nil); rc != 0 {
 		t.Errorf("Dispatch(nil) = %d, want 0", rc)
 	}
-	if rc := app.Dispatch(ctx, []string{"--help"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"--help"}); rc != 0 {
 		t.Errorf("Dispatch(--help) = %d, want 0", rc)
 	}
-	if rc := app.Dispatch(ctx, []string{"run", "--help"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--help"}); rc != 0 {
 		t.Errorf("Dispatch(run --help) = %d, want 0", rc)
 	}
-	if rc := app.Dispatch(ctx, []string{"nonexistent-mode"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"nonexistent-mode"}); rc == 0 {
 		t.Error("expected non-zero exit code for unknown mode")
 	}
 }
 
 func TestSandboxNamingAndGlobalAndRootParsing(t *testing.T) {
-	gOpts, err := ParseGlobalArgs([]string{"--allow-root", "run", "--name", "feat1"})
+	gOpts, err := parseGlobalArgs([]string{"--allow-root", "run", "--name", "feat1"})
 	if err != nil || !gOpts.AllowRoot || gOpts.Mode != "run" || !slices.Equal(gOpts.Rest, []string{"--name", "feat1"}) {
 		t.Fatalf("ParseGlobalArgs = %+v, %v", gOpts, err)
 	}
-	if _, err := ParseGlobalArgs([]string{"--unknown", "run"}); err == nil {
+	if _, err := parseGlobalArgs([]string{"--unknown", "run"}); err == nil {
 		t.Error("expected error for unknown global option")
 	}
 
-	if src, err := CheckRootExecution(1000, false, false); err != nil || src != "" {
+	if src, err := checkRootExecution(1000, false, false); err != nil || src != "" {
 		t.Errorf("CheckRootExecution(1000) = %q, %v", src, err)
 	}
-	if _, err := CheckRootExecution(0, false, false); err == nil {
+	if _, err := checkRootExecution(0, false, false); err == nil {
 		t.Error("expected error for root without override")
 	}
-	if src, err := CheckRootExecution(0, false, true); err != nil || src != "--allow-root" {
+	if src, err := checkRootExecution(0, false, true); err != nil || src != "--allow-root" {
 		t.Errorf("CheckRootExecution(flag) = %q, %v", src, err)
 	}
-	if src, err := CheckRootExecution(0, true, false); err != nil || src != "AGBOX_ALLOW_ROOT=1" {
+	if src, err := checkRootExecution(0, true, false); err != nil || src != "AGBOX_ALLOW_ROOT=1" {
 		t.Errorf("CheckRootExecution(env) = %q, %v", src, err)
 	}
 
@@ -699,23 +720,23 @@ func TestSandboxNamingAndGlobalAndRootParsing(t *testing.T) {
 	}
 	for _, tc := range validNames {
 		if tc.name != "" {
-			gotName, err := ValidateRunName(tc.name)
+			gotName, err := validateRunName(tc.name)
 			if err != nil || gotName != tc.name {
 				t.Fatalf("ValidateRunName(%q) = %q, %v", tc.name, gotName, err)
 			}
 		}
-		sbx := FormatRunSandboxName(tc.name, tc.pid)
+		sbx := formatRunSandboxName(tc.name, tc.pid)
 		if sbx != tc.sandbox {
 			t.Fatalf("FormatRunSandboxName(%q, %d) = %q, want %q", tc.name, tc.pid, sbx, tc.sandbox)
 		}
-		if !IsRunSandboxName(sbx) {
+		if !isRunSandboxName(sbx) {
 			t.Fatalf("expected IsRunSandboxName(%q) to be true", sbx)
 		}
-		dirID, err := RunDirIDFromSandbox(sbx)
+		dirID, err := runDirIDFromSandbox(sbx)
 		if err != nil || dirID != tc.dirID {
 			t.Fatalf("RunDirIDFromSandbox(%q) = %q, %v (want %q)", sbx, dirID, err, tc.dirID)
 		}
-		roundTrip, ok := SandboxFromRunDirID(dirID)
+		roundTrip, ok := sandboxFromRunDirID(dirID)
 		if !ok || roundTrip != sbx {
 			t.Fatalf("SandboxFromRunDirID(%q) = %q, %v (want %q)", dirID, roundTrip, ok, sbx)
 		}
@@ -731,19 +752,19 @@ func TestSandboxNamingAndGlobalAndRootParsing(t *testing.T) {
 		"bad space",
 		strings.Repeat("a", 64),
 	} {
-		if _, err := ValidateRunName(bad); err == nil {
+		if _, err := validateRunName(bad); err == nil {
 			t.Errorf("expected ValidateRunName(%q) to fail", bad)
 		}
 	}
-	if IsRunSandboxName("agbox-base") || IsRunSandboxName("other-sandbox") || IsRunSandboxName("agbox-") {
+	if isRunSandboxName("agbox-base") || isRunSandboxName("other-sandbox") || isRunSandboxName("agbox-") {
 		t.Error("expected invalid sandbox names to fail IsRunSandboxName")
 	}
 
-	defOpts, err := ParseRunArgs([]string{"--name", "feat1", "--allow-root", "opencode"}, "", nil)
+	defOpts, err := parseRunArgs([]string{"--name", "feat1", "--allow-root", "opencode"}, "", nil)
 	if err != nil || defOpts.MaskMode != config.MaskStrict || defOpts.Name != "feat1" || !defOpts.AllowRoot {
 		t.Fatalf("ParseRunArgs defaults = %+v, %v", defOpts, err)
 	}
-	eqOpts, err := ParseRunArgs([]string{"--name=feat2", "opencode"}, "", nil)
+	eqOpts, err := parseRunArgs([]string{"--name=feat2", "opencode"}, "", nil)
 	if err != nil || eqOpts.Name != "feat2" {
 		t.Fatalf("ParseRunArgs(--name=feat2) = %+v, %v", eqOpts, err)
 	}
@@ -753,19 +774,19 @@ func TestSandboxNamingAndGlobalAndRootParsing(t *testing.T) {
 		{"--name", "base"},
 		{"--name=-bad"},
 	} {
-		if _, err := ParseRunArgs(badRun, "", nil); err == nil {
+		if _, err := parseRunArgs(badRun, "", nil); err == nil {
 			t.Errorf("expected ParseRunArgs(%v) to fail", badRun)
 		}
 	}
 
-	if sOpts, err := ParseSuspendArgs([]string{"--allow-root", "agbox-feat1"}); err != nil || sOpts.Sandbox != "agbox-feat1" || !sOpts.AllowRoot {
+	if sOpts, err := parseSuspendArgs([]string{"--allow-root", "agbox-feat1"}); err != nil || sOpts.Sandbox != "agbox-feat1" || !sOpts.AllowRoot {
 		t.Fatalf("ParseSuspendArgs = %+v, %v", sOpts, err)
 	}
-	if rOpts, err := ParseResumeArgs([]string{"--allow-root", "-d", "agbox-feat1"}); err != nil || rOpts.Sandbox != "agbox-feat1" || !rOpts.AllowRoot || !rOpts.Detach {
+	if rOpts, err := parseResumeArgs([]string{"--allow-root", "-d", "agbox-feat1"}); err != nil || rOpts.Sandbox != "agbox-feat1" || !rOpts.AllowRoot || !rOpts.Detach {
 		t.Fatalf("ParseResumeArgs = %+v, %v", rOpts, err)
 	}
-	if name, err := ParseStopArgs([]string{"agbox-feat1"}); err != nil || name != "agbox-feat1" {
-		t.Fatalf("ParseStopArgs(agbox-feat1) = %q, %v", name, err)
+	if name, _, err := parseStopOpts([]string{"agbox-feat1"}); err != nil || name != "agbox-feat1" {
+		t.Fatalf("parseStopOpts(agbox-feat1) = %q, %v", name, err)
 	}
 	for _, bad := range [][]string{
 		{},
@@ -773,10 +794,10 @@ func TestSandboxNamingAndGlobalAndRootParsing(t *testing.T) {
 		{"other-sandbox"},
 		{"--bad", "agbox-feat1"},
 	} {
-		if _, err := ParseSuspendArgs(bad); err == nil {
+		if _, err := parseSuspendArgs(bad); err == nil {
 			t.Errorf("expected ParseSuspendArgs(%v) to fail", bad)
 		}
-		if _, err := ParseResumeArgs(bad); err == nil {
+		if _, err := parseResumeArgs(bad); err == nil {
 			t.Errorf("expected ParseResumeArgs(%v) to fail", bad)
 		}
 	}
@@ -807,13 +828,13 @@ func TestRootExecutionOverrideAcrossModes(t *testing.T) {
 		{"remove", "--yes"},
 		{"status"},
 	} {
-		if rc := app.Dispatch(ctx, cmd); rc == 0 {
+		if rc := app.dispatch(ctx, cmd); rc == 0 {
 			t.Errorf("expected mode %v to fail as root without --allow-root", cmd)
 		}
 	}
 
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"--allow-root", "setup"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"--allow-root", "setup"}); rc != 0 {
 		t.Fatalf("expected global --allow-root setup to succeed, stderr=%s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "Root mode is active") {
@@ -822,7 +843,7 @@ func TestRootExecutionOverrideAcrossModes(t *testing.T) {
 
 	stderr.Reset()
 	app.Env.AllowRoot = true
-	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"status"}); rc != 0 {
 		t.Fatalf("expected AGBOX_ALLOW_ROOT=1 status to succeed, stderr=%s", stderr.String())
 	}
 }
@@ -847,7 +868,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 
 	// 1. Default run uses --name, mounts via FUSE, and enforces local/private/multicast/cloud-config deny rules.
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "sec1", "--cmd", "id", projDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "sec1", "--cmd", "id", projDir}); rc != 0 {
 		t.Fatalf("Run --name sec1 failed: %s", stderr.String())
 	}
 	foundRestore := false
@@ -880,7 +901,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 		return 0, errors.New("fuse unavailable")
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "sec2", "--cmd", "id", projDir}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "sec2", "--cmd", "id", projDir}); rc == 0 {
 		t.Fatal("expected Run to fail closed when FUSE filter fails")
 	}
 	for _, c := range runner.calls {
@@ -906,7 +927,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 		return msb.CommandResult{}, nil
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "keyfail", "--cmd", "id"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "keyfail", "--cmd", "id"}); rc == 0 {
 		t.Fatal("expected Run to fail closed when pushKeys fails")
 	}
 	runner.handler = nil
@@ -914,7 +935,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 	// 4. Duplicate --name must fail closed without removing the existing sandbox.
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-existing running\n"
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "existing", "--cmd", "id"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "existing", "--cmd", "id"}); rc == 0 {
 		t.Fatal("expected duplicate --name to fail")
 	}
 	for _, c := range runner.calls {
@@ -926,7 +947,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 	// 5. Setup fails closed on CheckFUSE error or invalid DataDir, and passes --no-net to smoke test.
 	runner.sandboxes = "NAME STATE\n"
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"setup"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"setup"}); rc != 0 {
 		t.Fatalf("expected Setup to succeed, stderr=%s", stderr.String())
 	}
 	foundOfflineSmoke := false
@@ -940,14 +961,14 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 	}
 
 	app.CheckFUSE = func() error { return errors.New("fuse broken") }
-	if rc := app.Dispatch(ctx, []string{"setup"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"setup"}); rc == 0 {
 		t.Fatal("expected Setup to fail closed when CheckFUSE fails")
 	}
 	app.CheckFUSE = func() error { return nil }
 
 	badApp := *app
 	badApp.Env.DataDir = filepath.Join(app.Env.HomeReal, "dir with space")
-	if rc := badApp.Dispatch(ctx, []string{"setup"}); rc == 0 {
+	if rc := badApp.dispatch(ctx, []string{"setup"}); rc == 0 {
 		t.Fatal("expected Setup to fail closed when DataDir contains whitespace")
 	}
 
@@ -965,7 +986,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 		}
 		return msb.CommandResult{}, nil
 	}
-	if rc := app.Dispatch(ctx, []string{"edit-base", "--cmd", "true"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"edit-base", "--cmd", "true"}); rc == 0 {
 		t.Fatal("expected EditBase to fail closed when stopping agbox-base fails")
 	}
 	runner.handler = nil
@@ -991,7 +1012,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 
 	// 1. Start a named detached Remote Control sandbox.
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "work1", "-d", "--remote-control", projDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "work1", "-d", "--remote-control", projDir}); rc != 0 {
 		t.Fatalf("Run -d --remote-control failed: %s", stderr.String())
 	}
 	workDir := filepath.Join(app.Env.DataDir, "run", "work1")
@@ -1002,7 +1023,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	// 2. Suspend agbox-work1.
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-work1 running\n"
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"suspend", "agbox-work1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"suspend", "agbox-work1"}); rc != 0 {
 		t.Fatalf("Suspend failed: %s", stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(workDir, "suspended")); err != nil {
@@ -1035,8 +1056,8 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	_ = config.SaveRunMeta(filepath.Join(workDir, "suspended"), meta)
 
 	runner.calls = nil
-	otherApp.ReapOrphanRuns(ctx)
-	otherApp.ReapStaleFilterDirs(ctx)
+	otherApp.reapOrphanRuns(ctx)
+	otherApp.reapStaleFilterDirs(ctx)
 	for _, c := range runner.calls {
 		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-work1"}) {
 			t.Fatal("ReapOrphanRuns deleted suspended sandbox agbox-work1")
@@ -1051,7 +1072,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	if err := os.Rename(projDir, renamedDir); err != nil {
 		t.Fatal(err)
 	}
-	if rc := app.Dispatch(ctx, []string{"resume", "agbox-work1"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-work1"}); rc == 0 {
 		t.Fatal("expected Resume to fail when shared path is missing")
 	}
 	if _, err := os.Stat(filepath.Join(workDir, "suspended")); err != nil {
@@ -1073,7 +1094,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	if err := config.SaveRunMeta(filepath.Join(workDir, "suspended"), tampered); err != nil {
 		t.Fatal(err)
 	}
-	if rc := app.Dispatch(ctx, []string{"resume", "agbox-work1"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-work1"}); rc == 0 {
 		t.Fatal("expected Resume to fail closed when directory share is unmasked in strict mode")
 	}
 	if err := config.SaveRunMeta(filepath.Join(workDir, "suspended"), meta); err != nil {
@@ -1088,7 +1109,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 		return ""
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"resume", "agbox-work1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-work1"}); rc != 0 {
 		t.Fatalf("Resume failed: %s", stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(workDir, "suspended")); !os.IsNotExist(err) {
@@ -1112,7 +1133,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	}
 
 	// 6. Stop deletes agbox-work1 and removes $DATA_DIR/run/work1.
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-work1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-work1"}); rc != 0 {
 		t.Fatalf("Stop agbox-work1 failed: %s", stderr.String())
 	}
 	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
@@ -1143,7 +1164,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 			var peerOut, peerErr bytes.Buffer
 			peerApp.Stdout = &peerOut
 			peerApp.Stderr = &peerErr
-			if sRC := peerApp.Dispatch(ctx, []string{"suspend", "agbox-tui1"}); sRC != 0 {
+			if sRC := peerApp.dispatch(ctx, []string{"suspend", "agbox-tui1"}); sRC != 0 {
 				t.Errorf("peer suspend failed: %s", peerErr.String())
 			}
 			return msb.CommandResult{ExitCode: 137}, errors.New("vm halted")
@@ -1152,7 +1173,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	}
 
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "tui1", "opencode", projDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "tui1", "opencode", projDir}); rc != 0 {
 		t.Fatalf("foreground TUI run interrupted by suspend returned rc=%d, stderr=%s", rc, stderr.String())
 	}
 	for _, c := range runner.calls {
@@ -1167,7 +1188,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 
 	// Stop the suspended tui1 sandbox.
 	runner.handler = nil
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-tui1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-tui1"}); rc != 0 {
 		t.Fatalf("Stop suspended agbox-tui1 failed: %s", stderr.String())
 	}
 	if _, err := os.Stat(tuiDir); !os.IsNotExist(err) {
@@ -1276,7 +1297,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 	runner.sandboxes = "NAME STATE\n"
 	runner.snapshots = "NAME CREATED\n"
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"create-base", "antigravity"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"create-base", "antigravity"}); rc != 0 {
 		t.Fatalf("CreateBase(antigravity) failed: %s", stderr.String())
 	}
 	foundCreateNet := false
@@ -1319,7 +1340,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 		t.Errorf("CreateBase missing network isolation (%v), TLS curl flags (%v), base apt (%v), or base tools (%v)", foundCreateNet, foundAgyTLS, foundBaseApt, foundBaseTools)
 	}
 
-	// Provisioning failure in CreateBase must clean up partial agbox-base.
+	// Provisioning failure in CreateBase must delete partial agbox-base.
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
 			return msb.CommandResult{Stdout: "NAME STATE\n"}, nil
@@ -1330,7 +1351,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 		return msb.CommandResult{}, nil
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"create-base", "--force", "opencode"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"create-base", "--force", "opencode"}); rc == 0 {
 		t.Fatal("expected CreateBase to fail when provisioning fails")
 	}
 	cleanedBase := false
@@ -1367,14 +1388,14 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 		}
 		return msb.CommandResult{}, nil
 	}
-	if rc := app.Dispatch(ctx, []string{"edit-base", "--cmd", "true"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"edit-base", "--cmd", "true"}); rc == 0 {
 		t.Fatal("expected EditBase to fail closed when provisionGuestUser fails")
 	}
 	runner.handler = nil
 
 	// 3. Run mounts zero host shares when no paths are passed, and --serve binds only 127.0.0.1.
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "noshare", "--serve", "--probe", "--port", "4321"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "noshare", "--serve", "--probe", "--port", "4321"}); rc != 0 {
 		t.Fatalf("Run --serve --probe with zero shares failed: %s", stderr.String())
 	}
 	for _, c := range runner.calls {
@@ -1407,7 +1428,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 		{"suspend", "agbox-sym1"},
 		{"resume", "agbox-sym1"},
 	} {
-		if rc := symApp.Dispatch(ctx, modeArgs); rc == 0 {
+		if rc := symApp.dispatch(ctx, modeArgs); rc == 0 {
 			t.Errorf("expected %v to reject symlinked DataDir", modeArgs)
 		}
 	}
@@ -1467,7 +1488,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 		if err := config.SaveRunMeta(filepath.Join(tamperRunDir, "suspended"), badMeta); err != nil {
 			t.Fatal(err)
 		}
-		if rc := app.Dispatch(ctx, []string{"resume", "agbox-tamp1"}); rc == 0 {
+		if rc := app.dispatch(ctx, []string{"resume", "agbox-tamp1"}); rc == 0 {
 			t.Errorf("tampered Resume case %d unexpectedly succeeded: %+v", idx, badMeta)
 		}
 	}
@@ -1475,25 +1496,25 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 
 func TestParsePersistenceModeAndFlagArgs(t *testing.T) {
 	// 1. ParseAuthArgs
-	if aOpts, err := ParseAuthArgs(nil); err != nil || aOpts.Action != "login" || aOpts.Target != "" {
+	if aOpts, err := parseAuthArgs(nil); err != nil || aOpts.Action != "login" || aOpts.Target != "" {
 		t.Fatalf("ParseAuthArgs(nil) = %+v, %v", aOpts, err)
 	}
-	if aOpts, err := ParseAuthArgs([]string{"--allow-root", "antigravity"}); err != nil || aOpts.Action != "login" || aOpts.Target != "antigravity" || !aOpts.AllowRoot {
+	if aOpts, err := parseAuthArgs([]string{"--allow-root", "antigravity"}); err != nil || aOpts.Action != "login" || aOpts.Target != "antigravity" || !aOpts.AllowRoot {
 		t.Fatalf("ParseAuthArgs(antigravity) = %+v, %v", aOpts, err)
 	}
-	if aOpts, err := ParseAuthArgs([]string{"login", "opencode"}); err != nil || aOpts.Action != "login" || aOpts.Target != "opencode" {
+	if aOpts, err := parseAuthArgs([]string{"login", "opencode"}); err != nil || aOpts.Action != "login" || aOpts.Target != "opencode" {
 		t.Fatalf("ParseAuthArgs(login opencode) = %+v, %v", aOpts, err)
 	}
-	if aOpts, err := ParseAuthArgs([]string{"status"}); err != nil || aOpts.Action != "status" {
+	if aOpts, err := parseAuthArgs([]string{"status"}); err != nil || aOpts.Action != "status" {
 		t.Fatalf("ParseAuthArgs(status) = %+v, %v", aOpts, err)
 	}
-	if aOpts, err := ParseAuthArgs([]string{"logout"}); err != nil || aOpts.Action != "logout" || aOpts.Target != "all" {
+	if aOpts, err := parseAuthArgs([]string{"logout"}); err != nil || aOpts.Action != "logout" || aOpts.Target != "all" {
 		t.Fatalf("ParseAuthArgs(logout) = %+v, %v", aOpts, err)
 	}
-	if aOpts, err := ParseAuthArgs([]string{"logout", "opencode"}); err != nil || aOpts.Action != "logout" || aOpts.Target != "opencode" {
+	if aOpts, err := parseAuthArgs([]string{"logout", "opencode"}); err != nil || aOpts.Action != "logout" || aOpts.Target != "opencode" {
 		t.Fatalf("ParseAuthArgs(logout opencode) = %+v, %v", aOpts, err)
 	}
-	if _, err := ParseAuthArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+	if _, err := parseAuthArgs([]string{"--help"}); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 	for _, bad := range [][]string{
@@ -1505,22 +1526,22 @@ func TestParsePersistenceModeAndFlagArgs(t *testing.T) {
 		{"antigravity", "extra"},
 		{"unknown"},
 	} {
-		if _, err := ParseAuthArgs(bad); err == nil {
+		if _, err := parseAuthArgs(bad); err == nil {
 			t.Errorf("expected ParseAuthArgs(%v) to fail", bad)
 		}
 	}
 
 	// 2. ParseSkillsArgs
-	if sOpts, err := ParseSkillsArgs(nil); err != nil || sOpts.Action != "list" {
+	if sOpts, err := parseSkillsArgs(nil); err != nil || sOpts.Action != "list" {
 		t.Fatalf("ParseSkillsArgs(nil) = %+v, %v", sOpts, err)
 	}
-	if sOpts, err := ParseSkillsArgs([]string{"--allow-root", "add", "--force", "./my-skill"}); err != nil || sOpts.Action != "add" || !sOpts.Force || !sOpts.AllowRoot || sOpts.Target != "./my-skill" {
+	if sOpts, err := parseSkillsArgs([]string{"--allow-root", "add", "--force", "./my-skill"}); err != nil || sOpts.Action != "add" || !sOpts.Force || !sOpts.AllowRoot || sOpts.Target != "./my-skill" {
 		t.Fatalf("ParseSkillsArgs(add) = %+v, %v", sOpts, err)
 	}
-	if sOpts, err := ParseSkillsArgs([]string{"rm", "my-skill"}); err != nil || sOpts.Action != "rm" || sOpts.Target != "my-skill" {
+	if sOpts, err := parseSkillsArgs([]string{"rm", "my-skill"}); err != nil || sOpts.Action != "rm" || sOpts.Target != "my-skill" {
 		t.Fatalf("ParseSkillsArgs(rm) = %+v, %v", sOpts, err)
 	}
-	if _, err := ParseSkillsArgs([]string{"-h"}); !errors.Is(err, ErrHelp) {
+	if _, err := parseSkillsArgs([]string{"-h"}); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 	for _, bad := range [][]string{
@@ -1530,22 +1551,22 @@ func TestParsePersistenceModeAndFlagArgs(t *testing.T) {
 		{"rm"},
 		{"unknown"},
 	} {
-		if _, err := ParseSkillsArgs(bad); err == nil {
+		if _, err := parseSkillsArgs(bad); err == nil {
 			t.Errorf("expected ParseSkillsArgs(%v) to fail", bad)
 		}
 	}
 
 	// 3. ParseProfileArgs
-	if pOpts, err := ParseProfileArgs(nil); err != nil || pOpts.Action != "list" {
+	if pOpts, err := parseProfileArgs(nil); err != nil || pOpts.Action != "list" {
 		t.Fatalf("ParseProfileArgs(nil) = %+v, %v", pOpts, err)
 	}
-	if pOpts, err := ParseProfileArgs([]string{"--allow-root", "create", "--size", "16g", "work1"}); err != nil || pOpts.Action != "create" || pOpts.Name != "work1" || pOpts.Size != "16G" || !pOpts.AllowRoot {
+	if pOpts, err := parseProfileArgs([]string{"--allow-root", "create", "--size", "16g", "work1"}); err != nil || pOpts.Action != "create" || pOpts.Name != "work1" || pOpts.Size != "16G" || !pOpts.AllowRoot {
 		t.Fatalf("ParseProfileArgs(create) = %+v, %v", pOpts, err)
 	}
-	if pOpts, err := ParseProfileArgs([]string{"rm", "--force", "work1"}); err != nil || pOpts.Action != "rm" || pOpts.Name != "work1" || !pOpts.Force {
+	if pOpts, err := parseProfileArgs([]string{"rm", "--force", "work1"}); err != nil || pOpts.Action != "rm" || pOpts.Name != "work1" || !pOpts.Force {
 		t.Fatalf("ParseProfileArgs(rm) = %+v, %v", pOpts, err)
 	}
-	if _, err := ParseProfileArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+	if _, err := parseProfileArgs([]string{"--help"}); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 	for _, bad := range [][]string{
@@ -1559,17 +1580,17 @@ func TestParsePersistenceModeAndFlagArgs(t *testing.T) {
 		{"list", "extra"},
 		{"unknown"},
 	} {
-		if _, err := ParseProfileArgs(bad); err == nil {
+		if _, err := parseProfileArgs(bad); err == nil {
 			t.Errorf("expected ParseProfileArgs(%v) to fail", bad)
 		}
 	}
 
 	// 4. ParseRunArgs persistence flags and mutual exclusions
-	rPersist, err := ParseRunArgs([]string{"--name", "dev1", "--persist", "-c", "--no-auth", "--no-skills", "opencode"}, "", nil)
+	rPersist, err := parseRunArgs([]string{"--name", "dev1", "--persist", "-c", "--no-auth", "--no-skills", "opencode"}, "", nil)
 	if err != nil || !rPersist.Persist || !rPersist.Continue || !rPersist.NoAuth || !rPersist.NoSkills {
 		t.Fatalf("ParseRunArgs(--persist) = %+v, %v", rPersist, err)
 	}
-	rProf, err := ParseRunArgs([]string{"--profile=team_1", "--conversation=conv-123", "antigravity"}, "", nil)
+	rProf, err := parseRunArgs([]string{"--profile=team_1", "--conversation=conv-123", "antigravity"}, "", nil)
 	if err != nil || rProf.Profile != "team_1" || rProf.ContinueSession != "conv-123" {
 		t.Fatalf("ParseRunArgs(--profile=) = %+v, %v", rProf, err)
 	}
@@ -1586,13 +1607,25 @@ func TestParsePersistenceModeAndFlagArgs(t *testing.T) {
 		{"-c", "--serve"},
 		{"-c", "-d", "--remote-control"},
 	} {
-		if _, err := ParseRunArgs(bad, "", nil); err == nil {
+		if _, err := parseRunArgs(bad, "", nil); err == nil {
 			t.Errorf("expected ParseRunArgs(%v) to fail", bad)
+		}
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"-c", "--cmd", "id"}, "cannot combine --continue or --session with --serve or --cmd"},
+		{[]string{"-c", "--serve"}, "cannot combine --continue or --session with --serve or --cmd"},
+		{[]string{"-c", "-d", "--remote-control"}, "cannot combine --continue or --session with detached --remote-control"},
+	} {
+		if _, err := parseRunArgs(tc.args, "", nil); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("ParseRunArgs(%v) error = %v, want substring %q", tc.args, err, tc.want)
 		}
 	}
 
 	// 5. ParseResumeArgs continuation flags
-	resOpts, err := ParseResumeArgs([]string{"--conversation=conv-42", "--no-auth", "--no-skills", "agbox-dev1"})
+	resOpts, err := parseResumeArgs([]string{"--conversation=conv-42", "--no-auth", "--no-skills", "agbox-dev1"})
 	if err != nil || resOpts.ContinueSession != "conv-42" || !resOpts.NoAuth || !resOpts.NoSkills {
 		t.Fatalf("ParseResumeArgs = %+v, %v", resOpts, err)
 	}
@@ -1601,7 +1634,7 @@ func TestParsePersistenceModeAndFlagArgs(t *testing.T) {
 		{"--session", "bad;id", "agbox-dev1"},
 		{"--session"},
 	} {
-		if _, err := ParseResumeArgs(bad); err == nil {
+		if _, err := parseResumeArgs(bad); err == nil {
 			t.Errorf("expected ParseResumeArgs(%v) to fail", bad)
 		}
 	}
@@ -1623,14 +1656,14 @@ func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
 	// Help dispatch for auth, skills, profile.
 	for _, mode := range []string{"auth", "skills", "profile"} {
 		stdout.Reset()
-		if rc := app.Dispatch(ctx, []string{mode, "--help"}); rc != 0 || !strings.Contains(stdout.String(), "Usage:") {
+		if rc := app.dispatch(ctx, []string{mode, "--help"}); rc != 0 || !strings.Contains(stdout.String(), "Usage:") {
 			t.Fatalf("Dispatch(%s --help) = %d, out=%q", mode, rc, stdout.String())
 		}
 	}
 
 	// 1. Initial auth status is unconfigured.
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"auth", "status"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"auth", "status"}); rc != 0 {
 		t.Fatalf("auth status failed: %s", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "antigravity: not configured") || !strings.Contains(stdout.String(), "opencode: not configured") {
@@ -1638,11 +1671,11 @@ func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
 	}
 
 	// 2. Non-TTY or missing agent when base=both fails closed.
-	if rc := app.Dispatch(ctx, []string{"auth"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"auth"}); rc == 0 {
 		t.Fatal("expected auth without agent to fail when base=both")
 	}
 	app.IsTTY = func() bool { return false }
-	if rc := app.Dispatch(ctx, []string{"auth", "antigravity"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"auth", "antigravity"}); rc == 0 {
 		t.Fatal("expected auth to fail closed without TTY")
 	}
 	app.IsTTY = func() bool { return true }
@@ -1666,7 +1699,7 @@ func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
 		return msb.CommandResult{}, nil
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"auth", "antigravity"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"auth", "antigravity"}); rc == 0 {
 		t.Fatal("expected auth to fail closed when guest credentials are missing")
 	}
 	cleanedAuthVM := false
@@ -1697,15 +1730,20 @@ func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
 	}
 
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"auth", "antigravity"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"auth", "antigravity"}); rc != 0 {
 		t.Fatalf("auth antigravity failed: %s", stderr.String())
 	}
 	for _, c := range runner.calls {
 		if len(c.Args) >= 2 && c.Args[0] == "snap" && c.Args[1] == "restore" && slices.Contains(c.Args, "-v") {
 			t.Fatalf("auth VM must boot with zero host shares, got %v", c.Args)
 		}
+		if len(c.Args) >= 1 && c.Args[0] == "exec" && strings.Contains(strings.Join(c.Args, " "), "printf 'FILE ") {
+			if !slices.Contains(c.Args, "--stream") || !slices.Contains(c.Args, "--no-stdin") {
+				t.Fatalf("auth capScript must pass --stream and --no-stdin, got %v", c.Args)
+			}
+		}
 	}
-	if rc := app.Dispatch(ctx, []string{"auth", "opencode"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"auth", "opencode"}); rc != 0 {
 		t.Fatalf("auth opencode failed: %s", stderr.String())
 	}
 	runner.handler = nil
@@ -1717,7 +1755,7 @@ func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
 	}
 
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"auth", "status"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"auth", "status"}); rc != 0 {
 		t.Fatalf("auth status failed: %s", stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "antigravity: configured") || !strings.Contains(stdout.String(), "opencode: configured") {
@@ -1726,7 +1764,7 @@ func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
 
 	// 5. Run streams saved auth over stdin (never in CLI args), and --no-auth skips it.
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "antigravity"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "antigravity"}); rc != 0 {
 		t.Fatalf("run antigravity failed: %s", stderr.String())
 	}
 	streamedAuth := false
@@ -1745,7 +1783,7 @@ func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
 	}
 
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--no-auth", "antigravity"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--no-auth", "antigravity"}); rc != 0 {
 		t.Fatalf("run --no-auth failed: %s", stderr.String())
 	}
 	for _, c := range runner.calls {
@@ -1755,11 +1793,11 @@ func TestPersistentAuthLifecycleAndStdinStreaming(t *testing.T) {
 	}
 
 	// 6. Logout removes credentials.
-	if rc := app.Dispatch(ctx, []string{"auth", "logout", "all"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"auth", "logout", "all"}); rc != 0 {
 		t.Fatalf("auth logout all failed: %s", stderr.String())
 	}
 	stdout.Reset()
-	_ = app.Dispatch(ctx, []string{"auth", "status"})
+	_ = app.dispatch(ctx, []string{"auth", "status"})
 	if !strings.Contains(stdout.String(), "antigravity: not configured") {
 		t.Errorf("expected antigravity unconfigured after logout, got %q", stdout.String())
 	}
@@ -1780,7 +1818,7 @@ func TestPersistentSkillsAndProjectWorkingDirectory(t *testing.T) {
 
 	// 1. Empty skills list, then add, overwrite with --force, and list.
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"skills"}); rc != 0 || !strings.Contains(stdout.String(), "No global skills") {
+	if rc := app.dispatch(ctx, []string{"skills"}); rc != 0 || !strings.Contains(stdout.String(), "No global skills") {
 		t.Fatalf("skills list empty = %d, %q", rc, stdout.String())
 	}
 
@@ -1791,17 +1829,17 @@ func TestPersistentSkillsAndProjectWorkingDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(skillSrc, "SKILL.md"), []byte("---\nname: code-audit\n---\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if rc := app.Dispatch(ctx, []string{"skills", "add", skillSrc}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"skills", "add", skillSrc}); rc != 0 {
 		t.Fatalf("skills add failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"skills", "add", skillSrc}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"skills", "add", skillSrc}); rc == 0 {
 		t.Fatal("expected duplicate skills add without --force to fail")
 	}
-	if rc := app.Dispatch(ctx, []string{"skills", "add", "--force", skillSrc}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"skills", "add", "--force", skillSrc}); rc != 0 {
 		t.Fatalf("skills add --force failed: %s", stderr.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"skills", "list"}); rc != 0 || strings.TrimSpace(stdout.String()) != "code-audit" {
+	if rc := app.dispatch(ctx, []string{"skills", "list"}); rc != 0 || strings.TrimSpace(stdout.String()) != "code-audit" {
 		t.Fatalf("skills list = %d, %q", rc, stdout.String())
 	}
 
@@ -1815,7 +1853,7 @@ func TestPersistentSkillsAndProjectWorkingDirectory(t *testing.T) {
 	}
 
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "antigravity", proj1}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "antigravity", proj1}); rc != 0 {
 		t.Fatalf("run antigravity proj1 failed: %s", stderr.String())
 	}
 	wantSkillsVol := filepath.Join(app.Env.DataDir, "skills") + ":" + msb.GuestSkillsMount + ":ro,stat-virt=relaxed,uid=1000,gid=1000"
@@ -1840,7 +1878,7 @@ func TestPersistentSkillsAndProjectWorkingDirectory(t *testing.T) {
 
 	// 3. Multiple directory shares use /workspace CWD and pass --add-dir to agy, while --no-skills omits the skills volume.
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--no-skills", "antigravity", proj1, proj2}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--no-skills", "antigravity", proj1, proj2}); rc != 0 {
 		t.Fatalf("run --no-skills multi-share failed: %s", stderr.String())
 	}
 	foundAddDir := false
@@ -1863,7 +1901,7 @@ func TestPersistentSkillsAndProjectWorkingDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "antigravity", proj1}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "antigravity", proj1}); rc == 0 {
 		t.Fatal("expected Run to fail closed when $DATA_DIR/skills contains a symlink")
 	}
 	for _, c := range runner.calls {
@@ -1874,7 +1912,7 @@ func TestPersistentSkillsAndProjectWorkingDirectory(t *testing.T) {
 	_ = os.Remove(badSym)
 
 	// 5. Remove skill cleanly.
-	if rc := app.Dispatch(ctx, []string{"skills", "rm", "code-audit"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"skills", "rm", "code-audit"}); rc != 0 {
 		t.Fatalf("skills rm failed: %s", stderr.String())
 	}
 }
@@ -1916,7 +1954,7 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 		return msb.CommandResult{}, nil
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "broken1", "opencode", projA}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "broken1", "opencode", projA}); rc == 0 {
 		t.Fatal("expected --persist run to fail closed when pushKeys fails")
 	}
 	foundBrokenRM := false
@@ -1933,7 +1971,7 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 	// 2. First successful --persist run auto-suspends on exit instead of calling msb rm -f.
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "opencode", projA}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "opencode", projA}); rc != 0 {
 		t.Fatalf("first --persist run failed: %s", stderr.String())
 	}
 	dev1Dir := filepath.Join(app.Env.DataDir, "run", "dev1")
@@ -1955,7 +1993,7 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 
 	// 3. Repeat --persist run with different share path fails closed and keeps suspended marker.
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-dev1 stopped\n"
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "opencode", projB}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "opencode", projB}); rc == 0 {
 		t.Fatal("expected repeat --persist run with mismatched share path to fail")
 	}
 	if _, err := os.Stat(filepath.Join(dev1Dir, "suspended")); err != nil {
@@ -1965,7 +2003,7 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 	// 4. Repeat --persist run with matching share and -c resumes agbox-dev1 with `opencode -c` and re-suspends on exit.
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "-c", "opencode", projA}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "-c", "opencode", projA}); rc != 0 {
 		t.Fatalf("repeat --persist -c run failed: %s", stderr.String())
 	}
 	foundStart := false
@@ -1990,7 +2028,7 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 
 	// 5. Explicit `agbox resume --session ses_42 agbox-dev1` also re-suspends on exit until `agbox stop`.
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"resume", "--session", "ses_42", "agbox-dev1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "--session", "ses_42", "agbox-dev1"}); rc != 0 {
 		t.Fatalf("resume --session failed: %s", stderr.String())
 	}
 	foundSessionFlag := false
@@ -2006,7 +2044,7 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 		t.Fatalf("expected persistent sandbox to re-suspend after `agbox resume`: %v", err)
 	}
 
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-dev1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-dev1"}); rc != 0 {
 		t.Fatalf("stop agbox-dev1 failed: %s", stderr.String())
 	}
 	if _, err := os.Stat(dev1Dir); !os.IsNotExist(err) {
@@ -2039,17 +2077,17 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 	}
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--no-auth", "--persist", "--name", "rcfail", "-d", "--remote-control", "antigravity", projA}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--no-auth", "--persist", "--name", "rcfail", "-d", "--remote-control", "antigravity", projA}); rc == 0 {
 		t.Fatal("expected --persist -d --remote-control startup failure to fail")
 	}
 	rcFailDir := filepath.Join(app.Env.DataDir, "run", "rcfail")
 	if _, err := os.Stat(rcFailDir); !os.IsNotExist(err) {
-		t.Errorf("expected failed rc run dir %s to be cleaned up, err=%v", rcFailDir, err)
+		t.Errorf("expected failed rc run dir %s to be deleted, err=%v", rcFailDir, err)
 	}
 	foundRCRM := false
 	for _, c := range runner.calls {
 		if slices.Equal(c.Args, []string{"stop", "agbox-rcfail"}) {
-			t.Fatal("failed --persist -d --remote-control called msb stop instead of cleaning up")
+			t.Fatal("failed --persist -d --remote-control called msb stop instead of deleting resources")
 		}
 		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-rcfail"}) {
 			foundRCRM = true
@@ -2064,19 +2102,19 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 	runner.handler = nil
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "srvfail", "-d", "--serve", "opencode", projA}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "srvfail", "-d", "--serve", "opencode", projA}); rc == 0 {
 		app.WaitServeUI = origWaitServe
 		t.Fatal("expected --persist -d --serve readiness failure to fail")
 	}
 	app.WaitServeUI = origWaitServe
 	srvFailDir := filepath.Join(app.Env.DataDir, "run", "srvfail")
 	if _, err := os.Stat(srvFailDir); !os.IsNotExist(err) {
-		t.Errorf("expected failed serve run dir %s to be cleaned up, err=%v", srvFailDir, err)
+		t.Errorf("expected failed serve run dir %s to be deleted, err=%v", srvFailDir, err)
 	}
 	foundSrvRM := false
 	for _, c := range runner.calls {
 		if slices.Equal(c.Args, []string{"stop", "agbox-srvfail"}) {
-			t.Fatal("failed --persist -d --serve called msb stop instead of cleaning up")
+			t.Fatal("failed --persist -d --serve called msb stop instead of deleting resources")
 		}
 		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-srvfail"}) {
 			foundSrvRM = true
@@ -2105,7 +2143,7 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 	}
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "stoprace", "--cmd", "sleep 300", "opencode", projA}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "stoprace", "--cmd", "sleep 300", "opencode", projA}); rc != 0 {
 		t.Fatalf("foreground --persist run during deleting race failed: %s", stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(stopRaceDir, "suspended")); !os.IsNotExist(err) {
@@ -2171,21 +2209,21 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 	defer func() { runner.handler = nil }()
 
 	// 1. Create and list profile, and verify `agbox status` reports persistence state.
-	if rc := app.Dispatch(ctx, []string{"profile", "create", "--size", "12G", "workprof"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"profile", "create", "--size", "12G", "workprof"}); rc != 0 {
 		t.Fatalf("profile create failed: %s", stderr.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"profile", "list"}); rc != 0 || !strings.Contains(stdout.String(), "agbox-profile-workprof") {
+	if rc := app.dispatch(ctx, []string{"profile", "list"}); rc != 0 || !strings.Contains(stdout.String(), "agbox-profile-workprof") {
 		t.Fatalf("profile list = %d, out=%q", rc, stdout.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "profiles: workprof") {
+	if rc := app.dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "profiles: workprof") {
 		t.Fatalf("status missing profile info: rc=%d, out=%q", rc, stdout.String())
 	}
 
 	// 2. Run with --profile mounts raw ext4 disk volume, bind-mounts conversation dirs, passes --conversation, and deletes ephemeral VM on exit.
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "ephem1", "--profile", "workprof", "--conversation", "1c2a8c1e", "antigravity", proj}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "ephem1", "--profile", "workprof", "--conversation", "1c2a8c1e", "antigravity", proj}); rc != 0 {
 		t.Fatalf("run --profile failed: %s", stderr.String())
 	}
 	wantDiskFlag := filepath.Join(app.Env.MSBHome, "volumes", "agbox-profile-workprof", "disk.raw") + ":" + msb.GuestProfileMount + ":rw,format=raw,fstype=ext4"
@@ -2225,7 +2263,7 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-ephem-stop"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-ephem-stop"}); rc != 0 {
 		t.Fatalf("agbox stop profile sandbox failed: %s", stderr.String())
 	}
 	manualStopIdx := -1
@@ -2267,7 +2305,7 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 	}
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-ephem-race"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-ephem-race"}); rc != 0 {
 		t.Fatalf("agbox stop with concurrent rm -f race failed: %s", stderr.String())
 	}
 	if !sawDeletingBeforeStop {
@@ -2285,7 +2323,7 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 		return prevRaceHandler(req)
 	}
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-nonexistent"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-nonexistent"}); rc == 0 {
 		t.Fatal("expected agbox stop on nonexistent sandbox to fail")
 	}
 	if _, err := os.Stat(filepath.Join(app.Env.DataDir, "run", "nonexistent")); !os.IsNotExist(err) {
@@ -2302,7 +2340,7 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 		return prevHandler(req)
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--name", "ephem-insp", "--profile", "workprof", "antigravity", proj}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--name", "ephem-insp", "--profile", "workprof", "antigravity", proj}); rc != 0 {
 		t.Fatalf("run --profile with volume inspect failed: %s", stderr.String())
 	}
 	wantInspectedDisk := "--mount-disk /custom/msb/volumes/agbox-profile-workprof/disk.raw:" + msb.GuestProfileMount + ":rw,format=raw,fstype=ext4"
@@ -2324,7 +2362,7 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--profile", "workprof", "antigravity", proj}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--profile", "workprof", "antigravity", proj}); rc == 0 {
 		_ = heldLock.Unlock()
 		t.Fatal("expected concurrent --profile run to fail while flock is held")
 	}
@@ -2335,7 +2373,7 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 		}
 	}
 
-	// 4. Suspended sandbox referencing workprof blocks `profile rm` unless --force is passed,
+	// 4. Suspended sandbox referencing workprof blocks `profile rm` unless you pass --force,
 	// and resuming after `--force` removal fails closed because the disk volume is gone.
 	suspDir := filepath.Join(app.Env.DataDir, "run", "psusp")
 	suspMeta := config.RunMeta{
@@ -2349,22 +2387,26 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-psusp stopped\n"
-	if rc := app.Dispatch(ctx, []string{"profile", "rm", "workprof"}); rc == 0 {
-		t.Fatal("expected profile rm without --force to fail when referenced by suspended sandbox")
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"profile", "rm", "workprof"}); rc == 0 {
+		t.Fatal("expected profile rm without --force to fail when suspended sandbox references profile")
 	}
-	if rc := app.Dispatch(ctx, []string{"profile", "rm", "--force", "workprof"}); rc != 0 {
+	if !strings.Contains(stderr.String(), `suspended sandbox agbox-psusp references profile "workprof"`) {
+		t.Fatalf("expected profile rm error to report suspended sandbox reference, got: %s", stderr.String())
+	}
+	if rc := app.dispatch(ctx, []string{"profile", "rm", "--force", "workprof"}); rc != 0 {
 		t.Fatalf("profile rm --force failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"resume", "agbox-psusp"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-psusp"}); rc == 0 {
 		t.Fatal("expected Resume to fail closed when profile disk volume was deleted")
 	}
 
 	// 5. `agbox remove --yes` deletes remaining agbox-profile-* volumes alongside sandboxes and DataDir.
-	if rc := app.Dispatch(ctx, []string{"profile", "create", "cleanupme"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"profile", "create", "cleanupme"}); rc != 0 {
 		t.Fatalf("profile create cleanupme failed: %s", stderr.String())
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"remove", "--yes"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"remove", "--yes"}); rc != 0 {
 		t.Fatalf("remove --yes failed: %s", stderr.String())
 	}
 	deletedProfVol := false
@@ -2390,7 +2432,7 @@ func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
 		{"rules", "list"},
 		{"profile", "list"},
 	} {
-		if rc := app.Dispatch(ctx, cmd); rc == 0 {
+		if rc := app.dispatch(ctx, cmd); rc == 0 {
 			t.Errorf("expected %v to fail closed as root without --allow-root", cmd)
 		}
 	}
@@ -2409,7 +2451,7 @@ func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
 		{"rules", "list"},
 		{"profile", "list"},
 	} {
-		if rc := symApp.Dispatch(ctx, cmd); rc == 0 {
+		if rc := symApp.dispatch(ctx, cmd); rc == 0 {
 			t.Errorf("expected %v to reject symlinked DataDir", cmd)
 		}
 	}
@@ -2436,33 +2478,33 @@ func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
 		if err := config.SaveRunMeta(filepath.Join(tampDir, "suspended"), badMeta); err != nil {
 			t.Fatal(err)
 		}
-		if rc := app.Dispatch(ctx, []string{"resume", "agbox-tamp2"}); rc == 0 {
+		if rc := app.dispatch(ctx, []string{"resume", "agbox-tamp2"}); rc == 0 {
 			t.Errorf("expected tampered Resume metadata %+v to fail closed", badMeta)
 		}
 	}
 }
 
 func TestParseRulesArgsAndNoRulesFlags(t *testing.T) {
-	if _, err := ParseRulesArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+	if _, err := parseRulesArgs([]string{"--help"}); !errors.Is(err, errHelp) {
 		t.Fatalf("ParseRulesArgs(--help) = %v, want ErrHelp", err)
 	}
-	opts, err := ParseRulesArgs(nil)
+	opts, err := parseRulesArgs(nil)
 	if err != nil || opts.Action != "list" {
 		t.Fatalf("ParseRulesArgs(nil) = %+v, %v", opts, err)
 	}
-	opts, err = ParseRulesArgs([]string{"add", "--force", "--name", "eng-standards", "/tmp/rules.md"})
+	opts, err = parseRulesArgs([]string{"add", "--force", "--name", "eng-standards", "/tmp/rules.md"})
 	if err != nil || opts.Action != "add" || !opts.Force || opts.Name != "eng-standards" || opts.Target != "/tmp/rules.md" {
 		t.Fatalf("ParseRulesArgs(add) = %+v, %v", opts, err)
 	}
-	opts, err = ParseRulesArgs([]string{"add", "--name=AGENTS.md", "/tmp/rules.md"})
+	opts, err = parseRulesArgs([]string{"add", "--name=AGENTS.md", "/tmp/rules.md"})
 	if err != nil || opts.Name != "AGENTS" {
 		t.Fatalf("ParseRulesArgs(add --name=) = %+v, %v", opts, err)
 	}
-	opts, err = ParseRulesArgs([]string{"show", "eng-standards"})
+	opts, err = parseRulesArgs([]string{"show", "eng-standards"})
 	if err != nil || opts.Action != "show" || opts.Target != "eng-standards" {
 		t.Fatalf("ParseRulesArgs(show) = %+v, %v", opts, err)
 	}
-	opts, err = ParseRulesArgs([]string{"rm", "--all"})
+	opts, err = parseRulesArgs([]string{"rm", "--all"})
 	if err != nil || opts.Action != "rm" || !opts.All {
 		t.Fatalf("ParseRulesArgs(rm --all) = %+v, %v", opts, err)
 	}
@@ -2479,16 +2521,16 @@ func TestParseRulesArgsAndNoRulesFlags(t *testing.T) {
 		{"rm", "--all", "extra"},
 		{"bogus"},
 	} {
-		if _, err := ParseRulesArgs(bad); err == nil {
+		if _, err := parseRulesArgs(bad); err == nil {
 			t.Errorf("ParseRulesArgs(%v) succeeded, want error", bad)
 		}
 	}
 
-	runOpts, err := ParseRunArgs([]string{"--no-rules", "opencode"}, config.MaskStrict, func(string) bool { return false })
+	runOpts, err := parseRunArgs([]string{"--no-rules", "opencode"}, config.MaskStrict, func(string) bool { return false })
 	if err != nil || !runOpts.NoRules {
 		t.Fatalf("ParseRunArgs(--no-rules) = %+v, %v", runOpts, err)
 	}
-	resOpts, err := ParseResumeArgs([]string{"--no-rules", "agbox-dev"})
+	resOpts, err := parseResumeArgs([]string{"--no-rules", "agbox-dev"})
 	if err != nil || !resOpts.NoRules || resOpts.Sandbox != "agbox-dev" {
 		t.Fatalf("ParseResumeArgs(--no-rules) = %+v, %v", resOpts, err)
 	}
@@ -2509,11 +2551,11 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 
 	// 1. Empty rules list and status check.
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"rules"}); rc != 0 || !strings.Contains(stdout.String(), "No global rules") {
+	if rc := app.dispatch(ctx, []string{"rules"}); rc != 0 || !strings.Contains(stdout.String(), "No global rules") {
 		t.Fatalf("rules empty = %d, %q", rc, stdout.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "global_rules: none") {
+	if rc := app.dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "global_rules: none") {
 		t.Fatalf("status empty global_rules = %d, %q", rc, stdout.String())
 	}
 
@@ -2523,13 +2565,13 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 	if err := os.WriteFile(stdFile, []byte("# Engineering Standards\nRun gofmt and tests.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if rc := app.Dispatch(ctx, []string{"rules", "add", "--name", "standards", stdFile}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"rules", "add", "--name", "standards", stdFile}); rc != 0 {
 		t.Fatalf("rules add standards failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"rules", "add", "--name", "standards", stdFile}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"rules", "add", "--name", "standards", stdFile}); rc == 0 {
 		t.Fatal("expected duplicate rules add without --force to fail")
 	}
-	if rc := app.Dispatch(ctx, []string{"rules", "add", "--force", "--name", "standards", stdFile}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"rules", "add", "--force", "--name", "standards", stdFile}); rc != 0 {
 		t.Fatalf("rules add --force failed: %s", stderr.String())
 	}
 
@@ -2539,7 +2581,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 		t.Fatal(err)
 	}
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"rules", "add", largeFile}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"rules", "add", largeFile}); rc != 0 {
 		t.Fatalf("rules add large-guide failed: %s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "WARN:") || !strings.Contains(stderr.String(), "24000") {
@@ -2547,15 +2589,15 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 	}
 
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"rules", "show", "standards"}); rc != 0 || !strings.Contains(stdout.String(), "Run gofmt and tests.") {
+	if rc := app.dispatch(ctx, []string{"rules", "show", "standards"}); rc != 0 || !strings.Contains(stdout.String(), "Run gofmt and tests.") {
 		t.Fatalf("rules show standards = %d, %q", rc, stdout.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"rules", "show"}); rc != 0 || !strings.Contains(stdout.String(), "== standards.md ==") || !strings.Contains(stdout.String(), "== large-guide.md ==") {
+	if rc := app.dispatch(ctx, []string{"rules", "show"}); rc != 0 || !strings.Contains(stdout.String(), "== standards.md ==") || !strings.Contains(stdout.String(), "== large-guide.md ==") {
 		t.Fatalf("rules show all = %d, %q", rc, stdout.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "global_rules: large-guide, standards") {
+	if rc := app.dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "global_rules: large-guide, standards") {
 		t.Fatalf("status global_rules = %d, %q", rc, stdout.String())
 	}
 
@@ -2567,7 +2609,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 	wantRulesVol := filepath.Join(app.Env.DataDir, "rules") + ":" + msb.GuestRulesMount + ":ro,stat-virt=relaxed,uid=1000,gid=1000"
 
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "rulesvm", "antigravity", proj}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "rulesvm", "antigravity", proj}); rc != 0 {
 		t.Fatalf("run with global rules failed: %s", stderr.String())
 	}
 	foundRulesVol := false
@@ -2588,7 +2630,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 	// 4. Resume re-runs setupGuestRules so host rule edits take effect, while `resume --no-rules` skips it.
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rulesvm stopped\n"
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"resume", "agbox-rulesvm"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-rulesvm"}); rc != 0 {
 		t.Fatalf("resume agbox-rulesvm failed: %s", stderr.String())
 	}
 	resumedBind := false
@@ -2602,7 +2644,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 	}
 
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"resume", "--no-rules", "agbox-rulesvm"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "--no-rules", "agbox-rulesvm"}); rc != 0 {
 		t.Fatalf("resume --no-rules agbox-rulesvm failed: %s", stderr.String())
 	}
 	for _, c := range runner.calls {
@@ -2613,7 +2655,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 
 	// 5. `--no-rules` on `agbox run` omits the global rules volume and skips setupGuestRules.
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--no-rules", "opencode", proj}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--no-rules", "opencode", proj}); rc != 0 {
 		t.Fatalf("run --no-rules failed: %s", stderr.String())
 	}
 	for _, c := range runner.calls {
@@ -2631,7 +2673,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "opencode", proj}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "opencode", proj}); rc == 0 {
 		t.Fatal("expected Run to fail closed when $DATA_DIR/rules contains a symlink")
 	}
 	for _, c := range runner.calls {
@@ -2640,7 +2682,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 		}
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"resume", "agbox-rulesvm"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-rulesvm"}); rc == 0 {
 		t.Fatal("expected Resume to fail closed when $DATA_DIR/rules contains a symlink")
 	}
 	for _, c := range runner.calls {
@@ -2651,38 +2693,38 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 	_ = os.Remove(badSym)
 
 	// 7. Remove single rule and remove --all.
-	if rc := app.Dispatch(ctx, []string{"rules", "rm", "large-guide"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"rules", "rm", "large-guide"}); rc != 0 {
 		t.Fatalf("rules rm large-guide failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"rules", "rm", "--all"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"rules", "rm", "--all"}); rc != 0 {
 		t.Fatalf("rules rm --all failed: %s", stderr.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"rules", "list"}); rc != 0 || !strings.Contains(stdout.String(), "No global rules") {
+	if rc := app.dispatch(ctx, []string{"rules", "list"}); rc != 0 || !strings.Contains(stdout.String(), "No global rules") {
 		t.Fatalf("rules list after rm --all = %d, %q", rc, stdout.String())
 	}
 }
 
 func TestParseUpdateAndShareArgsAndRunConflicts(t *testing.T) {
 	// 1. ParseUpdateArgs
-	if u, err := ParseUpdateArgs(nil); err != nil || u.Action != "update" || u.Target != "" {
+	if u, err := parseUpdateArgs(nil); err != nil || u.Action != "update" || u.Target != "" {
 		t.Fatalf("ParseUpdateArgs(nil) = %+v, %v", u, err)
 	}
 	for _, ag := range []string{"antigravity", "opencode", "both"} {
-		if u, err := ParseUpdateArgs([]string{"--allow-root", ag}); err != nil || u.Action != "update" || u.Target != ag || !u.AllowRoot {
+		if u, err := parseUpdateArgs([]string{"--allow-root", ag}); err != nil || u.Action != "update" || u.Target != ag || !u.AllowRoot {
 			t.Fatalf("ParseUpdateArgs(%s) = %+v, %v", ag, u, err)
 		}
 	}
-	if u, err := ParseUpdateArgs([]string{"status"}); err != nil || u.Action != "status" {
+	if u, err := parseUpdateArgs([]string{"status"}); err != nil || u.Action != "status" {
 		t.Fatalf("ParseUpdateArgs(status) = %+v, %v", u, err)
 	}
-	if u, err := ParseUpdateArgs([]string{"clear"}); err != nil || u.Action != "clear" || u.Target != "all" {
+	if u, err := parseUpdateArgs([]string{"clear"}); err != nil || u.Action != "clear" || u.Target != "all" {
 		t.Fatalf("ParseUpdateArgs(clear) = %+v, %v", u, err)
 	}
-	if u, err := ParseUpdateArgs([]string{"clear", "opencode"}); err != nil || u.Action != "clear" || u.Target != "opencode" {
+	if u, err := parseUpdateArgs([]string{"clear", "opencode"}); err != nil || u.Action != "clear" || u.Target != "opencode" {
 		t.Fatalf("ParseUpdateArgs(clear opencode) = %+v, %v", u, err)
 	}
-	if _, err := ParseUpdateArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+	if _, err := parseUpdateArgs([]string{"--help"}); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 	for _, bad := range [][]string{
@@ -2693,28 +2735,28 @@ func TestParseUpdateAndShareArgsAndRunConflicts(t *testing.T) {
 		{"antigravity", "extra"},
 		{"bogus"},
 	} {
-		if _, err := ParseUpdateArgs(bad); err == nil {
+		if _, err := parseUpdateArgs(bad); err == nil {
 			t.Errorf("expected ParseUpdateArgs(%v) to fail", bad)
 		}
 	}
 
 	// 2. ParseShareArgs
-	if s, err := ParseShareArgs([]string{"list", "agbox-dev"}); err != nil || s.Action != "list" || s.Sandbox != "agbox-dev" {
+	if s, err := parseShareArgs([]string{"list", "agbox-dev"}); err != nil || s.Action != "list" || s.Sandbox != "agbox-dev" {
 		t.Fatalf("ParseShareArgs(list) = %+v, %v", s, err)
 	}
-	if s, err := ParseShareArgs([]string{"add", "agbox-dev", "./proj"}); err != nil || s.Action != "add" || s.HasAccess || s.HasVCS {
+	if s, err := parseShareArgs([]string{"add", "agbox-dev", "./proj"}); err != nil || s.Action != "add" || s.HasAccess || s.HasVCS {
 		t.Fatalf("ParseShareArgs(add default) = %+v, %v", s, err)
 	}
-	if s, err := ParseShareArgs([]string{"add", "--rw", "--vcs", "--as", "api", "agbox-dev", "./proj"}); err != nil || !s.HasAccess || s.ReadOnly || !s.HasVCS || s.VCSPolicy != config.VCSAllow || s.Alias != "api" {
+	if s, err := parseShareArgs([]string{"add", "--rw", "--vcs", "--as", "api", "agbox-dev", "./proj"}); err != nil || !s.HasAccess || s.ReadOnly || !s.HasVCS || s.VCSPolicy != config.VCSAllow || s.Alias != "api" {
 		t.Fatalf("ParseShareArgs(add --rw --vcs --as api) = %+v, %v", s, err)
 	}
-	if s, err := ParseShareArgs([]string{"set", "--ro", "--force", "agbox-dev", "api"}); err != nil || s.Action != "set" || !s.ReadOnly || !s.Force {
+	if s, err := parseShareArgs([]string{"set", "--ro", "--force", "agbox-dev", "api"}); err != nil || s.Action != "set" || !s.ReadOnly || !s.Force {
 		t.Fatalf("ParseShareArgs(set --ro --force) = %+v, %v", s, err)
 	}
-	if s, err := ParseShareArgs([]string{"rm", "--force", "agbox-dev", "api"}); err != nil || s.Action != "rm" || !s.Force {
+	if s, err := parseShareArgs([]string{"rm", "--force", "agbox-dev", "api"}); err != nil || s.Action != "rm" || !s.Force {
 		t.Fatalf("ParseShareArgs(rm --force) = %+v, %v", s, err)
 	}
-	if _, err := ParseShareArgs([]string{"--help"}); !errors.Is(err, ErrHelp) {
+	if _, err := parseShareArgs([]string{"--help"}); !errors.Is(err, errHelp) {
 		t.Errorf("expected ErrHelp, got %v", err)
 	}
 	for _, bad := range [][]string{
@@ -2735,13 +2777,13 @@ func TestParseUpdateAndShareArgsAndRunConflicts(t *testing.T) {
 		{"list", "agbox-base"},
 		{"list", "not-agbox"},
 	} {
-		if _, err := ParseShareArgs(bad); err == nil {
+		if _, err := parseShareArgs(bad); err == nil {
 			t.Errorf("expected ParseShareArgs(%v) to fail on invalid or conflicting options", bad)
 		}
 	}
 
 	// 3. ParseRunArgs per-share syntax and conflicting option errors
-	rOpts, err := ParseRunArgs([]string{
+	rOpts, err := parseRunArgs([]string{
 		"--share-hub",
 		"--no-agent-cache",
 		"--share", "./docs:ro",
@@ -2776,7 +2818,7 @@ func TestParseUpdateAndShareArgsAndRunConflicts(t *testing.T) {
 		{"./proj:ro,vcs-hooks"},
 		{"./proj:vcs,mask"},
 	} {
-		if _, err := ParseRunArgs(badRun, config.MaskStrict, func(string) bool { return false }); err == nil {
+		if _, err := parseRunArgs(badRun, config.MaskStrict, func(string) bool { return false }); err == nil {
 			t.Errorf("expected ParseRunArgs(%v) to fail on conflicting options", badRun)
 		}
 	}
@@ -2797,11 +2839,11 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 
 	// 1. Empty status check.
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"update", "status"}); rc != 0 || !strings.Contains(stdout.String(), "No cached agent updates") {
+	if rc := app.dispatch(ctx, []string{"update", "status"}); rc != 0 || !strings.Contains(stdout.String(), "No cached agent updates") {
 		t.Fatalf("update status empty = %d, %q", rc, stdout.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "cached_agents: none") {
+	if rc := app.dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "cached_agents: none") {
 		t.Fatalf("status cached_agents empty = %d, %q", rc, stdout.String())
 	}
 
@@ -2822,7 +2864,7 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 		}
 		return msb.CommandResult{}, nil
 	}
-	if rc := app.Dispatch(ctx, []string{"update", "antigravity"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"update", "antigravity"}); rc == 0 {
 		t.Fatal("expected update with non-ELF stream to fail closed")
 	}
 	if cached, err := persist.InspectAgentsDir(filepath.Join(app.Env.DataDir, "agents")); err != nil || len(cached) != 0 {
@@ -2858,7 +2900,7 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 	}
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"update", "both"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"update", "both"}); rc != 0 {
 		t.Fatalf("update both failed: %s", stderr.String())
 	}
 
@@ -2888,11 +2930,11 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 	runner.handler = nil
 
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"update", "status"}); rc != 0 || !strings.Contains(stdout.String(), "antigravity: version=agy 2.5.1") || !strings.Contains(stdout.String(), "opencode: version=1.4.9") {
+	if rc := app.dispatch(ctx, []string{"update", "status"}); rc != 0 || !strings.Contains(stdout.String(), "antigravity: version=agy 2.5.1") || !strings.Contains(stdout.String(), "opencode: version=1.4.9") {
 		t.Fatalf("update status = %d, %q", rc, stdout.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "cached_agents: antigravity (agy 2.5.1), opencode (1.4.9)") {
+	if rc := app.dispatch(ctx, []string{"status"}); rc != 0 || !strings.Contains(stdout.String(), "cached_agents: antigravity (agy 2.5.1), opencode (1.4.9)") {
 		t.Fatalf("status cached_agents = %d, %q", rc, stdout.String())
 	}
 
@@ -2904,7 +2946,7 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 	wantAgentsVol := filepath.Join(app.Env.DataDir, "agents") + ":" + msb.GuestAgentsMount + ":ro,stat-virt=relaxed,uid=1000,gid=1000"
 
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "agy --version", "antigravity", proj}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--cmd", "agy --version", "antigravity", proj}); rc != 0 {
 		t.Fatalf("run with cached agents failed: %s", stderr.String())
 	}
 	foundAgentsVol := false
@@ -2923,7 +2965,7 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 	}
 
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--no-agent-cache", "--cmd", "agy --version", "antigravity", proj}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--no-agent-cache", "--cmd", "agy --version", "antigravity", proj}); rc != 0 {
 		t.Fatalf("run --no-agent-cache failed: %s", stderr.String())
 	}
 	for _, c := range runner.calls {
@@ -2938,7 +2980,7 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "id", "antigravity", proj}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--cmd", "id", "antigravity", proj}); rc == 0 {
 		t.Fatal("expected Run to fail closed when $DATA_DIR/agents contains a symlink")
 	}
 	for _, c := range runner.calls {
@@ -2949,14 +2991,14 @@ func TestUpdateModeCacheAndRunIntegration(t *testing.T) {
 	_ = os.Remove(plantedSym)
 
 	// 6. Clear single agent and clear all.
-	if rc := app.Dispatch(ctx, []string{"update", "clear", "opencode"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"update", "clear", "opencode"}); rc != 0 {
 		t.Fatalf("update clear opencode failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"update", "clear"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"update", "clear"}); rc != 0 {
 		t.Fatalf("update clear all failed: %s", stderr.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"update", "status"}); rc != 0 || !strings.Contains(stdout.String(), "No cached agent updates") {
+	if rc := app.dispatch(ctx, []string{"update", "status"}); rc != 0 || !strings.Contains(stdout.String(), "No cached agent updates") {
 		t.Fatalf("update status after clear = %d, %q", rc, stdout.String())
 	}
 }
@@ -3024,7 +3066,15 @@ func TestShareLiveAndSuspended(t *testing.T) {
 		if err := os.MkdirAll(mntDir, 0o700); err != nil {
 			return 0, err
 		}
-		h, err := vcsfuse.NewWorkspaceHub(initial, app.Env.DataDir)
+		h, err := vcsfuse.NewWorkspaceHubWithOptions(initial, vcsfuse.HubOptions{
+			HomeReal:         app.Env.HomeReal,
+			DataDir:          app.Env.DataDir,
+			MSBHome:          app.Env.MSBHome,
+			AllowOutsideHome: app.Env.AllowOutsideHome,
+			MapGuestIDs:      true,
+			GuestUID:         config.GuestUID,
+			GuestGID:         config.GuestGID,
+		})
 		if err != nil {
 			return 0, err
 		}
@@ -3042,7 +3092,7 @@ func TestShareLiveAndSuspended(t *testing.T) {
 	}
 
 	// 1. Start a detached running sandbox with mixed per-share permissions.
-	if rc := app.Dispatch(ctx, []string{
+	if rc := app.dispatch(ctx, []string{
 		"run", "--name", "s1", "-d", "--remote-control",
 		"--share", docsDir + ":ro",
 		projA + ":rw",
@@ -3054,7 +3104,7 @@ func TestShareLiveAndSuspended(t *testing.T) {
 
 	// 2. `agbox share list` queries the live control socket and reports per-share permissions.
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 {
 		t.Fatalf("share list failed: %s", stderr.String())
 	}
 	listOut := stdout.String()
@@ -3070,38 +3120,38 @@ func TestShareLiveAndSuspended(t *testing.T) {
 
 	// 3. `agbox share add` defaults to ro,mask (most restrictive) on a running VM and drops guest caches.
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"share", "add", "agbox-s1", hotDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "add", "agbox-s1", hotDir}); rc != 0 {
 		t.Fatalf("share add default failed: %s", stderr.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 || !strings.Contains(stdout.String(), "/workspace/hot\tmode=ro\tvcs=mask") {
+	if rc := app.dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 || !strings.Contains(stdout.String(), "/workspace/hot\tmode=ro\tvcs=mask") {
 		t.Fatalf("expected hot-added share to default to mode=ro vcs=mask, got %q", stdout.String())
 	}
 
 	// Overlapping or duplicate share path must fail closed.
-	if rc := app.Dispatch(ctx, []string{"share", "add", "agbox-s1", hotDir}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"share", "add", "agbox-s1", hotDir}); rc == 0 {
 		t.Fatal("expected duplicate share add to fail closed")
 	}
 
 	// 4. `agbox share set` updates hot -> rw,vcs and then downgrades -> ro,mask. `agbox share rm` detaches it.
-	if rc := app.Dispatch(ctx, []string{"share", "set", "--rw", "--vcs", "agbox-s1", "hot"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "set", "--rw", "--vcs", "agbox-s1", "hot"}); rc != 0 {
 		t.Fatalf("share set --rw --vcs failed: %s", stderr.String())
 	}
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 || !strings.Contains(stdout.String(), "/workspace/hot\tmode=rw\tvcs=vcs") {
+	if rc := app.dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 || !strings.Contains(stdout.String(), "/workspace/hot\tmode=rw\tvcs=vcs") {
 		t.Fatalf("expected mode=rw vcs=vcs after set, got %q", stdout.String())
 	}
 	// Downgrading to --ro while vcs=vcs-hooks is active must fail as conflicting.
-	if rc := app.Dispatch(ctx, []string{"share", "set", "--vcs-hooks", "agbox-s1", "hot"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "set", "--vcs-hooks", "agbox-s1", "hot"}); rc != 0 {
 		t.Fatalf("share set --vcs-hooks failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"share", "set", "--ro", "agbox-s1", "hot"}); rc == 0 {
+	if rc := app.dispatch(ctx, []string{"share", "set", "--ro", "agbox-s1", "hot"}); rc == 0 {
 		t.Fatal("expected set --ro on a vcs-hooks share without --mask-vcs/--vcs to fail closed")
 	}
-	if rc := app.Dispatch(ctx, []string{"share", "set", "--ro", "--mask-vcs", "agbox-s1", "hot"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "set", "--ro", "--mask-vcs", "agbox-s1", "hot"}); rc != 0 {
 		t.Fatalf("share set --ro --mask-vcs failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"share", "rm", "agbox-s1", "hot"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "rm", "agbox-s1", "hot"}); rc != 0 {
 		t.Fatalf("share rm hot failed: %s", stderr.String())
 	}
 
@@ -3110,23 +3160,23 @@ func TestShareLiveAndSuspended(t *testing.T) {
 		_ = activeLn.Close()
 		activeLn = nil
 	}
-	if rc := app.Dispatch(ctx, []string{"suspend", "agbox-s1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"suspend", "agbox-s1"}); rc != 0 {
 		t.Fatalf("suspend agbox-s1 failed: %s", stderr.String())
 	}
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-s1 stopped\n"
 
-	if rc := app.Dispatch(ctx, []string{"share", "add", "--rw", "agbox-s1", hotDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "add", "--rw", "agbox-s1", hotDir}); rc != 0 {
 		t.Fatalf("suspended share add failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"share", "rm", "agbox-s1", "docs"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "rm", "agbox-s1", "docs"}); rc != 0 {
 		t.Fatalf("suspended share rm failed: %s", stderr.String())
 	}
-	if rc := app.Dispatch(ctx, []string{"resume", "-d", "agbox-s1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "-d", "agbox-s1"}); rc != 0 {
 		t.Fatalf("resume agbox-s1 after suspended share edits failed: %s", stderr.String())
 	}
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-s1 running\n"
 	stdout.Reset()
-	if rc := app.Dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 {
 		t.Fatalf("share list after resume failed: %s", stderr.String())
 	}
 	afterResume := stdout.String()
@@ -3134,10 +3184,10 @@ func TestShareLiveAndSuspended(t *testing.T) {
 		t.Fatalf("unexpected shares after resume: %q", afterResume)
 	}
 
-	// 6. Legacy suspended sandbox (WorkspaceHub == false) still resumes cleanly via StartFilter (m0.pid).
-	legacyDir := filepath.Join(app.Env.DataDir, "run", "leg1")
-	legacyMeta := config.RunMeta{
-		Sandbox:      "agbox-leg1",
+	// 6. Suspended sandbox with WorkspaceHub == false resumes cleanly via StartFilter (m0.pid).
+	filterRunDir := filepath.Join(app.Env.DataDir, "run", "perfilter1")
+	filterMeta := config.RunMeta{
+		Sandbox:      "agbox-perfilter1",
 		Agent:        "opencode",
 		Mode:         config.RunModeCmd,
 		Cmd:          "true",
@@ -3147,22 +3197,22 @@ func TestShareLiveAndSuspended(t *testing.T) {
 			{Index: 0, HostPath: projA, GuestName: "projA", IsDir: true, Masked: true},
 		},
 	}
-	if err := config.SaveRunMeta(filepath.Join(legacyDir, "suspended"), legacyMeta); err != nil {
+	if err := config.SaveRunMeta(filepath.Join(filterRunDir, "suspended"), filterMeta); err != nil {
 		t.Fatal(err)
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-leg1 stopped\n"
-	usedLegacyFilter := false
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-perfilter1 stopped\n"
+	usedShareFilter := false
 	app.StartFilter = func(_, mntDir, pidFile string, _ bool) (int, error) {
-		usedLegacyFilter = true
+		usedShareFilter = true
 		_ = os.MkdirAll(mntDir, 0o700)
 		_ = os.WriteFile(pidFile, []byte("7777\n"), 0o600)
 		return 7777, nil
 	}
-	if rc := app.Dispatch(ctx, []string{"resume", "agbox-leg1"}); rc != 0 {
-		t.Fatalf("legacy WorkspaceHub=false resume failed: %s", stderr.String())
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-perfilter1"}); rc != 0 {
+		t.Fatalf("WorkspaceHub=false resume failed: %s", stderr.String())
 	}
-	if !usedLegacyFilter {
-		t.Fatal("expected legacy WorkspaceHub=false sandbox to resume using StartFilter")
+	if !usedShareFilter {
+		t.Fatal("expected WorkspaceHub=false sandbox to resume using StartFilter")
 	}
 }
 
@@ -3199,7 +3249,7 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(skillSrc, "SKILL.md"), []byte("---\nname: blip-skill\ndescription: Test skill.\n---\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if rc := app.Dispatch(ctx, []string{"skills", "add", skillSrc}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"skills", "add", skillSrc}); rc != 0 {
 		t.Fatalf("skills add failed: %s", stderr.String())
 	}
 
@@ -3207,7 +3257,7 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 	if err := os.WriteFile(ruleSrc, []byte("# Blip Rule\nAlways run tests.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if rc := app.Dispatch(ctx, []string{"rules", "add", ruleSrc}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"rules", "add", ruleSrc}); rc != 0 {
 		t.Fatalf("rules add failed: %s", stderr.String())
 	}
 
@@ -3220,7 +3270,7 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 	runner.calls = nil
 	stdout.Reset()
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "blip", "-d", "--remote-control", repoDir}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "blip", "-d", "--remote-control", repoDir}); rc != 0 {
 		t.Fatalf("run --persist --name blip -d --remote-control failed (rc=%d): %s", rc, stderr.String())
 	}
 
@@ -3261,6 +3311,9 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 				if explicitUser != config.GuestUser {
 					t.Fatalf("remote-control start must pass -u %s, got args %v", config.GuestUser, c.Args)
 				}
+				if !slices.Contains(c.Args, "--stream") || !slices.Contains(c.Args, "--no-stdin") {
+					t.Fatalf("remote-control start must pass --stream and --no-stdin, got args %v", c.Args)
+				}
 				foundRCStart = true
 			}
 		}
@@ -3272,12 +3325,12 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 
 	// 3. Suspend and resume agbox-blip and verify root exec flags repeat cleanly on resume.
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-blip running\n"
-	if rc := app.Dispatch(ctx, []string{"suspend", "agbox-blip"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"suspend", "agbox-blip"}); rc != 0 {
 		t.Fatalf("suspend agbox-blip failed: %s", stderr.String())
 	}
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-blip stopped\n"
 	runner.calls = nil
-	if rc := app.Dispatch(ctx, []string{"resume", "agbox-blip"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-blip"}); rc != 0 {
 		t.Fatalf("resume agbox-blip failed: %s", stderr.String())
 	}
 	resumedSkills := false
@@ -3296,7 +3349,7 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 	if !resumedSkills || !resumedRules {
 		t.Fatalf("resume missing -u root skills (%v) or rules (%v)", resumedSkills, resumedRules)
 	}
-	if rc := app.Dispatch(ctx, []string{"stop", "agbox-blip"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"stop", "agbox-blip"}); rc != 0 {
 		t.Fatalf("stop agbox-blip failed: %s", stderr.String())
 	}
 	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
@@ -3324,7 +3377,7 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 	}
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "failrestore", "-d", "--remote-control", repoDir}); rc != 7 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "failrestore", "-d", "--remote-control", repoDir}); rc != 7 {
 		t.Fatalf("expected rc=7 on snap restore ExitError, got rc=%d, stderr=%q", rc, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "[agbox] ERROR:") || !strings.Contains(stderr.String(), "restore volume missing") {
@@ -3357,7 +3410,7 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 	}
 	runner.calls = nil
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--persist", "--name", "failskills", "-d", "--remote-control", repoDir}); rc != 7 {
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "failskills", "-d", "--remote-control", repoDir}); rc != 7 {
 		t.Fatalf("expected rc=7 on setupGuestSkills ExitError, got rc=%d, stderr=%q", rc, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "[agbox] ERROR:") || !strings.Contains(stderr.String(), "mount permission denied") {
@@ -3391,7 +3444,7 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 		return msb.CommandResult{}, nil
 	}
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "false", repoDir}); rc != 23 {
+	if rc := app.dispatch(ctx, []string{"run", "--cmd", "false", repoDir}); rc != 23 {
 		t.Fatalf("expected --cmd ExitError passthrough rc=23, got rc=%d, stderr=%q", rc, stderr.String())
 	}
 	if strings.Contains(stderr.String(), "[agbox] ERROR:") {
@@ -3510,7 +3563,7 @@ esac
 	app.Stdin = devNull
 	stdout.Reset()
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "echo hello"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--cmd", "echo hello"}); rc != 0 {
 		t.Fatalf("run --cmd with /dev/null stdin failed rc=%d, stdout=%q, stderr=%q", rc, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "CMD_OUT_STREAM") {
@@ -3532,7 +3585,7 @@ esac
 	app.Stdin = pipeR
 	stdout.Reset()
 	stderr.Reset()
-	if rc := app.Dispatch(ctx, []string{"run", "--cmd", "cat"}); rc != 0 {
+	if rc := app.dispatch(ctx, []string{"run", "--cmd", "cat"}); rc != 0 {
 		_ = pipeR.Close()
 		t.Fatalf("run --cmd with piped stdin failed rc=%d, stdout=%q, stderr=%q", rc, stdout.String(), stderr.String())
 	}
@@ -3559,7 +3612,7 @@ esac
 					app.Stdin = slave
 					stdout.Reset()
 					stderr.Reset()
-					if rc := app.Dispatch(ctx, []string{"run", "--cmd", "echo tty-cmd"}); rc != 0 {
+					if rc := app.dispatch(ctx, []string{"run", "--cmd", "echo tty-cmd"}); rc != 0 {
 						t.Fatalf("run --cmd with TTY stdin failed rc=%d, stdout=%q, stderr=%q", rc, stdout.String(), stderr.String())
 					}
 					if !strings.Contains(stdout.String(), "CMD_OUT_STREAM") || !strings.Contains(stderr.String(), "CMD_ERR_STREAM") {
@@ -3616,10 +3669,2528 @@ esac
 		}
 		return msb.CommandResult{}, nil
 	}
-	if rc := app2.Dispatch(ctx, []string{"run", "--persist", "--name", "cmdp", "--cmd", "echo ok"}); rc != 0 {
+	if rc := app2.dispatch(ctx, []string{"run", "--persist", "--name", "cmdp", "--cmd", "echo ok"}); rc != 0 {
 		t.Fatalf("persistent --cmd resume failed rc=%d, stderr=%q", rc, stderr2.String())
 	}
 	if !strings.Contains(stdout2.String(), "PERSIST_CMD_STDOUT") || !strings.Contains(stderr2.String(), "PERSIST_CMD_STDERR") {
 		t.Errorf("expected persistent --cmd stdout/stderr, got stdout=%q stderr=%q", stdout2.String(), stderr2.String())
+	}
+}
+
+func TestServeAntigravityRejection(t *testing.T) {
+	app, _, _, stderr := newTestApp(t)
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Snapshot:  "agbox:v1",
+		Agent:     "both",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	projDir := filepath.Join(app.Env.HomeReal, "proj-serve-err")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	rc := app.dispatch(ctx, []string{"run", "--serve", "antigravity", projDir})
+	if rc == 0 {
+		t.Fatal("expected run --serve antigravity to fail")
+	}
+	if !strings.Contains(stderr.String(), "--serve supports only the opencode agent") {
+		t.Errorf("expected error to mention '--serve supports only the opencode agent', got %q", stderr.String())
+	}
+}
+
+func TestUpdateExecStreamingFlags(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Snapshot:  "agbox:v1",
+		Agent:     "both",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.snapshots = "agbox:v1 1m 100M\n"
+
+	var execCalls []msb.CommandRequest
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" {
+			execCalls = append(execCalls, req)
+			var isBash, isSh bool
+			for i, arg := range req.Args {
+				if arg == "bash" && i+1 < len(req.Args) && req.Args[i+1] == "-c" {
+					isBash = true
+				}
+				if arg == "sh" && i+1 < len(req.Args) && req.Args[i+1] == "-c" {
+					isSh = true
+				}
+			}
+			lastArg := req.Args[len(req.Args)-1]
+			if isSh && strings.Contains(lastArg, "version.txt") {
+				return msb.CommandResult{Stdout: "1.0.0\n"}, nil
+			}
+			if isSh && strings.Contains(lastArg, "binpath.txt") {
+				elf := []byte("\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00" + strings.Repeat("\x00", 100))
+				if req.Stdout != nil {
+					_, _ = req.Stdout.Write(elf)
+				}
+				return msb.CommandResult{Stdout: string(elf)}, nil
+			}
+			if isBash {
+				return msb.CommandResult{}, nil
+			}
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	ctx := context.Background()
+	rc := app.dispatch(ctx, []string{"update", "opencode"})
+	if rc != 0 {
+		t.Fatalf("update failed rc=%d, stdout=%s, stderr=%s", rc, stdout.String(), stderr.String())
+	}
+	foundUpd := false
+	foundVer := false
+	foundStream := false
+	for _, call := range execCalls {
+		var isBash, isSh bool
+		for i, arg := range call.Args {
+			if arg == "bash" && i+1 < len(call.Args) && call.Args[i+1] == "-c" {
+				isBash = true
+			}
+			if arg == "sh" && i+1 < len(call.Args) && call.Args[i+1] == "-c" {
+				isSh = true
+			}
+		}
+		lastArg := call.Args[len(call.Args)-1]
+		if isBash {
+			foundUpd = true
+			if !slices.Contains(call.Args, "--stream") || !slices.Contains(call.Args, "--no-stdin") {
+				t.Errorf("updScript missing --stream or --no-stdin: %v", call.Args)
+			}
+		}
+		if isSh && strings.Contains(lastArg, "version.txt") {
+			foundVer = true
+			if !slices.Contains(call.Args, "--stream") || !slices.Contains(call.Args, "--no-stdin") {
+				t.Errorf("verCmd missing --stream or --no-stdin: %v", call.Args)
+			}
+		}
+		if isSh && strings.Contains(lastArg, "binpath.txt") {
+			foundStream = true
+			if !slices.Contains(call.Args, "--stream") || !slices.Contains(call.Args, "--no-stdin") {
+				t.Errorf("streamCmd missing --stream or --no-stdin: %v", call.Args)
+			}
+		}
+	}
+	if !foundUpd || !foundVer || !foundStream {
+		t.Errorf("expected updScript (%v), verCmd (%v), and streamCmd (%v) calls", foundUpd, foundVer, foundStream)
+	}
+}
+
+type raceTeardownRunner struct {
+	base               *fakeMSBRunner
+	cancel             context.CancelFunc
+	canceledDuringExec bool
+	stoppedWithProfile bool
+	removedWithForce   bool
+	stopBeforeRm       bool
+	stopCtxNonCanceled bool
+	rmCtxNonCanceled   bool
+}
+
+func (r *raceTeardownRunner) Run(callCtx context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
+	if len(req.Args) >= 1 && req.Args[0] == "ls" {
+		return msb.CommandResult{Stdout: r.base.sandboxes}, nil
+	}
+	if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+		return msb.CommandResult{Stdout: r.base.snapshots}, nil
+	}
+	if len(req.Args) >= 1 && req.Args[0] == "exec" {
+		cmdStr := strings.Join(req.Args, " ")
+		if strings.Contains(cmdStr, "sleep 10") {
+			r.canceledDuringExec = true
+			r.cancel()
+			return msb.CommandResult{ExitCode: 130}, callCtx.Err()
+		}
+	}
+	if len(req.Args) >= 3 && req.Args[0] == "stop" && req.Args[1] == "-t" && req.Args[2] == "10" {
+		r.stoppedWithProfile = true
+		if callCtx.Err() == nil {
+			r.stopCtxNonCanceled = true
+		}
+		return msb.CommandResult{}, nil
+	}
+	if len(req.Args) >= 2 && req.Args[0] == "rm" && req.Args[1] == "-f" {
+		r.removedWithForce = true
+		if r.stoppedWithProfile {
+			r.stopBeforeRm = true
+		}
+		if callCtx.Err() == nil {
+			r.rmCtxNonCanceled = true
+		}
+		return msb.CommandResult{}, nil
+	}
+	return r.base.Run(callCtx, req)
+}
+
+func TestSignalCancellationSynchronousTeardownUnderRace(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Snapshot:  "agbox:v1",
+		Agent:     "both",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.snapshots = "agbox:v1 1m 100M\n"
+
+	if err := os.MkdirAll(filepath.Join(app.Env.MSBHome, "volumes", "agbox-profile-raceprof"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app.Env.MSBHome, "volumes", "agbox-profile-raceprof", "disk.raw"), []byte("DISK"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	projDir := filepath.Join(app.Env.HomeReal, "proj-race")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	raceRunner := &raceTeardownRunner{
+		base:   runner,
+		cancel: cancel,
+	}
+	app.MSB = raceRunner
+
+	rc := app.dispatch(ctx, []string{"run", "opencode", "--name", "racesbx", "--profile", "raceprof", "--cmd", "sleep 10", projDir})
+	if rc == 0 {
+		t.Fatal("expected canceled run to exit with non-zero")
+	}
+
+	destroyedCleanly := raceRunner.canceledDuringExec &&
+		raceRunner.stoppedWithProfile &&
+		raceRunner.removedWithForce &&
+		raceRunner.stopBeforeRm &&
+		raceRunner.stopCtxNonCanceled &&
+		raceRunner.rmCtxNonCanceled
+
+	if !destroyedCleanly {
+		t.Errorf("expected clean destroySandbox execution on cancellation: %s", stderr.String())
+	}
+
+	lock, err := persist.LockProfile(app.Env.DataDir, "raceprof")
+	if err != nil {
+		t.Fatalf("expected profile lock to be released after cancellation, got err: %v", err)
+	}
+	_ = lock.Unlock()
+}
+
+func TestReapOrphanRunsFlushesProfileDisk(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+
+	dirID := "orphan1"
+	sbName := "agbox-orphan1"
+	runDir := filepath.Join(app.Env.DataDir, "run", dirID)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(runDir, "run.meta"), config.RunMeta{
+		Sandbox:  sbName,
+		OwnerPID: 999999,
+		Profile:  "orphanprof",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner.sandboxes = fmt.Sprintf("NAME STATE\nagbox-base stopped\n%s running\n", sbName)
+	runner.calls = nil
+
+	app.reapOrphanRuns(context.Background())
+
+	stopIdx := -1
+	rmIdx := -1
+	for i, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", sbName}) {
+			stopIdx = i
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", sbName}) {
+			rmIdx = i
+		}
+	}
+	if stopIdx == -1 {
+		t.Errorf("expected stop -t 10 call for running profile orphan sandbox, calls: %v", runner.calls)
+	}
+	if rmIdx == -1 {
+		t.Errorf("expected rm -f call for orphan sandbox, calls: %v", runner.calls)
+	}
+	if stopIdx != -1 && rmIdx != -1 && stopIdx >= rmIdx {
+		t.Errorf("expected stop -t 10 (idx %d) before rm -f (idx %d)", stopIdx, rmIdx)
+	}
+}
+
+func TestSuspendFlushesProfileDisk(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+
+	sbName := "agbox-suspprof"
+	dirID := "suspprof"
+	runDir := filepath.Join(app.Env.DataDir, "run", dirID)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(runDir, "run.meta"), config.RunMeta{
+		Sandbox:  sbName,
+		OwnerPID: app.PID,
+		Profile:  "myprofile",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner.sandboxes = fmt.Sprintf("NAME STATE\nagbox-base stopped\n%s running\n", sbName)
+	runner.calls = nil
+
+	ctx := context.Background()
+	if rc := app.dispatch(ctx, []string{"suspend", sbName}); rc != 0 {
+		t.Fatalf("suspend failed (rc=%d): %s", rc, stderr.String())
+	}
+
+	foundStopFlush := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", sbName}) {
+			foundStopFlush = true
+			break
+		}
+	}
+	if !foundStopFlush {
+		t.Errorf("expected msb stop -t 10 %s on profile sandbox suspend, calls: %v", sbName, runner.calls)
+	}
+}
+
+func TestStopFailureBoundaryPreservesState(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+
+	sbName := "agbox-failstop"
+	dirID := "failstop"
+	runDir := filepath.Join(app.Env.DataDir, "run", dirID)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(runDir, "run.meta")
+	if err := config.SaveRunMeta(metaPath, config.RunMeta{
+		Sandbox:  sbName,
+		OwnerPID: app.PID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runner.sandboxes = fmt.Sprintf("NAME STATE\nagbox-base stopped\n%s running\n", sbName)
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 2 && req.Args[0] == "rm" && req.Args[1] == "-f" {
+			return msb.CommandResult{ExitCode: 1, Stderr: "simulated backend destroy failure"}, errors.New("backend failure")
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	ctx := context.Background()
+	rc := app.dispatch(ctx, []string{"stop", sbName})
+	if rc == 0 {
+		t.Fatal("expected stop to fail when destroySandbox fails")
+	}
+
+	if _, err := os.Stat(runDir); err != nil {
+		t.Errorf("expected runDir %s to be preserved, got error: %v", runDir, err)
+	}
+	if _, err := os.Stat(metaPath); err != nil {
+		t.Errorf("expected run.meta %s to be preserved, got error: %v", metaPath, err)
+	}
+	deletingMarker := filepath.Join(runDir, "deleting")
+	if _, err := os.Stat(deletingMarker); !os.IsNotExist(err) {
+		t.Errorf("expected deleting marker to be removed after failure, found: %v", err)
+	}
+}
+
+func TestShareMutationsRollbackOnSaveMetaError(t *testing.T) {
+	app, _, _, _ := newTestApp(t)
+	ctx := context.Background()
+
+	sbName := "agbox-shroll"
+	dirID := "shroll"
+	runDir := filepath.Join(app.Env.DataDir, "run", dirID)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sockPath := filepath.Join(runDir, "ws.sock")
+
+	var hubCommands []string
+	hubLn, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hubLn.Close()
+
+	go func() {
+		for {
+			conn, lErr := hubLn.Accept()
+			if lErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				n, _ := c.Read(buf)
+				hubCommands = append(hubCommands, strings.TrimSpace(string(buf[:n])))
+				_, _ = c.Write([]byte("{\"ok\":true,\"share\":{\"guest_name\":\"sh\"}}\n"))
+			}(conn)
+		}
+	}()
+
+	shareDir := filepath.Join(app.Env.HomeReal, "hot-shroll")
+	if err := os.MkdirAll(shareDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	initialMeta := config.RunMeta{
+		Sandbox:  sbName,
+		OwnerPID: app.PID,
+		Shares: []config.ShareRecord{
+			{Index: 0, GuestName: "hot", HostPath: shareDir, AccessMode: "rw", ReadOnly: false, VCSPolicy: config.VCSAllow},
+		},
+	}
+	blockerFile := filepath.Join(runDir, "not-a-dir")
+	if err := os.WriteFile(blockerFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badMetaPath := filepath.Join(blockerFile, "run.meta")
+
+	addOpts := shareOpts{Target: shareDir, Alias: "hot2"}
+	errAdd := app.addSandboxShare(ctx, addOpts, true, runDir, badMetaPath, initialMeta)
+	if errAdd == nil {
+		t.Error("expected addSandboxShare to fail when SaveRunMeta fails")
+	}
+
+	setOpts := shareOpts{Target: "hot", HasAccess: true, ReadOnly: true}
+	errSet := app.setSandboxShare(ctx, setOpts, true, runDir, badMetaPath, initialMeta)
+	if errSet == nil {
+		t.Error("expected setSandboxShare to fail when SaveRunMeta fails")
+	}
+
+	rmOpts := shareOpts{Target: "hot"}
+	errRm := app.removeSandboxShare(ctx, rmOpts, true, runDir, badMetaPath, initialMeta)
+	if errRm == nil {
+		t.Error("expected removeSandboxShare to fail when SaveRunMeta fails")
+	}
+}
+
+func TestEnsureProfileVolumeRollbackOnSaveMetaError(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 2 && req.Args[0] == "volume" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: ""}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	origDir := app.Env.DataDir
+	app.Env.DataDir = "/dev/null/impossible"
+	defer func() { app.Env.DataDir = origDir }()
+
+	ctx := context.Background()
+	_, err := app.ensureProfileVolume(ctx, "myvol", "1G")
+	if err == nil {
+		t.Fatal("expected ensureProfileVolume to fail when SaveProfileMeta fails")
+	}
+
+	foundVolRm := false
+	for _, c := range runner.calls {
+		if len(c.Args) >= 3 && c.Args[0] == "volume" && c.Args[1] == "rm" && c.Args[2] == "agbox-profile-myvol" {
+			foundVolRm = true
+			break
+		}
+	}
+	if !foundVolRm {
+		t.Errorf("expected volume rm rollback call, calls: %v", runner.calls)
+	}
+}
+
+func TestVersionCommandAndFlag(t *testing.T) {
+	app, _, stdout, _ := newTestApp(t)
+	ctx := context.Background()
+
+	stdout.Reset()
+	if rc := app.dispatch(ctx, []string{"--version"}); rc != 0 {
+		t.Fatalf("expected --version rc=0, got %d", rc)
+	}
+	if stdout.String() != fmt.Sprintf("agbox %s\n", version) {
+		t.Errorf("expected %q, got %q", fmt.Sprintf("agbox %s\n", version), stdout.String())
+	}
+
+	stdout.Reset()
+	if rc := app.dispatch(ctx, []string{"version"}); rc != 0 {
+		t.Fatalf("expected version rc=0, got %d", rc)
+	}
+	if stdout.String() != fmt.Sprintf("agbox %s\n", version) {
+		t.Errorf("expected %q, got %q", fmt.Sprintf("agbox %s\n", version), stdout.String())
+	}
+
+	opts, err := parseGlobalArgs([]string{"--version"})
+	if err != nil || opts.Mode != "version" {
+		t.Errorf("ParseGlobalArgs(--version) = %+v, %v", opts, err)
+	}
+	opts, err = parseGlobalArgs([]string{"version"})
+	if err != nil || opts.Mode != "version" {
+		t.Errorf("ParseGlobalArgs(version) = %+v, %v", opts, err)
+	}
+
+	if rc := Main([]string{"--version"}); rc != 0 {
+		t.Errorf("Main(--version) = %d, want 0", rc)
+	}
+	if rc := Main([]string{"version"}); rc != 0 {
+		t.Errorf("Main(version) = %d, want 0", rc)
+	}
+}
+
+func TestSignaledChildExitCode(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "kill -TERM $$")
+	err := cmd.Run()
+	if err != nil {
+		wrapped := wrapPassthroughExit(msb.CommandResult{}, err)
+		var passErr passthroughExitError
+		if errors.As(wrapped, &passErr) {
+			if passErr.code != 128+int(syscall.SIGTERM) {
+				t.Errorf("expected code %d for SIGTERM, got %d", 128+int(syscall.SIGTERM), passErr.code)
+			}
+		} else {
+			t.Errorf("expected passthroughExitError for signaled child, got %v", wrapped)
+		}
+	}
+}
+
+func TestCliHelperFunctionsAndEdgeCases(t *testing.T) {
+	if !isAgboxSnapshotName("agbox:v1") || !isAgboxSnapshotName("agbox:v99") {
+		t.Error("expected valid agbox:vN to match")
+	}
+	if isAgboxSnapshotName("custom:v1") || isAgboxSnapshotName("ubuntu:latest") {
+		t.Error("expected invalid snapshot names not to match")
+	}
+
+	td := t.TempDir()
+	_ = supportsUserXattr(td, true)
+	_ = checkKVMAccess()
+
+	app, _, stdout, _ := newTestApp(t)
+	ctx := context.Background()
+	for _, sub := range []string{"rules", "share", "update", "profile", "auth", "skills"} {
+		stdout.Reset()
+		rc := app.dispatch(ctx, []string{sub, "--help"})
+		if rc != 0 {
+			t.Errorf("expected %s --help rc=0, got %d", sub, rc)
+		}
+		if sub == "share" {
+			if !strings.Contains(stdout.String(), "unless you pass --rw or :rw.") {
+				t.Errorf("share --help missing active-voice text: %s", stdout.String())
+			}
+			if !strings.Contains(stdout.String(), "unless you pass --force.") {
+				t.Errorf("share --help missing active-voice text: %s", stdout.String())
+			}
+		}
+	}
+
+	docsDir := filepath.Join(td, "docs")
+	codeDir := filepath.Join(td, "code")
+	_ = os.MkdirAll(docsDir, 0o700)
+	_ = os.MkdirAll(codeDir, 0o700)
+	symlinkPath := filepath.Join(td, "docs-link")
+	_ = os.Symlink(docsDir, symlinkPath)
+
+	shares := []config.ShareRecord{
+		{Index: 0, GuestName: "docs", HostPath: filepath.Clean(docsDir)},
+		{Index: 1, GuestName: "code", HostPath: filepath.Clean(codeDir)},
+	}
+	if idx, err := findShareRecordIndex(shares, "/workspace/docs"); err != nil || idx != 0 {
+		t.Errorf("findShareRecordIndex(/workspace/docs) = %d, %v", idx, err)
+	}
+	if idx, err := findShareRecordIndex(shares, "code"); err != nil || idx != 1 {
+		t.Errorf("findShareRecordIndex(code) = %d, %v", idx, err)
+	}
+	if idx, err := findShareRecordIndex(shares, docsDir); err != nil || idx != 0 {
+		t.Errorf("findShareRecordIndex(hostPath) = %d, %v", idx, err)
+	}
+	if idx, err := findShareRecordIndex(shares, symlinkPath); err != nil || idx != 0 {
+		t.Errorf("findShareRecordIndex(symlink) = %d, %v", idx, err)
+	}
+	if _, err := findShareRecordIndex(shares, "nonexistent"); err == nil {
+		t.Error("expected error for nonexistent share")
+	}
+
+	if _, err := parseStatusArgs([]string{"--help"}); !errors.Is(err, errHelp) {
+		t.Errorf("ParseStatusArgs(--help) expected ErrHelp, got %v", err)
+	}
+	if _, err := parseStatusArgs([]string{"-h"}); !errors.Is(err, errHelp) {
+		t.Errorf("ParseStatusArgs(-h) expected ErrHelp, got %v", err)
+	}
+	if _, err := parseStatusArgs([]string{"--bogus"}); err == nil {
+		t.Error("ParseStatusArgs(--bogus) expected error")
+	}
+	if _, err := parseSetupArgs([]string{"-h"}); !errors.Is(err, errHelp) {
+		t.Errorf("ParseSetupArgs(-h) expected ErrHelp, got %v", err)
+	}
+	if _, err := parseSetupArgs([]string{"--bogus"}); err == nil {
+		t.Error("ParseSetupArgs(--bogus) expected error")
+	}
+
+	if aOpts, err := parseAuthArgs([]string{"logout", "antigravity"}); err != nil || aOpts.Action != "logout" || aOpts.Target != "antigravity" {
+		t.Errorf("ParseAuthArgs(logout antigravity) = %+v, %v", aOpts, err)
+	}
+	if aOpts, err := parseAuthArgs([]string{"logout", "all"}); err != nil || aOpts.Action != "logout" || aOpts.Target != "all" {
+		t.Errorf("ParseAuthArgs(logout all) = %+v, %v", aOpts, err)
+	}
+	if _, err := parseAuthArgs([]string{"logout", "invalid"}); err == nil {
+		t.Error("ParseAuthArgs(logout invalid) expected error")
+	}
+
+	app.Env.RootDisk = "0"
+	if err := app.ensureSparseRootDiskSize(ctx, false); err != nil {
+		t.Errorf("ensureSparseRootDiskSize with 0 expected nil, got %v", err)
+	}
+	app.Env.RootDisk = "invalid"
+	if err := app.ensureSparseRootDiskSize(ctx, false); err != nil {
+		t.Errorf("ensureSparseRootDiskSize with invalid expected nil, got %v", err)
+	}
+
+	runDir := filepath.Join(app.Env.DataDir, "run", "susp1")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(runDir, "suspended"), config.RunMeta{
+		Sandbox: "agbox-susp1",
+		Shares:  shares,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	if err := app.listSandboxShares("agbox-susp1", false, runDir, config.RunMeta{Shares: shares}); err != nil {
+		t.Errorf("listSandboxShares on suspended sandbox returned error: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "/workspace/docs") {
+		t.Errorf("expected docs share in output, got: %s", stdout.String())
+	}
+
+	prodApp, _ := newApp()
+	if prodApp != nil {
+		_ = prodApp.isRoot()
+	}
+}
+
+func TestNoMaskStatVirtModes(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Snapshot:  "agbox:v1",
+		Agent:     "both",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app.Env.MaskVCS = config.MaskOff
+
+	projDir := filepath.Join(app.Env.HomeReal, "nomask-proj")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var restoreArgs []string
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
+			restoreArgs = slices.Clone(req.Args)
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	ctx := context.Background()
+	_ = app.dispatch(ctx, []string{"run", "--no-mask", "--ro", "--cmd", "id", projDir})
+	foundRO := false
+	for _, a := range restoreArgs {
+		if strings.Contains(a, "ro,stat-virt=relaxed,uid=1000,gid=1000") {
+			foundRO = true
+			break
+		}
+	}
+	if !foundRO {
+		t.Errorf("expected ro,stat-virt=relaxed for read-only direct share, got: %v", restoreArgs)
+	}
+}
+
+func TestSignalExitCode128PlusSignal(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "kill -TERM $$")
+	realErr := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(realErr, &exitErr) {
+		t.Skip("real *exec.ExitError unavailable on this platform")
+	}
+	ws, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !ws.Signaled() || ws.Signal() != syscall.SIGTERM {
+		t.Skip("subprocess was not terminated by SIGTERM")
+	}
+	wantCode := 128 + int(syscall.SIGTERM)
+	if wantCode != 143 {
+		t.Fatalf("expected wantCode 143, got %d", wantCode)
+	}
+
+	// 1. Direct wrapPassthroughExit verification.
+	wrapped := wrapPassthroughExit(msb.CommandResult{}, realErr)
+	var passErr passthroughExitError
+	if !errors.As(wrapped, &passErr) {
+		t.Fatalf("wrapPassthroughExit returned %T (%v), want passthroughExitError", wrapped, wrapped)
+	}
+	if passErr.code != wantCode {
+		t.Fatalf("wrapPassthroughExit code = %d, want %d", passErr.code, wantCode)
+	}
+
+	// 2. Dispatch verification with runner returning the signaled exit error.
+	app, runner, _, _ := newTestApp(t)
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Snapshot:  "agbox:v1",
+		Agent:     "opencode",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.snapshots = "agbox:v1 1m 100M\n"
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" {
+			return msb.CommandResult{ExitCode: wantCode}, realErr
+		}
+		return msb.CommandResult{}, nil
+	}
+	projDir := filepath.Join(app.Env.HomeReal, "proj-term")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rc := app.dispatch(context.Background(), []string{"run", "opencode", "--name", "test-term", "--cmd", "exit", projDir})
+	if rc != wantCode {
+		t.Fatalf("Dispatch exit code = %d, want %d", rc, wantCode)
+	}
+}
+
+func TestAuthAndRemoteControlExecStreamFlags(t *testing.T) {
+	// 1. App.Auth capScript must pass --stream and --no-stdin.
+	t.Run("AuthCapScriptStreamFlags", func(t *testing.T) {
+		app, runner, _, _ := newTestApp(t)
+		if err := config.SaveFile(app.Env.ConfigFile, config.State{
+			Snapshot:  "agbox:v1",
+			Agent:     "opencode",
+			SnapCount: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		fakeGuestHome := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(fakeGuestHome, ".local", "share", "opencode"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(fakeGuestHome, ".local", "share", "opencode", "auth.json"), []byte(`{"anthropic":{"type":"oauth","access":"secret"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+		runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
+		runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+			if len(req.Args) >= 1 && req.Args[0] == "ls" {
+				return msb.CommandResult{Stdout: runner.sandboxes}, nil
+			}
+			if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+				return msb.CommandResult{Stdout: runner.snapshots}, nil
+			}
+			if len(req.Args) >= 6 && req.Args[0] == "exec" && strings.Contains(req.Args[len(req.Args)-1], "printf 'FILE ") {
+				script := strings.ReplaceAll(req.Args[len(req.Args)-1], config.GuestHome, fakeGuestHome)
+				cmd := exec.Command("/bin/sh", "-c", script)
+				cmd.Env = []string{"HOME=" + fakeGuestHome, "PATH=/usr/bin:/bin"}
+				out, cErr := cmd.Output()
+				return msb.CommandResult{Stdout: string(out)}, cErr
+			}
+			return msb.CommandResult{}, nil
+		}
+
+		err := app.auth(context.Background(), []string{"opencode"})
+		if err != nil {
+			t.Fatalf("Auth failed: %v", err)
+		}
+
+		var foundCap bool
+		for _, c := range runner.calls {
+			if len(c.Args) >= 1 && c.Args[0] == "exec" && strings.Contains(strings.Join(c.Args, " "), "printf 'FILE ") {
+				foundCap = true
+				if !slices.Contains(c.Args, "--stream") {
+					t.Errorf("expected --stream in auth capScript exec args: %v", c.Args)
+				}
+				if !slices.Contains(c.Args, "--no-stdin") {
+					t.Errorf("expected --no-stdin in auth capScript exec args: %v", c.Args)
+				}
+			}
+		}
+		if !foundCap {
+			t.Fatal("auth capScript exec was not called")
+		}
+	})
+
+	// 2. RunModeRemoteControl start and status must pass --stream and --no-stdin.
+	t.Run("RemoteControlStartAndStatusStreamFlags", func(t *testing.T) {
+		app, runner, _, _ := newTestApp(t)
+		if err := config.SaveFile(app.Env.ConfigFile, config.State{
+			Snapshot:  "agbox:v1",
+			Agent:     "both",
+			SnapCount: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+		runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
+
+		projDir := filepath.Join(app.Env.HomeReal, "proj-rc-stream")
+		if err := os.MkdirAll(projDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		rc := app.dispatch(context.Background(), []string{"run", "--name", "rcstream", "-d", "--remote-control", projDir})
+		if rc != 0 {
+			t.Fatalf("Dispatch run -d --remote-control failed with rc=%d", rc)
+		}
+
+		var foundStart, foundStatus bool
+		for _, c := range runner.calls {
+			cmdStr := strings.Join(c.Args, " ")
+			if strings.Contains(cmdStr, "agy remote-control start") {
+				foundStart = true
+				if !slices.Contains(c.Args, "--stream") {
+					t.Errorf("expected --stream in remote-control start args: %v", c.Args)
+				}
+				if !slices.Contains(c.Args, "--no-stdin") {
+					t.Errorf("expected --no-stdin in remote-control start args: %v", c.Args)
+				}
+			}
+			if strings.Contains(cmdStr, "agy remote-control status") {
+				foundStatus = true
+				if !slices.Contains(c.Args, "--stream") {
+					t.Errorf("expected --stream in remote-control status args: %v", c.Args)
+				}
+				if !slices.Contains(c.Args, "--no-stdin") {
+					t.Errorf("expected --no-stdin in remote-control status args: %v", c.Args)
+				}
+			}
+		}
+		if !foundStart {
+			t.Fatal("agy remote-control start was not called")
+		}
+		if !foundStatus {
+			t.Fatal("agy remote-control status was not called")
+		}
+	})
+}
+
+func TestCreateBaseAndEditBaseTeardownUnderCanceledContext(t *testing.T) {
+	// 1. CreateBase deferred rollback under canceled context.
+	t.Run("CreateBaseRollback", func(t *testing.T) {
+		app, runner, _, _ := newTestApp(t)
+		parentCtx, cancelParent := context.WithCancel(context.Background())
+		defer cancelParent()
+
+		var rollbackCalled bool
+		var rollbackCtxErr error
+
+		runner.ctxHandler = func(callCtx context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
+			if len(req.Args) >= 1 && req.Args[0] == "ls" {
+				return msb.CommandResult{Stdout: "NAME STATE\n"}, nil
+			}
+			if len(req.Args) >= 1 && req.Args[0] == "create" {
+				return msb.CommandResult{}, nil
+			}
+			if len(req.Args) >= 1 && req.Args[0] == "exec" {
+				cancelParent()
+				return msb.CommandResult{ExitCode: 1}, errors.New("simulated provisioning failure")
+			}
+			if slices.Equal(req.Args, []string{"rm", "-f", config.BaseSandbox}) {
+				rollbackCalled = true
+				rollbackCtxErr = callCtx.Err()
+				return msb.CommandResult{}, nil
+			}
+			return msb.CommandResult{}, nil
+		}
+
+		err := app.createBase(parentCtx, []string{"--force", "opencode"})
+		if err == nil {
+			t.Fatal("expected CreateBase to fail when canceled during provisioning")
+		}
+		if parentCtx.Err() == nil {
+			t.Fatal("expected parent context to be canceled")
+		}
+		if !rollbackCalled {
+			t.Fatal("expected deferred rollback 'rm -f agbox-base' to be called")
+		}
+		if rollbackCtxErr != nil {
+			t.Fatalf("expected callCtx.Err() == nil during rollback, got %v", rollbackCtxErr)
+		}
+		for _, c := range runner.calls {
+			if slices.Equal(c.Args, []string{"rm", "-f", config.BaseSandbox}) {
+				if c.CtxErr != nil {
+					t.Fatalf("expected c.CtxErr == nil at call time, got %v", c.CtxErr)
+				}
+			}
+		}
+	})
+
+	// 2. EditBase deferred stop under canceled context.
+	t.Run("EditBaseStop", func(t *testing.T) {
+		app, runner, _, _ := newTestApp(t)
+		if err := config.SaveFile(app.Env.ConfigFile, config.State{
+			Agent:     "opencode",
+			Image:     "node:24-bookworm-slim",
+			Snapshot:  "agbox:v1",
+			SnapCount: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+		runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
+
+		parentCtx, cancelParent := context.WithCancel(context.Background())
+		defer cancelParent()
+
+		var stopCalled bool
+		var stopCtxErr error
+
+		runner.ctxHandler = func(callCtx context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
+			if len(req.Args) >= 1 && req.Args[0] == "ls" {
+				return msb.CommandResult{Stdout: runner.sandboxes}, nil
+			}
+			if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+				return msb.CommandResult{Stdout: runner.snapshots}, nil
+			}
+			if len(req.Args) >= 1 && req.Args[0] == "start" {
+				return msb.CommandResult{}, nil
+			}
+			if len(req.Args) >= 1 && req.Args[0] == "exec" {
+				cancelParent()
+				return msb.CommandResult{ExitCode: 1}, errors.New("simulated edit failure")
+			}
+			if slices.Equal(req.Args, []string{"stop", config.BaseSandbox}) {
+				stopCalled = true
+				stopCtxErr = callCtx.Err()
+				return msb.CommandResult{}, nil
+			}
+			return msb.CommandResult{}, nil
+		}
+
+		err := app.editBase(parentCtx, []string{"--cmd", "true"})
+		if err == nil {
+			t.Fatal("expected EditBase to fail when canceled during provisioning command")
+		}
+		if parentCtx.Err() == nil {
+			t.Fatal("expected parent context to be canceled")
+		}
+		if !stopCalled {
+			t.Fatal("expected deferred stop 'stop agbox-base' to be called")
+		}
+		if stopCtxErr != nil {
+			t.Fatalf("expected callCtx.Err() == nil during stop, got %v", stopCtxErr)
+		}
+		for _, c := range runner.calls {
+			if slices.Equal(c.Args, []string{"stop", config.BaseSandbox}) {
+				if c.CtxErr != nil {
+					t.Fatalf("expected c.CtxErr == nil at call time, got %v", c.CtxErr)
+				}
+			}
+		}
+	})
+}
+
+func TestEnsureSparseRootDiskSizeExpansion(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+	baseDir := filepath.Join(app.Env.MSBHome, "sandboxes", config.BaseSandbox)
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	upperPath := filepath.Join(baseDir, "upper.ext4")
+	initialBytes := int64(1024 * 1024)
+	if err := os.WriteFile(upperPath, make([]byte, initialBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app.Env.RootDisk = "10M"
+	targetBytes := int64(10 * 1024 * 1024)
+	if err := app.ensureSparseRootDiskSize(context.Background(), false); err != nil {
+		t.Fatalf("ensureSparseRootDiskSize failed: %v", err)
+	}
+	st, err := os.Stat(upperPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != targetBytes {
+		t.Errorf("expected size %d, got %d", targetBytes, st.Size())
+	}
+
+	// Expand running sandbox and verify msb stop and start calls.
+	app.Env.RootDisk = "20M"
+	targetBytes2 := int64(20 * 1024 * 1024)
+	runner.calls = nil
+	if err := app.ensureSparseRootDiskSize(context.Background(), true); err != nil {
+		t.Fatalf("ensureSparseRootDiskSize running failed: %v", err)
+	}
+	st2, err := os.Stat(upperPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st2.Size() != targetBytes2 {
+		t.Errorf("expected size %d, got %d", targetBytes2, st2.Size())
+	}
+	var foundStop, foundStart bool
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", config.BaseSandbox}) {
+			foundStop = true
+		}
+		if slices.Equal(c.Args, []string{"start", config.BaseSandbox}) {
+			foundStart = true
+		}
+	}
+	if !foundStop || !foundStart {
+		t.Errorf("expected stop and start calls when isRunning is true, got %v", runner.calls)
+	}
+}
+
+func TestStopUnderCanceledContextFlushesProfile(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+	sbName := "agbox-run-7777"
+	runDir := filepath.Join(app.Env.DataDir, "run", "7777")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := config.RunMeta{
+		Sandbox:  sbName,
+		OwnerPID: app.PID,
+		Mode:     config.RunModeTUI,
+		Profile:  "prof-stop",
+	}
+	if err := config.SaveRunMeta(filepath.Join(runDir, "run.meta"), meta); err != nil {
+		t.Fatal(err)
+	}
+	runner.sandboxes = "NAME STATE\n" + sbName + " running\n"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := app.stop(ctx, []string{"--allow-root", sbName}); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+
+	var foundStop, foundRm bool
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", sbName}) {
+			foundStop = true
+			if c.CtxErr != nil {
+				t.Errorf("expected non-canceled context on stop, got error %v", c.CtxErr)
+			}
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", sbName}) {
+			foundRm = true
+			if c.CtxErr != nil {
+				t.Errorf("expected non-canceled context on rm, got error %v", c.CtxErr)
+			}
+		}
+	}
+	if !foundStop {
+		t.Error("expected stop -t 10 call before removal")
+	}
+	if !foundRm {
+		t.Error("expected rm -f call during Stop")
+	}
+}
+
+func TestRemoveFlushesRunningSandboxes(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+	runner.sandboxes = "NAME STATE\nagbox-base running\nagbox-run-100 running\nagbox-run-200 stopped\n"
+
+	if err := app.remove(context.Background(), []string{"--yes", "--allow-root"}); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+
+	var stopBase, rmBase, stop100, rm100, stop200, rm200 bool
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", config.BaseSandbox}) {
+			stopBase = true
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", config.BaseSandbox}) {
+			rmBase = true
+		}
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", "agbox-run-100"}) {
+			stop100 = true
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-run-100"}) {
+			rm100 = true
+		}
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", "agbox-run-200"}) {
+			stop200 = true
+		}
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-run-200"}) {
+			rm200 = true
+		}
+	}
+
+	if !stopBase || !rmBase {
+		t.Error("expected stop -t 10 and rm -f for running agbox-base")
+	}
+	if !stop100 || !rm100 {
+		t.Error("expected stop -t 10 and rm -f for running agbox-run-100")
+	}
+	if stop200 {
+		t.Error("expected no stop -t 10 call for stopped agbox-run-200")
+	}
+	if !rm200 {
+		t.Error("expected rm -f for stopped agbox-run-200")
+	}
+}
+
+func TestResumeRollbackFlushesProfileDisk(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+	sbName := "agbox-run-8888"
+	runDir := filepath.Join(app.Env.DataDir, "run", "8888")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := config.RunMeta{
+		Sandbox:      sbName,
+		OwnerPID:     app.PID,
+		Mode:         config.RunModeCmd,
+		Cmd:          "echo ok",
+		Agent:        "opencode",
+		Profile:      "prof-resume",
+		WorkspaceHub: false,
+		NoSkills:     true,
+		NoRules:      true,
+		NoAgentCache: true,
+	}
+	suspendedPath := filepath.Join(runDir, "suspended")
+	if err := config.SaveRunMeta(suspendedPath, meta); err != nil {
+		t.Fatal(err)
+	}
+
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	metaPath := filepath.Join(runDir, "run.meta")
+	volName := persist.FormatProfileVolumeName(meta.Profile)
+	runner.sandboxes = "NAME STATE\n" + sbName + " stopped\n"
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "volume" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: "NAME\n" + volName + "\n"}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "start" && req.Args[1] == sbName {
+			cancelParent()
+			_ = os.Remove(metaPath)
+			_ = os.MkdirAll(filepath.Join(metaPath, "keep"), 0o700)
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	defer func() {
+		_ = os.RemoveAll(metaPath)
+	}()
+
+	err := app.resume(parentCtx, []string{"--allow-root", sbName})
+	if err == nil {
+		t.Fatal("expected Resume to fail when SaveRunMeta fails")
+	}
+
+	var foundStopProfile bool
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "-t", "10", sbName}) {
+			foundStopProfile = true
+			if c.CtxErr != nil {
+				t.Errorf("expected non-canceled context during rollback stop, got error %v", c.CtxErr)
+			}
+		}
+	}
+	if !foundStopProfile {
+		t.Errorf("expected stop -t 10 call during SaveRunMeta rollback, got calls %v", runner.calls)
+	}
+}
+
+func TestExecStreamFlagsAndSmokeTest(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+	app.CheckKVM = func() error { return nil }
+	app.CheckFUSE = func() error { return nil }
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "exec" {
+			return msb.CommandResult{Stdout: "SMOKE-OK\n0\n"}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	if err := app.setup(context.Background(), []string{"--allow-root"}); err != nil {
+		t.Fatalf("Setup failed: %v", err)
+	}
+
+	var foundSmokeExec bool
+	for _, c := range runner.calls {
+		if len(c.Args) >= 1 && c.Args[0] == "exec" && strings.Contains(strings.Join(c.Args, " "), "SMOKE-OK") {
+			foundSmokeExec = true
+			if !slices.Contains(c.Args, "--stream") {
+				t.Errorf("expected --stream in smoke test exec: %v", c.Args)
+			}
+			if !slices.Contains(c.Args, "--no-stdin") {
+				t.Errorf("expected --no-stdin in smoke test exec: %v", c.Args)
+			}
+			idx := slices.Index(c.Args, "-u")
+			if idx == -1 || idx+1 >= len(c.Args) || c.Args[idx+1] != "root" {
+				t.Errorf("expected -u root in smoke test exec: %v", c.Args)
+			}
+		}
+	}
+	if !foundSmokeExec {
+		t.Fatal("smoke test exec was not called")
+	}
+
+	// Verify the 6 helper functions pass --stream and --no-stdin with -u root.
+	helperCalls := []struct {
+		name string
+		fn   func() error
+	}{
+		{"provisionGuestUser", func() error { return app.provisionGuestUser(context.Background(), "sb-test") }},
+		{"setupGuestSkills", func() error { return app.setupGuestSkills(context.Background(), "sb-test") }},
+		{"setupGuestRules", func() error { return app.setupGuestRules(context.Background(), "sb-test") }},
+		{"setupGuestProfile", func() error { return app.setupGuestProfile(context.Background(), "sb-test") }},
+		{"setupGuestAgents", func() error { return app.setupGuestAgents(context.Background(), "sb-test") }},
+		{"dropGuestVFSCaches", func() error { app.dropGuestVFSCaches(context.Background(), "sb-test"); return nil }},
+	}
+
+	for _, hc := range helperCalls {
+		t.Run(hc.name, func(t *testing.T) {
+			runner.calls = nil
+			if err := hc.fn(); err != nil {
+				t.Fatalf("%s failed: %v", hc.name, err)
+			}
+			if len(runner.calls) == 0 {
+				t.Fatalf("expected at least one call from %s", hc.name)
+			}
+			last := runner.calls[len(runner.calls)-1]
+			if !slices.Contains(last.Args, "--stream") {
+				t.Errorf("%s missing --stream: %v", hc.name, last.Args)
+			}
+			if !slices.Contains(last.Args, "--no-stdin") {
+				t.Errorf("%s missing --no-stdin: %v", hc.name, last.Args)
+			}
+			idx := slices.Index(last.Args, "-u")
+			if idx == -1 || idx+1 >= len(last.Args) || last.Args[idx+1] != "root" {
+				t.Errorf("%s missing -u root: %v", hc.name, last.Args)
+			}
+		})
+	}
+}
+
+func TestSetupInstallsDefaultEnvRuleAndPreservesRemoval(t *testing.T) {
+	ctx := context.Background()
+	app, runner, stdout, stderr := newTestApp(t)
+	app.CheckKVM = func() error { return nil }
+	app.CheckFUSE = func() error { return nil }
+
+	// 1. Setup installs default environment rule file.
+	if err := app.setup(ctx, []string{"--allow-root"}); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	rulePath := filepath.Join(app.Env.DataDir, "rules", persist.DefaultEnvRuleName+".md")
+	if info, err := os.Lstat(rulePath); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("expected rule file at %s with mode 0644, err=%v", rulePath, err)
+	}
+
+	// 2. Rules list displays installed default rule.
+	stdout.Reset()
+	if rc := app.dispatch(ctx, []string{"rules", "list"}); rc != 0 || !strings.Contains(stdout.String(), persist.DefaultEnvRuleName) {
+		t.Fatalf("rules list expected %s, rc=%d stdout=%s", persist.DefaultEnvRuleName, rc, stdout.String())
+	}
+
+	// 3. User removes default rule with rules rm.
+	if rc := app.dispatch(ctx, []string{"rules", "rm", persist.DefaultEnvRuleName}); rc != 0 {
+		t.Fatalf("rules rm failed with rc=%d: %s", rc, stderr.String())
+	}
+	if _, err := os.Lstat(rulePath); !os.IsNotExist(err) {
+		t.Fatalf("expected rule file deleted, got stat err=%v", err)
+	}
+
+	// 4. Subsequent run does not re-create deleted default rule.
+	runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "opencode",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	projDir := filepath.Join(app.Env.HomeReal, "repo-norules")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--cmd", "id -u", projDir}); rc != 0 {
+		t.Fatalf("run failed with rc=%d: %s", rc, stderr.String())
+	}
+	if _, err := os.Lstat(rulePath); !os.IsNotExist(err) {
+		t.Fatalf("expected rule to stay deleted after run, got stat err=%v", err)
+	}
+
+	// 5. Setup fails closed when rules dir is a symlink.
+	symApp, _, _, _ := newTestApp(t)
+	symApp.CheckKVM = func() error { return nil }
+	symApp.CheckFUSE = func() error { return nil }
+	outsideRules := filepath.Join(t.TempDir(), "outside-rules")
+	if err := os.MkdirAll(outsideRules, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rulesSymlink := filepath.Join(symApp.Env.DataDir, "rules")
+	if err := os.Symlink(outsideRules, rulesSymlink); err != nil {
+		t.Fatal(err)
+	}
+	if err := symApp.setup(ctx, []string{"--allow-root"}); err == nil {
+		t.Fatal("expected setup to fail closed when rules dir is a symlink")
+	}
+}
+
+func TestPassthroughExitErrorAndRuntimeHelpers(t *testing.T) {
+	inner := errors.New("exit 17")
+	pe := passthroughExitError{code: 17, err: inner}
+	if pe.Error() != "exit 17" {
+		t.Fatalf("passthroughExitError.Error() = %q, want %q", pe.Error(), "exit 17")
+	}
+	if !errors.Is(pe, inner) {
+		t.Fatalf("expected Unwrap to match inner error")
+	}
+
+	errWithStderr := formatMSBStderrOnlyError("capture auth", "line1\nline2\n", inner)
+	if !strings.Contains(errWithStderr.Error(), "line2") {
+		t.Errorf("expected stderr detail in %q", errWithStderr.Error())
+	}
+	errNoStderr := formatMSBStderrOnlyError("capture auth", "   ", inner)
+	if errNoStderr.Error() != "capture auth: exit 17" {
+		t.Errorf("unexpected empty-stderr format: %q", errNoStderr.Error())
+	}
+
+	if got := shortSHA256("abcdef"); got != "abcdef" {
+		t.Errorf("shortSHA256 short = %q", got)
+	}
+	if got := shortSHA256("0123456789abcdef0000"); got != "0123456789ab" {
+		t.Errorf("shortSHA256 long = %q", got)
+	}
+	if got := tailLines("a\nb\nc\nd\n", 2); got != "c\nd" {
+		t.Errorf("tailLines(2) = %q", got)
+	}
+
+	// Verify nil-default vs injected runtime helpers.
+	var bare appRuntime
+	if bare.euid() != config.GuestUID || bare.egid() != config.GuestGID {
+		t.Errorf("bare euid/egid = %d/%d", bare.euid(), bare.egid())
+	}
+	if bare.now().IsZero() {
+		t.Error("expected non-zero default time")
+	}
+	fixedNow := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	bare.Now = func() time.Time { return fixedNow }
+	bare.GetEGID = func() int { return 2222 }
+	if !bare.now().Equal(fixedNow) || bare.egid() != 2222 {
+		t.Errorf("injected now/egid mismatch")
+	}
+	if isFileTerminal(nil) {
+		t.Error("expected isFileTerminal(nil) == false")
+	}
+
+	// cmdNeedsNoStdin edge cases.
+	bare.Stdin = nil
+	if !bare.cmdNeedsNoStdin() {
+		t.Error("nil Stdin should report needsNoStdin=true")
+	}
+	bare.Stdin = strings.NewReader("")
+	if !bare.cmdNeedsNoStdin() {
+		t.Error("empty Reader should report needsNoStdin=true")
+	}
+	bare.Stdin = strings.NewReader("abc")
+	if bare.cmdNeedsNoStdin() {
+		t.Error("non-empty Reader should report needsNoStdin=false")
+	}
+	bare.Stdin = io.NopCloser(strings.NewReader("stream"))
+	if bare.cmdNeedsNoStdin() {
+		t.Error("unsized Reader should report needsNoStdin=false")
+	}
+	td := t.TempDir()
+	emptyReg := filepath.Join(td, "empty.txt")
+	nonEmptyReg := filepath.Join(td, "data.txt")
+	_ = os.WriteFile(emptyReg, nil, 0o600)
+	_ = os.WriteFile(nonEmptyReg, []byte("x"), 0o600)
+	fEmpty, err := os.Open(emptyReg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fEmpty.Close()
+	bare.Stdin = fEmpty
+	if !bare.cmdNeedsNoStdin() {
+		t.Error("empty regular file should report needsNoStdin=true")
+	}
+	fData, err := os.Open(nonEmptyReg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fData.Close()
+	bare.Stdin = fData
+	if bare.cmdNeedsNoStdin() {
+		t.Error("non-empty regular file should report needsNoStdin=false")
+	}
+
+	// Verify newApp leaves MSB untyped nil (not typed-nil *msb.ExecRunner) when msb is absent.
+	t.Setenv("PATH", td)
+	t.Setenv("HOME", td)
+	app, err := newApp()
+	if err != nil {
+		t.Fatalf("newApp without msb in PATH failed: %v", err)
+	}
+	if app.MSB != nil {
+		t.Fatalf("expected app.MSB == nil when msb is missing, got non-nil interface %T", app.MSB)
+	}
+	if err := app.ensureMSB(); err == nil {
+		t.Fatal("expected ensureMSB to fail when msb is absent from PATH")
+	}
+	fakeBin := filepath.Join(td, "msb")
+	if err := os.WriteFile(fakeBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.ensureMSB(); err != nil || app.MSB == nil {
+		t.Fatalf("expected ensureMSB to resolve fake msb from PATH, got %v", err)
+	}
+
+	// Main entry error and help paths.
+	if rc := Main([]string{"--help"}); rc != 0 {
+		t.Errorf("Main(--help) = %d, want 0", rc)
+	}
+	if rc := Main([]string{"--unknown-global"}); rc != 1 {
+		t.Errorf("Main(--unknown-global) = %d, want 1", rc)
+	}
+	t.Setenv("AGBOX_CPUS", "0")
+	if rc := Main([]string{"status"}); rc != 1 {
+		t.Errorf("Main(status) with invalid AGBOX_CPUS = %d, want 1", rc)
+	}
+}
+
+func TestParserEdgeCasesAndRunNameReservation(t *testing.T) {
+	// run-<digits> must be rejected for --name while agbox-run-<digits> remains a valid PID run sandbox.
+	if _, err := validateRunName("run-1234"); err == nil {
+		t.Error("expected validateRunName(run-1234) to fail")
+	}
+	if !isRunSandboxName("agbox-run-1234") {
+		t.Error("expected isRunSandboxName(agbox-run-1234) == true")
+	}
+	if !isRunSandboxName("agbox-1234") {
+		t.Error("expected isRunSandboxName(agbox-1234) == true")
+	}
+	if dirID, err := runDirIDFromSandbox("agbox-1234"); err != nil || dirID != "_1234" {
+		t.Errorf("runDirIDFromSandbox(agbox-1234) = %q, %v", dirID, err)
+	}
+	if _, err := runDirIDFromSandbox("not-agbox"); err == nil {
+		t.Error("expected runDirIDFromSandbox(not-agbox) error")
+	}
+
+	sbxTests := []struct {
+		dirID  string
+		want   string
+		wantOK bool
+	}{
+		{"", "", false},
+		{"4242", "agbox-run-4242", true},
+		{"_4242", "agbox-4242", true},
+		{"run-4242", "", false},
+		{"work1", "agbox-work1", true},
+		{"-bad", "", false},
+	}
+	for _, tc := range sbxTests {
+		got, ok := sandboxFromRunDirID(tc.dirID)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("sandboxFromRunDirID(%q) = (%q, %v), want (%q, %v)", tc.dirID, got, ok, tc.want, tc.wantOK)
+		}
+	}
+
+	// parseRunArgs rejects --serve + antigravity at parse time without /dev/kvm.
+	if _, err := parseRunArgs([]string{"--serve", "antigravity"}, config.MaskStrict, nil); err == nil || !strings.Contains(err.Error(), "--serve supports only the opencode agent") {
+		t.Fatalf("expected parseRunArgs(--serve antigravity) error, got %v", err)
+	}
+
+	if _, err := parseStatusArgs([]string{"extra"}); err == nil {
+		t.Error("expected parseStatusArgs positional arg error")
+	}
+	if _, err := parseResumeArgs([]string{"--help"}); !errors.Is(err, errHelp) {
+		t.Errorf("parseResumeArgs(--help) = %v", err)
+	}
+	for _, bad := range [][]string{
+		{},
+		{"agbox-a", "agbox-b"},
+		{"--bogus", "agbox-a"},
+		{"-c", "--session", "s1", "agbox-a"},
+		{"--session"},
+	} {
+		if _, err := parseResumeArgs(bad); err == nil {
+			t.Errorf("expected parseResumeArgs(%v) to fail", bad)
+		}
+	}
+	rOpts, err := parseResumeArgs([]string{"--no-auth", "--no-skills", "--no-rules", "--no-agent-cache", "-d", "agbox-a"})
+	if err != nil || !rOpts.NoAuth || !rOpts.NoSkills || !rOpts.NoRules || !rOpts.NoAgentCache || !rOpts.Detach {
+		t.Fatalf("parseResumeArgs valid flags = %+v, %v", rOpts, err)
+	}
+
+	if _, _, err := parseStopOpts([]string{"-h"}); !errors.Is(err, errHelp) {
+		t.Errorf("parseStopOpts(-h) = %v", err)
+	}
+	if _, _, err := parseRemoveOpts([]string{"-h"}); !errors.Is(err, errHelp) {
+		t.Errorf("parseRemoveOpts(-h) = %v", err)
+	}
+	if _, _, err := parseRemoveOpts([]string{"--bogus"}); err == nil {
+		t.Error("expected parseRemoveOpts(--bogus) error")
+	}
+
+	// Per-subcommand flag rejections for skills, rules, profile, and share.
+	for _, bad := range [][]string{
+		{"--force"},
+		{"list", "--force"},
+		{"rm", "--force", "sk"},
+		{"list", "extra"},
+	} {
+		if _, err := parseSkillsArgs(bad); err == nil {
+			t.Errorf("expected parseSkillsArgs(%v) error", bad)
+		}
+	}
+	for _, bad := range [][]string{
+		{"--force"},
+		{"list", "--force"},
+		{"add", "--name", "a", "--name", "b", "f.md"},
+		{"add", "--all", "f.md"},
+		{"show", "--force", "a"},
+		{"rm", "--force", "a"},
+		{"rm", "--name", "a", "a"},
+	} {
+		if _, err := parseRulesArgs(bad); err == nil {
+			t.Errorf("expected parseRulesArgs(%v) error", bad)
+		}
+	}
+	for _, bad := range [][]string{
+		{"--force"},
+		{"list", "--size", "10G"},
+		{"create", "--size", "10G", "--size", "20G", "p1"},
+		{"create", "--force", "p1"},
+		{"rm", "--size", "10G", "p1"},
+	} {
+		if _, err := parseProfileArgs(bad); err == nil {
+			t.Errorf("expected parseProfileArgs(%v) error", bad)
+		}
+	}
+	for _, bad := range [][]string{
+		{},
+		{"--as"},
+		{"add", "--as", "a", "--as", "b", "agbox-s1", "/tmp/x"},
+		{"list", "--ro", "agbox-s1"},
+		{"add", "--force", "agbox-s1", "/tmp/x"},
+		{"set", "--as", "alias", "--ro", "agbox-s1", "x"},
+		{"rm", "--ro", "agbox-s1", "x"},
+		{"add", "--ro", "--vcs-hooks", "agbox-s1", "/tmp/x"},
+		{"add", "--vcs", "--vcs-hooks", "agbox-s1", "/tmp/x"},
+		{"unknown", "agbox-s1"},
+	} {
+		if _, err := parseShareArgs(bad); err == nil {
+			t.Errorf("expected parseShareArgs(%v) error", bad)
+		}
+	}
+	shHooks, err := parseShareArgs([]string{"add", "--vcs-hooks", "agbox-s1", "/tmp/x:rw"})
+	if err != nil || !shHooks.HasVCS || shHooks.VCSPolicy != config.VCSAllowHooks {
+		t.Fatalf("expected share add --vcs-hooks path:rw to parse, got %+v, %v", shHooks, err)
+	}
+
+	// parseSizeBytes overflow check.
+	if _, ok := parseSizeBytes("99999999999G"); ok {
+		t.Error("expected parseSizeBytes int64 overflow to return ok=false")
+	}
+	if b, ok := parseSizeBytes("2G"); !ok || b != 2*1024*1024*1024 {
+		t.Errorf("parseSizeBytes(2G) = %d, %v", b, ok)
+	}
+}
+
+func TestWaitServeUIRedirectRejectionAndPingFailure(t *testing.T) {
+	var canaryHits atomic.Int32
+	canary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		canaryHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer canary.Close()
+
+	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, canary.URL+"/ssrf", http.StatusFound)
+	}))
+	defer redirectSrv.Close()
+
+	_, portStr, _ := net.SplitHostPort(redirectSrv.Listener.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	app, runner, _, _ := newTestApp(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	if app.defaultWaitServeUI(ctx, port, "agbox-srv") {
+		t.Fatal("expected HTTP 302 redirect response not to count as ready UI")
+	}
+	if canaryHits.Load() != 0 {
+		t.Fatalf("expected CheckRedirect to block redirect target, got %d hits", canaryHits.Load())
+	}
+
+	// Verify msb ping failure aborts waiting immediately.
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 2 && req.Args[0] == "ping" {
+			return msb.CommandResult{ExitCode: 1}, errors.New("sandbox dead")
+		}
+		return msb.CommandResult{}, nil
+	}
+	if app.defaultWaitServeUI(context.Background(), port, "agbox-srv") {
+		t.Fatal("expected ping failure to abort defaultWaitServeUI")
+	}
+}
+
+func TestSecurityFixesAuthSecretsAndPushKeysZeroClear(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "opencode",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// [H6] Auth capture failure must NEVER include capRes.Stdout token material in returned error.
+	secretToken := "SECRET_STDOUT_OAUTH_BEARER_999"
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		joined := strings.Join(req.Args, " ")
+		if strings.Contains(joined, "FILE opencode") {
+			return msb.CommandResult{
+				Stdout:   "FILE opencode auth.json " + secretToken + "\n",
+				Stderr:   "capture failed cleanly\n",
+				ExitCode: 1,
+			}, errors.New("exit status 1")
+		}
+		return msb.CommandResult{}, nil
+	}
+	err := app.auth(ctx, []string{"opencode"})
+	if err == nil {
+		t.Fatal("expected auth capture error")
+	}
+	if strings.Contains(err.Error(), secretToken) {
+		t.Fatalf("auth capture error leaked stdout secret: %v", err)
+	}
+	if !strings.Contains(err.Error(), "capture failed cleanly") {
+		t.Errorf("expected stderr diagnostic in auth error, got %v", err)
+	}
+
+	// Auth returns early when context is canceled during interactive login without running capture.
+	authCancelCtx, cancelAuth := context.WithCancel(ctx)
+	captureCalled := false
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		joined := strings.Join(req.Args, " ")
+		if strings.Contains(joined, "opencode auth login") {
+			cancelAuth()
+			return msb.CommandResult{ExitCode: 130}, context.Canceled
+		}
+		if strings.Contains(joined, "FILE opencode") {
+			captureCalled = true
+		}
+		return msb.CommandResult{}, nil
+	}
+	if err := app.auth(authCancelCtx, []string{"opencode"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled on aborted auth, got %v", err)
+	}
+	if captureCalled {
+		t.Fatal("expected auth not to run credential capture after context cancellation")
+	}
+	runner.handler = nil
+
+	// [H6] pushKeys with 0 secrets still overwrites/clears /home/agent/.agbox-keys.sh and checks [ ! -L /home/agent ].
+	app.Getenv = func(string) string { return "" }
+	runner.calls = nil
+	stdout.Reset()
+	stderr.Reset()
+	if err := app.pushKeys(ctx, "agbox-zero"); err != nil {
+		t.Fatalf("pushKeys with 0 secrets failed: %v", err)
+	}
+	if strings.Contains(stdout.String(), "Streamed ") {
+		t.Errorf("did not expect Streamed log when 0 secrets exist, got %q", stdout.String())
+	}
+	foundWrite := false
+	for _, c := range runner.calls {
+		joined := strings.Join(c.Args, " ")
+		if strings.Contains(joined, "[ ! -L /home/agent ]") &&
+			strings.Contains(joined, "rm -f "+config.GuestKeysFile) &&
+			strings.Contains(joined, "chmod 0600 "+config.GuestKeysFile) {
+			foundWrite = true
+			if strings.Contains(c.Stdin, "export ") {
+				t.Errorf("expected header-only script on 0 keys, got %q", c.Stdin)
+			}
+		}
+	}
+	if !foundWrite {
+		t.Fatalf("expected pushKeys to overwrite %s even with 0 keys, calls=%v", config.GuestKeysFile, runner.calls)
+	}
+}
+
+func TestSecurityFixesProfileLockRefreshAndInitialRunMeta(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "opencode",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// [H9] Run refreshes msb ls AFTER LockProfile so a sandbox that started before lock acquisition is detected.
+	otherDir := filepath.Join(app.Env.DataDir, "run", "other1")
+	if err := config.SaveRunMeta(filepath.Join(otherDir, "run.meta"), config.RunMeta{
+		Sandbox:  "agbox-other1",
+		OwnerPID: app.PID,
+		Profile:  "sharedprof",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lsCount := 0
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			lsCount++
+			if lsCount == 1 {
+				return msb.CommandResult{Stdout: "NAME STATE\nagbox-base stopped\n"}, nil
+			}
+			return msb.CommandResult{Stdout: "NAME STATE\nagbox-base stopped\nagbox-other1 running\n"}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	if rc := app.dispatch(ctx, []string{"run", "--name", "contend1", "--profile", "sharedprof", "--cmd", "true"}); rc == 0 {
+		t.Fatal("expected run to detect active profile sandbox on post-lock msb ls refresh")
+	}
+	if !strings.Contains(stderr.String(), "active in running sandbox agbox-other1") {
+		t.Errorf("unexpected stderr: %s", stderr.String())
+	}
+	_ = os.RemoveAll(otherDir)
+	runner.handler = nil
+
+	// [M3] Run writes initial run.meta BEFORE StartHub so concurrent reapStaleFilterDirs preserves runFilterDir.
+	app.PID = os.Getpid()
+	projDir := filepath.Join(app.Env.HomeReal, "m3-proj")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sawLiveMetaDuringHub := false
+	origHub := app.StartHub
+	app.StartHub = func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error) {
+		runDir := filepath.Dir(mntDir)
+		if m, err := config.LoadRunMeta(filepath.Join(runDir, "run.meta")); err == nil && m.OwnerPID == app.PID {
+			sawLiveMetaDuringHub = true
+		}
+		peer := *app
+		peer.PID = app.PID + 100
+		peer.reapStaleFilterDirs(ctx)
+		if _, err := os.Stat(runDir); err != nil {
+			return 0, fmt.Errorf("reapStaleFilterDirs deleted active starting runDir: %w", err)
+		}
+		return origHub(mntDir, sockPath, pidFile, initial, dieWithParent)
+	}
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--name", "m3run", "--cmd", "true", projDir}); rc != 0 {
+		t.Fatalf("run with concurrent reapStaleFilterDirs failed: %s", stderr.String())
+	}
+	app.StartHub = origHub
+	if !sawLiveMetaDuringHub {
+		t.Fatal("expected initial run.meta with live OwnerPID before StartHub")
+	}
+}
+
+func TestHardenedRootDiskResizeResumeRollbackAndRemoveSymlink(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	baseDir := filepath.Join(app.Env.MSBHome, "sandboxes", config.BaseSandbox)
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	upperPath := filepath.Join(baseDir, "upper.ext4")
+
+	// [M6] Reject symlinked upper.ext4.
+	realTarget := filepath.Join(t.TempDir(), "real.ext4")
+	_ = os.WriteFile(realTarget, make([]byte, 1024), 0o600)
+	_ = os.Symlink(realTarget, upperPath)
+	app.Env.RootDisk = "10M"
+	if err := app.ensureSparseRootDiskSize(ctx, false); err == nil || !strings.Contains(err.Error(), "refusing non-regular") {
+		t.Fatalf("expected symlinked upper.ext4 rejection, got %v", err)
+	}
+	_ = os.Remove(upperPath)
+	if err := os.WriteFile(upperPath, make([]byte, 1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// [M6] Abort before truncating if msb stop fails.
+	truncated := false
+	app.TruncateFile = func(string, int64) error {
+		truncated = true
+		return nil
+	}
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if slices.Equal(req.Args, []string{"stop", config.BaseSandbox}) {
+			return msb.CommandResult{Stderr: "stop busy", ExitCode: 1}, errors.New("stop failed")
+		}
+		return msb.CommandResult{}, nil
+	}
+	if err := app.ensureSparseRootDiskSize(ctx, true); err == nil {
+		t.Fatal("expected ensureSparseRootDiskSize to fail when msb stop fails")
+	}
+	if truncated {
+		t.Fatal("ensureSparseRootDiskSize truncated upper.ext4 despite msb stop failure")
+	}
+	app.TruncateFile = os.Truncate
+
+	// [M6] e2fsck fatal exit code fails closed and still restarts agbox-base via defer.
+	runner.calls = nil
+	runner.handler = nil
+	app.RunHostCmd = func(_ context.Context, name string, _ ...string) ([]byte, error) {
+		if strings.HasSuffix(name, "e2fsck") {
+			exit8 := exec.Command("sh", "-c", "exit 8").Run()
+			return []byte("corrupt superblock"), exit8
+		}
+		return nil, nil
+	}
+	if err := app.ensureSparseRootDiskSize(ctx, true); err == nil {
+		// Only skip if neither /sbin/resize2fs nor /usr/sbin/resize2fs exists on host.
+		if _, sErr := os.Stat("/sbin/resize2fs"); sErr == nil {
+			t.Fatal("expected e2fsck exit 8 to fail ensureSparseRootDiskSize")
+		}
+	}
+	app.RunHostCmd = func(context.Context, string, ...string) ([]byte, error) { return nil, nil }
+
+	// [M6] Remove skips symlinked snapshot group dir and never runs global 'msb prune -y'.
+	snapParent := filepath.Join(app.Env.MSBHome, "snapshots")
+	_ = os.MkdirAll(snapParent, 0o700)
+	outsideSnap := t.TempDir()
+	keepFile := filepath.Join(outsideSnap, "keep.txt")
+	_ = os.WriteFile(keepFile, []byte("safe"), 0o600)
+	_ = os.Symlink(outsideSnap, filepath.Join(snapParent, config.SnapGroup))
+
+	runner.calls = nil
+	stderr.Reset()
+	if err := app.remove(ctx, []string{"--yes", "--allow-root"}); err != nil {
+		t.Fatalf("remove failed: %v", err)
+	}
+	if _, err := os.Stat(keepFile); err != nil {
+		t.Fatalf("remove followed symlinked snapshot dir and deleted %s", keepFile)
+	}
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"prune", "-y"}) {
+			t.Fatalf("remove unexpectedly invoked global 'msb prune -y': %v", runner.calls)
+		}
+	}
+}
+
+func TestShareUpgradeOnlyRollbackAndErrorWrapping(t *testing.T) {
+	app, runner, _, _ := newTestApp(t)
+	ctx := context.Background()
+
+	sbName := "agbox-shsec"
+	runDir := filepath.Join(app.Env.DataDir, "run", "shsec")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sockPath := filepath.Join(runDir, "ws.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var mu sync.Mutex
+	var hubCmds []string
+	go func() {
+		for {
+			conn, cErr := ln.Accept()
+			if cErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				n, _ := c.Read(buf)
+				mu.Lock()
+				hubCmds = append(hubCmds, strings.TrimSpace(string(buf[:n])))
+				mu.Unlock()
+				_, _ = c.Write([]byte("{\"ok\":true,\"share\":{\"guest_name\":\"sh\"}}\n"))
+			}(conn)
+		}
+	}()
+
+	shareDir := filepath.Join(app.Env.HomeReal, "shsec-dir")
+	if err := os.MkdirAll(shareDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(runDir, "blocker-file")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badMetaPath := filepath.Join(blocker, "run.meta")
+
+	// 1. Downgrade (rw -> ro) must NOT roll back to rw when SaveRunMeta fails.
+	rwMeta := config.RunMeta{
+		Sandbox:  sbName,
+		OwnerPID: app.PID,
+		Shares: []config.ShareRecord{
+			{Index: 0, GuestName: "sh", HostPath: shareDir, IsDir: true, AccessMode: "rw", ReadOnly: false, VCSPolicy: config.VCSAllow},
+		},
+	}
+	_ = app.setSandboxShare(ctx, shareOpts{Target: "sh", HasAccess: true, ReadOnly: true}, true, runDir, badMetaPath, rwMeta)
+	mu.Lock()
+	downgradeCalls := len(hubCmds)
+	mu.Unlock()
+	if downgradeCalls != 1 {
+		t.Fatalf("expected exactly 1 hub call (no rollback) on rw->ro downgrade, got %d: %v", downgradeCalls, hubCmds)
+	}
+
+	// 2. Upgrade (ro -> rw and mask -> vcs) MUST roll back to ro+mask when SaveRunMeta fails.
+	mu.Lock()
+	hubCmds = nil
+	mu.Unlock()
+	roMeta := config.RunMeta{
+		Sandbox:  sbName,
+		OwnerPID: app.PID,
+		Shares: []config.ShareRecord{
+			{Index: 0, GuestName: "sh", HostPath: shareDir, IsDir: true, AccessMode: "ro", ReadOnly: true, VCSPolicy: config.VCSMask},
+		},
+	}
+	_ = app.setSandboxShare(ctx, shareOpts{Target: "sh", HasAccess: true, ReadOnly: false, HasVCS: true, VCSPolicy: config.VCSAllowHooks}, true, runDir, badMetaPath, roMeta)
+	mu.Lock()
+	upgradeCalls := len(hubCmds)
+	mu.Unlock()
+	if upgradeCalls != 2 {
+		t.Fatalf("expected 2 hub calls (apply + rollback) on ro->rw upgrade, got %d: %v", upgradeCalls, hubCmds)
+	}
+
+	// 3. Stopped sandbox with corrupt suspended file wraps parse error instead of claiming 'not suspended'.
+	corruptDir := filepath.Join(app.Env.DataDir, "run", "corrupt1")
+	_ = os.MkdirAll(corruptDir, 0o700)
+	_ = os.WriteFile(filepath.Join(corruptDir, "suspended"), []byte("{not-json"), 0o600)
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-corrupt1 stopped\n"
+	sErr := app.share(ctx, []string{"list", "agbox-corrupt1"})
+	if sErr == nil || strings.Contains(sErr.Error(), "not suspended") {
+		t.Fatalf("expected wrapped suspended parse error, got %v", sErr)
+	}
+}
+
+func TestProfileSizePreservationSuspendStopFailureAndMaskAutoWarn(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	// 1. Existing profile with 50G keeps 50G when ensureProfileVolume runs with default 10G.
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 2 && req.Args[0] == "volume" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: "NAME\nagbox-profile-keep50\n"}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	if err := persist.SaveProfileMeta(app.Env.DataDir, persist.ProfileMeta{
+		Name:   "keep50",
+		Volume: "agbox-profile-keep50",
+		Size:   "50G",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ensureProfileVolume(ctx, "keep50", "10G"); err != nil {
+		t.Fatalf("ensureProfileVolume(keep50) failed: %v", err)
+	}
+	profs, err := persist.ListProfiles(app.Env.DataDir)
+	if err != nil || len(profs) != 1 || profs[0].Size != "50G" {
+		t.Fatalf("expected ProfileMeta.Size to remain 50G, got %+v, %v", profs, err)
+	}
+
+	// 2. suspendSandboxOnExit must NOT write suspended marker when msb stop fails.
+	failStopDir := filepath.Join(app.Env.DataDir, "run", "failpers")
+	_ = os.MkdirAll(failStopDir, 0o700)
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "stop" {
+			return msb.CommandResult{Stderr: "cannot stop", ExitCode: 1}, errors.New("stop err")
+		}
+		return msb.CommandResult{}, nil
+	}
+	stdout.Reset()
+	stderr.Reset()
+	app.suspendSandboxOnExit("agbox-failpers", failStopDir, config.RunMeta{Sandbox: "agbox-failpers", Persist: true})
+	if hasMarker(filepath.Join(failStopDir, "suspended")) {
+		t.Fatal("suspendSandboxOnExit wrote suspended marker despite msb stop failure")
+	}
+	if strings.Contains(stdout.String(), "Persisted ") {
+		t.Errorf("unexpected success log on failed stop: %s", stdout.String())
+	}
+	runner.handler = nil
+
+	// 3. reapStaleFilterDirs fails closed when msb ls fails or MSB is nil.
+	staleDir := filepath.Join(app.Env.DataDir, "run", "999995")
+	_ = os.MkdirAll(staleDir, 0o700)
+	origMSB := app.MSB
+	app.MSB = nil
+	app.reapStaleFilterDirs(ctx)
+	if _, err := os.Stat(staleDir); err != nil {
+		t.Fatalf("reapStaleFilterDirs tore down dir when MSB == nil: %v", err)
+	}
+	app.MSB = origMSB
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{ExitCode: 1}, errors.New("ls failed")
+		}
+		return msb.CommandResult{}, nil
+	}
+	app.reapStaleFilterDirs(ctx)
+	if _, err := os.Stat(staleDir); err != nil {
+		t.Fatalf("reapStaleFilterDirs tore down dir when msb ls failed: %v", err)
+	}
+	runner.handler = nil
+	_ = os.RemoveAll(staleDir)
+
+	// 4. MaskAuto emits explicit WARN on fallback while MaskStrict never falls back.
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "opencode",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	projDir := filepath.Join(app.Env.HomeReal, "auto-proj")
+	_ = os.MkdirAll(projDir, 0o700)
+	app.Env.MaskVCS = config.MaskAuto
+	origHub := app.StartHub
+	app.StartHub = func(_, _, _ string, _ []vcsfuse.HubShareConfig, _ bool) (int, error) {
+		return 0, errors.New("fuse unavailable")
+	}
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--cmd", "true", projDir}); rc != 0 {
+		t.Fatalf("expected MaskAuto fallback run to succeed, stderr=%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "[agbox] WARN:") || !strings.Contains(stderr.String(), "without VCS masking") {
+		t.Errorf("expected explicit WARN on MaskAuto fallback, got %q", stderr.String())
+	}
+	app.StartHub = origHub
+	app.Env.MaskVCS = config.MaskStrict
+
+	// 5. OPENCODE_SERVER_PASSWORD suppresses loopback multi-user warning when set.
+	app.IsTTY = func() bool { return false }
+	app.Getenv = func(k string) string {
+		if k == "OPENCODE_SERVER_PASSWORD" {
+			return "strong-pass"
+		}
+		return ""
+	}
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--name", "pwdsrv", "--serve", "--port", "4099"}); rc != 0 {
+		t.Fatalf("detached serve with password failed: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Set OPENCODE_SERVER_PASSWORD") {
+		t.Errorf("unexpected OPENCODE_SERVER_PASSWORD warning when password is already set: %s", stderr.String())
+	}
+	_ = app.dispatch(ctx, []string{"stop", "agbox-pwdsrv"})
+}
+
+func TestEditBaseNoSnapCategoriesRequireBaseAndResumeM6H9(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	// 1. requireBase distinguishes missing config vs corrupt config vs snap ls failure.
+	if _, err := app.requireBase(ctx); err == nil || !strings.Contains(err.Error(), "no base configured") {
+		t.Fatalf("expected missing-base error, got %v", err)
+	}
+	if err := os.WriteFile(app.Env.ConfigFile, []byte("BAD\x00CONFIG"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Make ConfigFile a directory so LoadFile fails with non-ENOENT error.
+	_ = os.Remove(app.Env.ConfigFile)
+	if err := os.MkdirAll(app.Env.ConfigFile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.requireBase(ctx); err == nil || strings.Contains(err.Error(), "no base configured") {
+		t.Fatalf("expected LoadFile error (not missing-base), got %v", err)
+	}
+	_ = os.RemoveAll(app.Env.ConfigFile)
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:      "opencode",
+		Image:      "node:24-bookworm-slim",
+		Snapshot:   "agbox:v1",
+		SnapCount:  1,
+		Categories: "core",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stderr: "snap backend down", ExitCode: 1}, errors.New("snap ls err")
+		}
+		return msb.CommandResult{}, nil
+	}
+	if _, err := app.requireBase(ctx); err == nil || !strings.Contains(err.Error(), "check base snapshot") {
+		t.Fatalf("expected wrapped snap ls error, got %v", err)
+	}
+	runner.handler = nil
+
+	// 2. editBase --no-snap does NOT persist un-snapshotted Categories into config.
+	if rc := app.dispatch(ctx, []string{"edit-base", "--add", "go", "--no-snap"}); rc != 0 {
+		t.Fatalf("edit-base --add go --no-snap failed: %s", stderr.String())
+	}
+	stAfter, err := config.LoadFile(app.Env.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stAfter.Categories != "core" {
+		t.Fatalf("expected Categories to stay 'core' under --no-snap, got %q", stAfter.Categories)
+	}
+
+	// 3. [H9] resumeSandbox refreshes msb ls AFTER LockProfile and detects newly active profile sandbox.
+	resDir := filepath.Join(app.Env.DataDir, "run", "resprof1")
+	_ = os.MkdirAll(resDir, 0o700)
+	_ = config.SaveRunMeta(filepath.Join(resDir, "suspended"), config.RunMeta{
+		Sandbox:      "agbox-resprof1",
+		OwnerPID:     app.PID,
+		Agent:        "opencode",
+		Mode:         config.RunModeCmd,
+		Cmd:          "true",
+		Profile:      "p-race",
+		MaskMode:     config.MaskStrict,
+		NoSkills:     true,
+		NoRules:      true,
+		NoAgentCache: true,
+	})
+	otherDir := filepath.Join(app.Env.DataDir, "run", "otherp")
+	_ = config.SaveRunMeta(filepath.Join(otherDir, "run.meta"), config.RunMeta{
+		Sandbox:  "agbox-otherp",
+		OwnerPID: app.PID,
+		Profile:  "p-race",
+	})
+	lsCalls := 0
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			lsCalls++
+			if lsCalls == 1 {
+				return msb.CommandResult{Stdout: "NAME STATE\nagbox-base stopped\nagbox-resprof1 stopped\n"}, nil
+			}
+			return msb.CommandResult{Stdout: "NAME STATE\nagbox-base stopped\nagbox-resprof1 stopped\nagbox-otherp running\n"}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-resprof1"}); rc == 0 {
+		t.Fatal("expected resumeSandbox to reject profile activated before LockProfile")
+	}
+	_ = os.RemoveAll(otherDir)
+
+	// 4. [M6] resumeSandbox stops VM and unmounts FUSE if removing suspended marker fails after msb start.
+	remFailDir := filepath.Join(app.Env.DataDir, "run", "remfail")
+	_ = os.MkdirAll(remFailDir, 0o700)
+	suspPath := filepath.Join(remFailDir, "suspended")
+	_ = config.SaveRunMeta(suspPath, config.RunMeta{
+		Sandbox:      "agbox-remfail",
+		OwnerPID:     app.PID,
+		Agent:        "opencode",
+		Mode:         config.RunModeCmd,
+		Cmd:          "true",
+		MaskMode:     config.MaskStrict,
+		NoSkills:     true,
+		NoRules:      true,
+		NoAgentCache: true,
+	})
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-remfail stopped\n"
+	runner.calls = nil
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if slices.Equal(req.Args, []string{"start", "agbox-remfail"}) {
+			// Replace suspended file with a non-empty directory so os.Remove(suspendedPath) fails.
+			_ = os.Remove(suspPath)
+			_ = os.MkdirAll(filepath.Join(suspPath, "blocker"), 0o700)
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	defer func() { _ = os.RemoveAll(suspPath) }()
+
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-remfail"}); rc == 0 {
+		t.Fatal("expected resume to fail when os.Remove(suspendedPath) fails")
+	}
+	stoppedAfterStart := false
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"stop", "agbox-remfail"}) {
+			stoppedAfterStart = true
+		}
+	}
+	if !stoppedAfterStart {
+		t.Fatalf("expected resume cleanup to stop agbox-remfail on suspended-marker removal failure: %v", runner.calls)
+	}
+}
+
+func TestPersistAndResumeSuspendOnCtrlCOrNonZeroExit(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "opencode",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	projDir := filepath.Join(app.Env.HomeReal, "ctrlc-proj")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Foreground `run --persist` with non-zero --cmd exit (or Ctrl-C) suspends instead of deleting the sandbox.
+	exit130Err := exec.Command("sh", "-c", "exit 130").Run()
+	if exit130Err == nil {
+		t.Fatal("expected exit 130 error")
+	}
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl running\n"
+			return msb.CommandResult{}, nil
+		}
+		if slices.Equal(req.Args, []string{"stop", "agbox-pctrl"}) {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl stopped\n"
+			return msb.CommandResult{}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" && req.Interactive {
+			cancelRun()
+			return msb.CommandResult{ExitCode: 130}, exit130Err
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	runner.calls = nil
+	rc := app.dispatch(runCtx, []string{"run", "--persist", "--name", "pctrl", "--serve", projDir})
+	if rc != 130 {
+		t.Fatalf("expected foreground --persist --serve Ctrl-C rc=130, got %d (stderr=%s)", rc, stderr.String())
+	}
+	pctrlDir := filepath.Join(app.Env.DataDir, "run", "pctrl")
+	if !hasMarker(filepath.Join(pctrlDir, "suspended")) {
+		t.Fatal("expected foreground --persist --serve Ctrl-C to save suspended marker")
+	}
+	for _, c := range runner.calls {
+		if slices.Equal(c.Args, []string{"rm", "-f", "agbox-pctrl"}) {
+			t.Fatalf("foreground --persist Ctrl-C deleted agbox-pctrl instead of suspending: %v", runner.calls)
+		}
+	}
+
+	// 2. Foreground `agbox resume` with non-zero agent exit re-saves `suspended` instead of stranding the sandbox.
+	exit9Err := exec.Command("sh", "-c", "exit 9").Run()
+	if exit9Err == nil {
+		t.Fatal("expected exit 9 error")
+	}
+	app.IsTTY = func() bool { return true }
+	suspMeta, err := config.LoadRunMeta(filepath.Join(pctrlDir, "suspended"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	suspMeta.Mode = config.RunModeTUI
+	if err := config.SaveRunMeta(filepath.Join(pctrlDir, "suspended"), suspMeta); err != nil {
+		t.Fatal(err)
+	}
+
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if slices.Equal(req.Args, []string{"start", "agbox-pctrl"}) {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl running\n"
+			return msb.CommandResult{}, nil
+		}
+		if slices.Equal(req.Args, []string{"stop", "agbox-pctrl"}) {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl stopped\n"
+			return msb.CommandResult{}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" && req.Interactive {
+			return msb.CommandResult{ExitCode: 9}, exit9Err
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	rc2 := app.dispatch(ctx, []string{"resume", "agbox-pctrl"})
+	if rc2 != 9 {
+		t.Fatalf("expected foreground resume non-zero exit rc=9, got %d (stderr=%s)", rc2, stderr.String())
+	}
+	if !hasMarker(filepath.Join(pctrlDir, "suspended")) {
+		t.Fatal("expected foreground resume failure to re-save suspended marker instead of stranding sandbox")
+	}
+
+	// 3. Subsequent `agbox resume` succeeds cleanly because suspended state remained valid.
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if slices.Equal(req.Args, []string{"start", "agbox-pctrl"}) {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl running\n"
+			return msb.CommandResult{}, nil
+		}
+		if slices.Equal(req.Args, []string{"stop", "agbox-pctrl"}) {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl stopped\n"
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	if rc3 := app.dispatch(ctx, []string{"resume", "agbox-pctrl"}); rc3 != 0 {
+		t.Fatalf("expected subsequent resume to succeed, got rc=%d (stderr=%s)", rc3, stderr.String())
+	}
+}
+
+func TestDirectMountReadOnlySingleFileMaskAutoAndResume(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "opencode",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	roDir := filepath.Join(app.Env.HomeReal, "direct-ro-dir")
+	if err := os.MkdirAll(roDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	singleFile := filepath.Join(app.Env.HomeReal, "direct-note.txt")
+	if err := os.WriteFile(singleFile, []byte("hello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
+			for i := 0; i+1 < len(req.Args); i++ {
+				if req.Args[i] == "--name" {
+					runner.sandboxes = "NAME STATE\nagbox-base stopped\n" + req.Args[i+1] + " running\n"
+				}
+			}
+			return msb.CommandResult{}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "stop" {
+			sbx := req.Args[len(req.Args)-1]
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\n" + sbx + " stopped\n"
+			return msb.CommandResult{}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "start" {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\n" + req.Args[1] + " running\n"
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	// 1. `--no-mask --ro` with directory + single-file shares records VCSAllow on ro dir and VCSMask on file, and resumes cleanly.
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "nomaskro", "--no-mask", "--ro", "--cmd", "true", roDir, singleFile}); rc != 0 {
+		t.Fatalf("run --persist --no-mask --ro failed: %s", stderr.String())
+	}
+	suspMeta, err := config.LoadRunMeta(filepath.Join(app.Env.DataDir, "run", "nomaskro", "suspended"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(suspMeta.Shares) != 2 {
+		t.Fatalf("expected 2 share records, got %+v", suspMeta.Shares)
+	}
+	if suspMeta.Shares[0].VCSPolicy != config.VCSAllow {
+		t.Errorf("expected VCSAllow on direct ro directory share, got %q", suspMeta.Shares[0].VCSPolicy)
+	}
+	if suspMeta.Shares[1].VCSPolicy != config.VCSMask {
+		t.Errorf("expected VCSMask on direct single-file share, got %q", suspMeta.Shares[1].VCSPolicy)
+	}
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-nomaskro"}); rc != 0 {
+		t.Fatalf("resume of --no-mask --ro sandbox failed: %s", stderr.String())
+	}
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "nomaskro", "--no-mask", "--ro", "--cmd", "true", roDir, singleFile}); rc != 0 {
+		t.Fatalf("repeat run --persist on --no-mask --ro sandbox failed: %s", stderr.String())
+	}
+
+	// 2. `AGBOX_MASK_VCS=auto` fallback on `--ro` succeeds SaveRunMeta and resumes cleanly.
+	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	app.Env.MaskVCS = config.MaskAuto
+	origHub := app.StartHub
+	app.StartHub = func(_, _, _ string, _ []vcsfuse.HubShareConfig, _ bool) (int, error) {
+		return 0, errors.New("fuse unavailable")
+	}
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "autoro", "--ro", "--cmd", "true", roDir}); rc != 0 {
+		t.Fatalf("MaskAuto fallback on --ro failed: %s", stderr.String())
+	}
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "autoro", "--ro", "--cmd", "true", roDir}); rc != 0 {
+		t.Fatalf("repeat MaskAuto fallback run --persist --ro failed: %s", stderr.String())
+	}
+	app.StartHub = origHub
+	app.Env.MaskVCS = config.MaskStrict
+}
+
+func TestSingleRootWarningAcrossAuthUpdateAndPersistResume(t *testing.T) {
+	app, runner, _, stderr := newTestApp(t)
+	ctx := context.Background()
+	app.GetEUID = func() int { return 0 }
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "opencode",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. `auth --allow-root` emits exactly one root-mode warning.
+	b64Cred := "eyJ0b2tlbiI6Im9rIn0="
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if strings.Contains(strings.Join(req.Args, " "), "FILE opencode") {
+			return msb.CommandResult{Stdout: "FILE opencode auth.json " + b64Cred + "\n"}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"--allow-root", "auth", "opencode"}); rc != 0 {
+		t.Fatalf("auth --allow-root failed: %s", stderr.String())
+	}
+	if got := strings.Count(stderr.String(), "Root mode is active"); got != 1 {
+		t.Errorf("auth --allow-root emitted %d root warnings, want 1: %s", got, stderr.String())
+	}
+
+	// 2. `update --allow-root` emits exactly one root-mode warning.
+	fakeELF := append([]byte{0x7f, 'E', 'L', 'F'}, bytes.Repeat([]byte{0x11}, 128)...)
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		joined := strings.Join(req.Args, " ")
+		if strings.Contains(joined, "opencode-version.txt") && !strings.Contains(joined, "npm install") {
+			return msb.CommandResult{Stdout: "1.9.9\n"}, nil
+		}
+		if strings.Contains(joined, "opencode-binpath.txt") && req.Stdout != nil {
+			_, _ = req.Stdout.Write(fakeELF)
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"--allow-root", "update", "opencode"}); rc != 0 {
+		t.Fatalf("update --allow-root failed: %s", stderr.String())
+	}
+	if got := strings.Count(stderr.String(), "Root mode is active"); got != 1 {
+		t.Errorf("update --allow-root emitted %d root warnings, want 1: %s", got, stderr.String())
+	}
+
+	// 3. `run --allow-root --persist` resuming an existing suspended sandbox emits exactly one root-mode warning.
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: runner.sandboxes}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rootp running\n"
+			return msb.CommandResult{}, nil
+		}
+		if slices.Equal(req.Args, []string{"stop", "agbox-rootp"}) {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rootp stopped\n"
+			return msb.CommandResult{}, nil
+		}
+		if slices.Equal(req.Args, []string{"start", "agbox-rootp"}) {
+			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rootp running\n"
+			return msb.CommandResult{}, nil
+		}
+		return msb.CommandResult{}, nil
+	}
+	if rc := app.dispatch(ctx, []string{"--allow-root", "run", "--persist", "--name", "rootp", "--cmd", "true"}); rc != 0 {
+		t.Fatalf("initial run --allow-root --persist failed: %s", stderr.String())
+	}
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"--allow-root", "run", "--persist", "--name", "rootp", "--cmd", "true"}); rc != 0 {
+		t.Fatalf("resume via run --allow-root --persist failed: %s", stderr.String())
+	}
+	if got := strings.Count(stderr.String(), "Root mode is active"); got != 1 {
+		t.Errorf("run --allow-root --persist resume emitted %d root warnings, want 1: %s", got, stderr.String())
 	}
 }

@@ -1,17 +1,13 @@
-// Package persist manages persistent sandbox authentication, global skills,
-// global rules, cached agent binaries, and conversation profile metadata.
+// Package persist manages sandbox credentials, global skills, global rules,
+// cached agent binaries, and conversation profile metadata.
 //
 // Security properties:
-//   - Stores sandbox credentials in $DATA_DIR/auth with directory mode 0700 and file mode 0600.
-//   - Rejects symlinks via Lstat across $DATA_DIR/auth, $DATA_DIR/skills, $DATA_DIR/rules,
-//     $DATA_DIR/agents, and $DATA_DIR/profiles.
-//   - Captures and restores only allowlisted credential files within a 64 KiB size limit.
-//   - Streams credential restore scripts over stdin so tokens never appear in CLI arguments.
-//   - Rejects symlinks, special files, and unsafe path delimiters in $DATA_DIR/skills,
-//     $DATA_DIR/rules, and $DATA_DIR/agents.
-//   - Verifies ELF magic, regular single-link files, and SHA-256 manifest digests for cached
-//     agent binaries in $DATA_DIR/agents/bin before mounting them read-only into sandboxes.
-//   - Enforces exclusive host flock locking per conversation profile to prevent concurrent ext4 mounts.
+//   - SaveAuthBundle writes credentials in $DATA_DIR/auth at mode 0600 inside 0700 directories.
+//   - Every directory and file reader rejects symlinks with O_NOFOLLOW or Lstat.
+//   - ParseAuthCapture and LoadAuthBundle accept only allowlisted files within 64 KiB.
+//   - FormatAuthRestoreScript streams secrets over stdin and checks parent directories for symlinks.
+//   - InspectAgentsDir checks ELF headers, link counts, and SHA-256 digests against manifest.json.
+//   - LockProfile holds an exclusive host flock per profile outside the deleted profile directory.
 package persist
 
 import (
@@ -20,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -34,21 +31,44 @@ import (
 )
 
 const (
-	// MaxAuthFileBytes caps each saved credential file at 64 KiB.
-	MaxAuthFileBytes = 64 * 1024
+	maxAuthFileBytes    = 64 * 1024
+	maxSkillFileBytes   = 10 * 1024 * 1024
+	maxSkillTotalBytes  = 32 * 1024 * 1024
+	maxSkillFiles       = 128
+	maxRuleFileBytes    = 64 * 1024
+	maxProfileMetaBytes = 16 * 1024
 
-	// MaxSkillFileBytes caps each global skill file at 10 MiB.
-	MaxSkillFileBytes = 10 * 1024 * 1024
-
-	// MaxRuleFileBytes caps each global rule Markdown file at 64 KiB.
-	MaxRuleFileBytes = 64 * 1024
-
-	// AgyRuleWarnBytes is Antigravity's per-rule-file inline truncation limit (24,000 bytes).
+	// AgyRuleWarnBytes is Antigravity's inline limit (24,000 bytes) for one rule file.
 	AgyRuleWarnBytes = 24000
 
 	// ProfileVolumePrefix precedes every msb disk volume created for --profile.
 	ProfileVolumePrefix = "agbox-profile-"
 )
+
+var supportedAgents = []struct {
+	agent   string
+	binName string
+}{
+	{agent: "antigravity", binName: "agy"},
+	{agent: "opencode", binName: "opencode"},
+}
+
+func isSupportedAgent(agent string) bool {
+	for _, entry := range supportedAgents {
+		if entry.agent == agent {
+			return true
+		}
+	}
+	return false
+}
+
+func supportedAgentNames() []string {
+	names := make([]string, len(supportedAgents))
+	for i, entry := range supportedAgents {
+		names[i] = entry.agent
+	}
+	return names
+}
 
 type authFileSpec struct {
 	Agent    string
@@ -89,27 +109,25 @@ var allowlistedAuthSpecs = []authFileSpec{
 	},
 }
 
-// AuthFile represents one validated credential file for an agent.
+// AuthFile holds one checked credential file for an agent.
 type AuthFile struct {
 	Agent string
 	Name  string
 	Data  []byte
 }
 
-// AuthBundle holds validated credential files for one or more agents.
+// AuthBundle holds checked credential files for one or more agents.
 type AuthBundle struct {
 	Files []AuthFile
 }
 
-// IsEmpty reports whether bundle contains zero credential files.
+// IsEmpty reports whether b contains zero credential files.
 func (b AuthBundle) IsEmpty() bool {
 	return len(b.Files) == 0
 }
 
 func specsForAgent(agent string) ([]authFileSpec, error) {
-	switch agent {
-	case "antigravity", "opencode":
-	default:
+	if !isSupportedAgent(agent) {
 		return nil, fmt.Errorf("unsupported auth agent %q (expected antigravity or opencode)", agent)
 	}
 	var out []authFileSpec
@@ -133,11 +151,10 @@ func lookupAuthSpec(agent, name string) (authFileSpec, bool) {
 // BuildAuthCaptureScript builds a POSIX sh script that encodes allowlisted
 // credential files under /home/agent as base64 lines on stdout.
 func BuildAuthCaptureScript(agent string) (string, error) {
-	return BuildAuthCaptureScriptForHome(agent, config.GuestHome)
+	return buildAuthCaptureScriptForHome(agent, config.GuestHome)
 }
 
-// BuildAuthCaptureScriptForHome builds the credential capture script for guestHome.
-func BuildAuthCaptureScriptForHome(agent, guestHome string) (string, error) {
+func buildAuthCaptureScriptForHome(agent, guestHome string) (string, error) {
 	specs, err := specsForAgent(agent)
 	if err != nil {
 		return "", err
@@ -145,14 +162,14 @@ func BuildAuthCaptureScriptForHome(agent, guestHome string) (string, error) {
 	if guestHome == "" {
 		return "", errors.New("guest home path must not be empty")
 	}
-	limitPlusOne := MaxAuthFileBytes + 1
+	limitPlusOne := maxAuthFileBytes + 1
 	var b strings.Builder
 	b.WriteString("set -eu\n")
 	for _, sp := range specs {
 		full := filepath.Clean(filepath.Join(guestHome, sp.RelPath))
 		qPath := msb.ShellQuote(full)
 		fmt.Fprintf(&b, "if [ -L %s ]; then echo 'SYMLINK %s %s'; exit 1; fi\n", qPath, sp.Agent, sp.Name)
-		fmt.Fprintf(&b, "if [ -f %s ]; then\n", qPath)
+		fmt.Fprintf(&b, "if [ -f %s ] && [ -s %s ]; then\n", qPath, qPath)
 		fmt.Fprintf(&b, "  b64=$(head -c %d %s | base64 | tr -d '\\n\\r ')\n", limitPlusOne, qPath)
 		fmt.Fprintf(&b, "  printf 'FILE %s %s %%s\\n' \"$b64\"\n", sp.Agent, sp.Name)
 		b.WriteString("fi\n")
@@ -160,7 +177,7 @@ func BuildAuthCaptureScriptForHome(agent, guestHome string) (string, error) {
 	return b.String(), nil
 }
 
-// ParseAuthCapture validates stdout from BuildAuthCaptureScript and returns an AuthBundle.
+// ParseAuthCapture checks stdout from BuildAuthCaptureScript and returns an AuthBundle.
 func ParseAuthCapture(agent, stdout string) (AuthBundle, error) {
 	specs, err := specsForAgent(agent)
 	if err != nil {
@@ -176,10 +193,10 @@ func ParseAuthCapture(agent, stdout string) (AuthBundle, error) {
 			return AuthBundle{}, fmt.Errorf("refusing symlinked credential file in guest (%s)", line)
 		}
 		fields := strings.Fields(line)
-		if len(fields) != 4 || fields[0] != "FILE" {
-			return AuthBundle{}, fmt.Errorf("unexpected credential capture output line")
+		if fields[0] != "FILE" || (len(fields) != 3 && len(fields) != 4) {
+			return AuthBundle{}, errors.New("unexpected credential capture output line")
 		}
-		gotAgent, name, b64 := fields[1], fields[2], fields[3]
+		gotAgent, name := fields[1], fields[2]
 		if gotAgent != agent {
 			return AuthBundle{}, fmt.Errorf("captured credential agent mismatch: got %q, want %q", gotAgent, agent)
 		}
@@ -190,15 +207,20 @@ func ParseAuthCapture(agent, stdout string) (AuthBundle, error) {
 		if _, dup := seen[name]; dup {
 			return AuthBundle{}, fmt.Errorf("duplicate credential file %q in capture output", name)
 		}
-		decoded, dErr := base64.StdEncoding.DecodeString(b64)
+		if len(fields) == 3 {
+			seen[name] = nil
+			continue
+		}
+		decoded, dErr := base64.StdEncoding.DecodeString(fields[3])
 		if dErr != nil {
 			return AuthBundle{}, fmt.Errorf("decode credential file %q: %w", name, dErr)
 		}
 		if len(decoded) == 0 {
+			seen[name] = nil
 			continue
 		}
-		if len(decoded) > MaxAuthFileBytes {
-			return AuthBundle{}, fmt.Errorf("credential file %q exceeds %d bytes", name, MaxAuthFileBytes)
+		if len(decoded) > maxAuthFileBytes {
+			return AuthBundle{}, fmt.Errorf("credential file %q exceeds %d bytes", name, maxAuthFileBytes)
 		}
 		if sp.IsJSON {
 			if err := validateNonEmptyJSONObject(decoded, name); err != nil {
@@ -213,7 +235,7 @@ func ParseAuthCapture(agent, stdout string) (AuthBundle, error) {
 		data, ok := seen[sp.Name]
 		if !ok || len(data) == 0 {
 			if sp.Required {
-				return AuthBundle{}, fmt.Errorf("no %s credentials were saved (sign-in did not complete)", agent)
+				return AuthBundle{}, fmt.Errorf("sign-in did not save %s credentials", agent)
 			}
 			continue
 		}
@@ -240,35 +262,49 @@ func validateNonEmptyJSONObject(raw []byte, name string) error {
 // FormatAuthRestoreScript builds a POSIX sh script that writes bundle into /home/agent.
 // Callers stream this script over stdin so secrets never appear in CLI arguments.
 func FormatAuthRestoreScript(bundle AuthBundle) (string, error) {
-	return FormatAuthRestoreScriptForHome(bundle, config.GuestHome)
+	return formatAuthRestoreScriptForHome(bundle, config.GuestHome)
 }
 
-// FormatAuthRestoreScriptForHome builds the credential restore script for guestHome.
-func FormatAuthRestoreScriptForHome(bundle AuthBundle, guestHome string) (string, error) {
+func formatAuthRestoreScriptForHome(bundle AuthBundle, guestHome string) (string, error) {
 	if bundle.IsEmpty() {
 		return "", nil
 	}
 	if guestHome == "" {
 		return "", errors.New("guest home path must not be empty")
 	}
+	cleanHome := filepath.Clean(guestHome)
+	qHome := msb.ShellQuote(cleanHome)
+
 	var b strings.Builder
 	b.WriteString("set -eu\n")
 	b.WriteString("umask 077\n")
-	createdDirs := make(map[string]bool)
+	fmt.Fprintf(&b, "if [ -L %s ]; then echo 'agbox rejects symlinked guest home' >&2; exit 1; fi\n", qHome)
+
+	checkedDirs := map[string]bool{cleanHome: true}
 	for _, f := range bundle.Files {
 		sp, ok := lookupAuthSpec(f.Agent, f.Name)
 		if !ok {
 			return "", fmt.Errorf("refusing non-allowlisted credential file %s/%s", f.Agent, f.Name)
 		}
-		if len(f.Data) == 0 || len(f.Data) > MaxAuthFileBytes {
+		if len(f.Data) == 0 || len(f.Data) > maxAuthFileBytes {
 			return "", fmt.Errorf("invalid credential size for %s/%s (%d bytes)", f.Agent, f.Name, len(f.Data))
 		}
-		target := filepath.Clean(filepath.Join(guestHome, sp.RelPath))
-		parent := filepath.Dir(target)
-		if !createdDirs[parent] {
-			fmt.Fprintf(&b, "mkdir -p %s\n", msb.ShellQuote(parent))
-			createdDirs[parent] = true
+		relDir := filepath.Dir(filepath.Clean(sp.RelPath))
+		cur := cleanHome
+		for _, part := range strings.Split(relDir, string(filepath.Separator)) {
+			if part == "" || part == "." {
+				continue
+			}
+			cur = filepath.Join(cur, part)
+			if !checkedDirs[cur] {
+				qCur := msb.ShellQuote(cur)
+				fmt.Fprintf(&b, "if [ -L %s ]; then echo 'agbox rejects symlinked credential directory' >&2; exit 1; fi\n", qCur)
+				fmt.Fprintf(&b, "mkdir -p %s\n", qCur)
+				fmt.Fprintf(&b, "chmod 0700 %s\n", qCur)
+				checkedDirs[cur] = true
+			}
 		}
+		target := filepath.Clean(filepath.Join(cleanHome, sp.RelPath))
 		qTarget := msb.ShellQuote(target)
 		b64 := base64.StdEncoding.EncodeToString(f.Data)
 		fmt.Fprintf(&b, "rm -f %s\n", qTarget)
@@ -278,7 +314,7 @@ func FormatAuthRestoreScriptForHome(bundle AuthBundle, guestHome string) (string
 	return b.String(), nil
 }
 
-// SaveAuthBundle writes validated credential files atomically into $DATA_DIR/auth/<agent> with mode 0600.
+// SaveAuthBundle writes checked credential files atomically to $DATA_DIR/auth/<agent> at mode 0600.
 func SaveAuthBundle(dataDir string, bundle AuthBundle) error {
 	if bundle.IsEmpty() {
 		return errors.New("auth bundle is empty")
@@ -297,7 +333,7 @@ func SaveAuthBundle(dataDir string, bundle AuthBundle) error {
 		if !ok {
 			return fmt.Errorf("refusing non-allowlisted credential file %s/%s", f.Agent, f.Name)
 		}
-		if len(f.Data) == 0 || len(f.Data) > MaxAuthFileBytes {
+		if len(f.Data) == 0 || len(f.Data) > maxAuthFileBytes {
 			return fmt.Errorf("invalid credential size for %s/%s", f.Agent, f.Name)
 		}
 		if sp.IsJSON {
@@ -324,27 +360,30 @@ func SaveAuthBundle(dataDir string, bundle AuthBundle) error {
 				return err
 			}
 		}
-		// Remove optional stale files from earlier logins that are no longer present.
+		// Delete optional files that the new bundle does not contain.
 		for _, sp := range specs {
 			if !present[sp.Name] {
-				_ = os.Remove(filepath.Join(agentDir, sp.Name))
+				stalePath := filepath.Join(agentDir, sp.Name)
+				if rErr := os.Remove(stalePath); rErr != nil && !os.IsNotExist(rErr) {
+					return fmt.Errorf("remove stale credential %s: %w", stalePath, rErr)
+				}
 			}
 		}
 	}
 	return nil
 }
 
-// LoadAuthBundle reads saved credential files for the requested agents from $DATA_DIR/auth.
-// Missing directories return an empty AuthBundle without error. Symlinks fail closed.
+// LoadAuthBundle reads saved credential files for agents from $DATA_DIR/auth.
+// Missing directories return an empty AuthBundle without error.
 func LoadAuthBundle(dataDir string, agents []string) (AuthBundle, error) {
 	if dataDir == "" {
 		return AuthBundle{}, errors.New("data directory path must not be empty")
 	}
-	if err := verifyOptionalPrivateDir(dataDir); err != nil {
+	if err := verifyOptionalDir(dataDir); err != nil {
 		return AuthBundle{}, err
 	}
 	authRoot := filepath.Join(dataDir, "auth")
-	if err := verifyOptionalPrivateDir(authRoot); err != nil {
+	if err := verifyOptionalDir(authRoot); err != nil {
 		return AuthBundle{}, err
 	}
 	if _, err := os.Lstat(authRoot); os.IsNotExist(err) {
@@ -363,7 +402,7 @@ func LoadAuthBundle(dataDir string, agents []string) (AuthBundle, error) {
 			return AuthBundle{}, err
 		}
 		agentDir := filepath.Join(authRoot, agent)
-		if err := verifyOptionalPrivateDir(agentDir); err != nil {
+		if err := verifyOptionalDir(agentDir); err != nil {
 			return AuthBundle{}, err
 		}
 		if _, err := os.Lstat(agentDir); os.IsNotExist(err) {
@@ -373,7 +412,7 @@ func LoadAuthBundle(dataDir string, agents []string) (AuthBundle, error) {
 		hasRequired := true
 		for _, sp := range specs {
 			p := filepath.Join(agentDir, sp.Name)
-			data, exists, rErr := readSafeRegularFile(p, MaxAuthFileBytes)
+			data, exists, rErr := readSafeRegularFile(p, maxAuthFileBytes)
 			if rErr != nil {
 				return AuthBundle{}, rErr
 			}
@@ -401,43 +440,40 @@ func LoadAuthBundle(dataDir string, agents []string) (AuthBundle, error) {
 	return AuthBundle{Files: files}, nil
 }
 
-// AuthStatus reports whether valid saved credentials exist for antigravity and opencode.
+// AuthStatus reports whether valid saved credentials exist for each supported agent.
 func AuthStatus(dataDir string) (map[string]bool, error) {
-	status := map[string]bool{
-		"antigravity": false,
-		"opencode":    false,
-	}
-	for _, agent := range []string{"antigravity", "opencode"} {
-		bundle, err := LoadAuthBundle(dataDir, []string{agent})
+	status := make(map[string]bool, len(supportedAgents))
+	for _, entry := range supportedAgents {
+		bundle, err := LoadAuthBundle(dataDir, []string{entry.agent})
 		if err != nil {
 			return nil, err
 		}
-		status[agent] = !bundle.IsEmpty()
+		status[entry.agent] = !bundle.IsEmpty()
 	}
 	return status, nil
 }
 
 // RemoveAuth deletes saved credentials for antigravity, opencode, or all from $DATA_DIR/auth.
 func RemoveAuth(dataDir, target string) error {
-	if err := verifyOptionalPrivateDir(dataDir); err != nil {
+	if err := verifyOptionalDir(dataDir); err != nil {
 		return err
 	}
 	authRoot := filepath.Join(dataDir, "auth")
-	if err := verifyOptionalPrivateDir(authRoot); err != nil {
+	if err := verifyOptionalDir(authRoot); err != nil {
 		return err
 	}
 	var agents []string
-	switch target {
-	case "", "all":
-		agents = []string{"antigravity", "opencode"}
-	case "antigravity", "opencode":
+	switch {
+	case target == "" || target == "all":
+		agents = supportedAgentNames()
+	case isSupportedAgent(target):
 		agents = []string{target}
 	default:
 		return fmt.Errorf("unknown logout target %q (expected antigravity, opencode, or all)", target)
 	}
 	for _, ag := range agents {
 		agentDir := filepath.Join(authRoot, ag)
-		if err := verifyOptionalPrivateDir(agentDir); err != nil {
+		if err := verifyOptionalDir(agentDir); err != nil {
 			return err
 		}
 		if err := os.RemoveAll(agentDir); err != nil && !os.IsNotExist(err) {
@@ -447,8 +483,7 @@ func RemoveAuth(dataDir, target string) error {
 	return nil
 }
 
-// ValidateSkillName checks a global skill directory name.
-func ValidateSkillName(raw string) (string, error) {
+func validateSkillName(raw string) (string, error) {
 	if raw == "" {
 		return "", errors.New("skill name must not be empty")
 	}
@@ -474,17 +509,26 @@ func ValidateSkillName(raw string) (string, error) {
 	return raw, nil
 }
 
-// InspectSkillsDir validates $DATA_DIR/skills and returns sorted names of skills containing SKILL.md.
-// If skillsDir does not exist, InspectSkillsDir returns nil, nil.
-// Symlinks, special files, or msb delimiter characters fail closed.
-func InspectSkillsDir(skillsDir string) ([]string, error) {
-	if skillsDir == "" {
-		return nil, errors.New("skills directory path must not be empty")
+func validateMountDir(dir, label string) error {
+	if dir == "" {
+		return fmt.Errorf("%s directory path must not be empty", label)
 	}
-	for _, r := range skillsDir {
-		if r < 0x20 || r == 0x7f || r == ':' || r == ',' {
-			return nil, fmt.Errorf("skills directory %q contains unsupported characters for msb mounts", skillsDir)
+	if strings.ContainsAny(dir, ":,") {
+		return fmt.Errorf("%s directory %q cannot contain ':' or ','", label, dir)
+	}
+	for _, r := range dir {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%s directory %q contains control characters", label, dir)
 		}
+	}
+	return nil
+}
+
+// InspectSkillsDir checks $DATA_DIR/skills and returns sorted skill names containing SKILL.md.
+// If skillsDir does not exist, InspectSkillsDir returns nil, nil.
+func InspectSkillsDir(skillsDir string) ([]string, error) {
+	if err := validateMountDir(skillsDir, "skills"); err != nil {
+		return nil, err
 	}
 	info, err := os.Lstat(skillsDir)
 	if os.IsNotExist(err) {
@@ -511,10 +555,13 @@ func InspectSkillsDir(skillsDir string) ([]string, error) {
 	var names []string
 	for _, entry := range entries {
 		if !entry.IsDir() {
-			continue
+			return nil, fmt.Errorf("refusing non-directory entry %q in skills directory", entry.Name())
 		}
 		name := entry.Name()
-		if _, vErr := ValidateSkillName(name); vErr != nil {
+		if strings.HasPrefix(name, ".") {
+			return nil, fmt.Errorf("refusing hidden entry %q in skills directory", name)
+		}
+		if _, vErr := validateSkillName(name); vErr != nil {
 			return nil, vErr
 		}
 		skillFile := filepath.Join(skillsDir, name, "SKILL.md")
@@ -550,10 +597,13 @@ func walkRejectSymlinksAndSpecial(root string) error {
 	})
 }
 
-// InstallSkill validates srcPath (a skill directory or SKILL.md path) and copies it into skillsDir/<name>.
+// InstallSkill checks srcPath (a skill directory or SKILL.md path) and installs it in skillsDir/<name>.
 func InstallSkill(skillsDir, srcPath string, force bool) (string, error) {
 	if srcPath == "" {
 		return "", errors.New("skill source path must not be empty")
+	}
+	if err := validateMountDir(skillsDir, "skills"); err != nil {
+		return "", err
 	}
 	resolved, err := filepath.EvalSymlinks(srcPath)
 	if err != nil {
@@ -571,7 +621,7 @@ func InstallSkill(skillsDir, srcPath string, force bool) (string, error) {
 		srcDir = filepath.Dir(resolved)
 	}
 
-	skillName, err := ValidateSkillName(filepath.Base(srcDir))
+	skillName, err := validateSkillName(filepath.Base(srcDir))
 	if err != nil {
 		return "", err
 	}
@@ -584,7 +634,8 @@ func InstallSkill(skillsDir, srcPath string, force bool) (string, error) {
 		return "", fmt.Errorf("refusing non-regular SKILL.md in %s", srcDir)
 	}
 
-	if err := config.EnsurePrivateDir(filepath.Dir(skillsDir)); err != nil {
+	stageParent := filepath.Dir(skillsDir)
+	if err := config.EnsurePrivateDir(stageParent); err != nil {
 		return "", err
 	}
 	if err := config.EnsurePrivateDir(skillsDir); err != nil {
@@ -592,27 +643,36 @@ func InstallSkill(skillsDir, srcPath string, force bool) (string, error) {
 	}
 
 	dstDir := filepath.Join(skillsDir, skillName)
-	if _, statErr := os.Lstat(dstDir); statErr == nil {
+	dstInfo, dstStatErr := os.Lstat(dstDir)
+	dstExists := dstStatErr == nil
+	if dstStatErr != nil && !os.IsNotExist(dstStatErr) {
+		return "", dstStatErr
+	}
+	if dstExists {
+		if dstInfo.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("refusing symlinked skill destination %q", dstDir)
+		}
 		if !force {
 			return "", fmt.Errorf("skill %q already exists (pass --force to replace it)", skillName)
 		}
 	}
 
-	stageDir, err := os.MkdirTemp(skillsDir, ".skill-stage.*")
+	workDir, err := os.MkdirTemp(stageParent, ".agbox-stage-*")
 	if err != nil {
 		return "", fmt.Errorf("create staging directory: %w", err)
 	}
-	cleanupStage := true
 	defer func() {
-		if cleanupStage {
-			_ = os.RemoveAll(stageDir)
-		}
+		_ = os.RemoveAll(workDir)
 	}()
-	if err := os.Chmod(stageDir, 0o700); err != nil {
-		return "", err
+
+	stageDir := filepath.Join(workDir, "staged")
+	if err := os.Mkdir(stageDir, 0o755); err != nil {
+		return "", fmt.Errorf("create staged skill directory: %w", err)
 	}
 
 	vcsNames := pathsec.DefaultVCSNames()
+	fileCount := 0
+	var totalBytes int64
 	err = filepath.WalkDir(srcDir, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -640,19 +700,20 @@ func InstallSkill(skillsDir, srcPath string, force bool) (string, error) {
 		if !d.Type().IsRegular() {
 			return fmt.Errorf("refusing non-regular file in skill source: %s", p)
 		}
-		fInfo, iErr := d.Info()
-		if iErr != nil {
-			return iErr
+		fileCount++
+		if fileCount > maxSkillFiles {
+			return fmt.Errorf("skill %q exceeds %d files", skillName, maxSkillFiles)
 		}
-		if fInfo.Size() > MaxSkillFileBytes {
-			return fmt.Errorf("skill file %s exceeds %d bytes", p, MaxSkillFileBytes)
-		}
-		raw, readErr := os.ReadFile(p)
+		raw, st, readErr := readRegularNoFollowWithStat(p, maxSkillFileBytes)
 		if readErr != nil {
-			return readErr
+			return fmt.Errorf("read skill file %s: %w", p, readErr)
+		}
+		totalBytes += int64(len(raw))
+		if totalBytes > maxSkillTotalBytes {
+			return fmt.Errorf("skill %q exceeds %d total bytes", skillName, maxSkillTotalBytes)
 		}
 		perm := fs.FileMode(0o644)
-		if fInfo.Mode()&0o111 != 0 {
+		if st.Mode()&0o111 != 0 {
 			perm = 0o755
 		}
 		return os.WriteFile(dstPath, raw, perm)
@@ -661,23 +722,32 @@ func InstallSkill(skillsDir, srcPath string, force bool) (string, error) {
 		return "", err
 	}
 
-	if err := os.RemoveAll(dstDir); err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("replace existing skill %q: %w", skillName, err)
+	backupDir := ""
+	if dstExists {
+		backupDir = filepath.Join(workDir, "backup")
+		if err := os.Rename(dstDir, backupDir); err != nil {
+			return "", fmt.Errorf("back up existing skill %q: %w", skillName, err)
+		}
 	}
 	if err := os.Rename(stageDir, dstDir); err != nil {
-		return "", fmt.Errorf("commit skill %q: %w", skillName, err)
+		installErr := fmt.Errorf("commit skill %q: %w", skillName, err)
+		if backupDir != "" {
+			if rbErr := os.Rename(backupDir, dstDir); rbErr != nil {
+				installErr = errors.Join(installErr, fmt.Errorf("restore skill backup %q: %w", skillName, rbErr))
+			}
+		}
+		return "", installErr
 	}
-	cleanupStage = false
 	return skillName, nil
 }
 
 // RemoveSkill deletes skillsDir/<name>.
 func RemoveSkill(skillsDir, rawName string) error {
-	name, err := ValidateSkillName(rawName)
+	name, err := validateSkillName(rawName)
 	if err != nil {
 		return err
 	}
-	if err := verifyOptionalPrivateDir(skillsDir); err != nil {
+	if err := verifyOptionalDir(skillsDir); err != nil {
 		return err
 	}
 	target := filepath.Join(skillsDir, name)
@@ -694,8 +764,8 @@ func RemoveSkill(skillsDir, rawName string) error {
 	return os.RemoveAll(target)
 }
 
-// BuildGuestSkillsMountScript returns an idempotent root sh script that bind-mounts
-// /home/agent/.agbox-skills read-only into both agy and opencode global skill paths.
+// BuildGuestSkillsMountScript returns a root sh script that bind-mounts
+// /home/agent/.agbox-skills read-only into both agy and opencode skill paths.
 func BuildGuestSkillsMountScript() string {
 	return `set -eu
 mkdir -p /home/agent/.gemini/config/skills /home/agent/.config/opencode/skills
@@ -703,19 +773,20 @@ chown 1000:1000 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.conf
 chmod 0700 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.config /home/agent/.config/opencode
 if ! grep -qs ' /home/agent/.gemini/config/skills ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-skills /home/agent/.gemini/config/skills
-  mount -o remount,ro,bind /home/agent/.gemini/config/skills 2>/dev/null || true
+  mount -o remount,ro,bind /home/agent/.gemini/config/skills
 fi
-	if ! grep -qs ' /home/agent/.config/opencode/skills ' /proc/self/mountinfo; then
-	  mount --bind /home/agent/.agbox-skills /home/agent/.config/opencode/skills
-	  mount -o remount,ro,bind /home/agent/.config/opencode/skills 2>/dev/null || true
-	fi
+if ! grep -qs ' /home/agent/.config/opencode/skills ' /proc/self/mountinfo; then
+  mount --bind /home/agent/.agbox-skills /home/agent/.config/opencode/skills
+  mount -o remount,ro,bind /home/agent/.config/opencode/skills
+fi
 `
 }
 
-// ValidateRuleName normalizes and validates a global rule name (stripping an optional .md suffix).
+// ValidateRuleName normalizes and checks a global rule name.
+// It strips an optional lowercase .md suffix.
 func ValidateRuleName(raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
-	if len(trimmed) > 3 && strings.EqualFold(trimmed[len(trimmed)-3:], ".md") {
+	if len(trimmed) > 3 && strings.HasSuffix(trimmed, ".md") {
 		trimmed = trimmed[:len(trimmed)-3]
 	}
 	if trimmed == "" {
@@ -734,27 +805,19 @@ func ValidateRuleName(raw string) (string, error) {
 			continue
 		}
 		if !isAlphaNum && c != '-' && c != '_' && c != '.' {
-			return "", fmt.Errorf("invalid rule name %q: only ASCII letters, digits, '.', '-', and '_' are allowed", raw)
+			return "", fmt.Errorf("invalid rule name %q: use only ASCII letters, digits, '.', '-', or '_'", raw)
 		}
 	}
 	return trimmed, nil
 }
 
-// InspectRulesDir validates rulesDir (rejecting symlinks, subdirectories, special files, and unsafe names)
-// and returns sorted rule names (without the .md extension). Returns nil, nil if rulesDir does not exist.
+// InspectRulesDir checks rulesDir and returns sorted rule names without .md.
+// If rulesDir does not exist, InspectRulesDir returns nil, nil.
 func InspectRulesDir(rulesDir string) ([]string, error) {
-	if rulesDir == "" {
-		return nil, errors.New("rules directory path must not be empty")
+	if err := validateMountDir(rulesDir, "rules"); err != nil {
+		return nil, err
 	}
-	if strings.ContainsAny(rulesDir, ":,") {
-		return nil, fmt.Errorf("rules directory %q cannot contain ':' or ','", rulesDir)
-	}
-	for _, r := range rulesDir {
-		if r < 0x20 || r == 0x7f {
-			return nil, fmt.Errorf("rules directory %q contains control characters", rulesDir)
-		}
-	}
-	if err := verifyOptionalPrivateDir(rulesDir); err != nil {
+	if err := verifyOptionalDir(rulesDir); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(rulesDir)
@@ -782,15 +845,15 @@ func InspectRulesDir(rulesDir string) ([]string, error) {
 			return nil, fmt.Errorf("refusing non-regular file inside rules directory: %s", entryPath)
 		}
 		base := entry.Name()
-		if len(base) <= 3 || !strings.EqualFold(base[len(base)-3:], ".md") {
+		if len(base) <= 3 || !strings.HasSuffix(base, ".md") {
 			return nil, fmt.Errorf("refusing non-Markdown file inside rules directory: %s", entryPath)
 		}
 		stem, vErr := ValidateRuleName(base)
 		if vErr != nil {
 			return nil, vErr
 		}
-		if info.Size() == 0 || info.Size() > MaxRuleFileBytes {
-			return nil, fmt.Errorf("rule file %s has invalid size %d bytes (limit %d)", entryPath, info.Size(), MaxRuleFileBytes)
+		if info.Size() == 0 || info.Size() > maxRuleFileBytes {
+			return nil, fmt.Errorf("rule file %s has invalid size %d bytes (limit %d)", entryPath, info.Size(), maxRuleFileBytes)
 		}
 		names = append(names, stem)
 	}
@@ -798,10 +861,13 @@ func InspectRulesDir(rulesDir string) ([]string, error) {
 	return names, nil
 }
 
-// InstallRule validates srcPath (a Markdown file) and writes it atomically to rulesDir/<name>.md.
+// InstallRule checks srcPath and writes it atomically to rulesDir/<name>.md.
 func InstallRule(rulesDir, srcPath, overrideName string, force bool) (string, int, error) {
 	if srcPath == "" {
 		return "", 0, errors.New("rule source path must not be empty")
+	}
+	if err := validateMountDir(rulesDir, "rules"); err != nil {
+		return "", 0, err
 	}
 	resolved, err := filepath.EvalSymlinks(srcPath)
 	if err != nil {
@@ -814,27 +880,24 @@ func InstallRule(rulesDir, srcPath, overrideName string, force bool) (string, in
 	if !info.Mode().IsRegular() {
 		return "", 0, fmt.Errorf("expected a regular Markdown file, got %s", srcPath)
 	}
-	if info.Size() == 0 {
-		return "", 0, fmt.Errorf("rule file %s is empty", srcPath)
+
+	raw, _, err := readRegularNoFollowWithStat(resolved, maxRuleFileBytes)
+	if err != nil {
+		return "", 0, fmt.Errorf("rule file %s: %w", srcPath, err)
 	}
-	if info.Size() > MaxRuleFileBytes {
-		return "", 0, fmt.Errorf("rule file %s exceeds %d bytes", srcPath, MaxRuleFileBytes)
+	if len(raw) == 0 {
+		return "", 0, fmt.Errorf("rule file %s is empty", srcPath)
 	}
 
 	rawName := overrideName
 	if rawName == "" {
 		base := filepath.Base(resolved)
-		if len(base) <= 3 || !strings.EqualFold(base[len(base)-3:], ".md") {
+		if len(base) <= 3 || !strings.HasSuffix(base, ".md") {
 			return "", 0, fmt.Errorf("rule file %s must end in .md (or pass --name <name>)", srcPath)
 		}
 		rawName = base
 	}
 	ruleName, err := ValidateRuleName(rawName)
-	if err != nil {
-		return "", 0, err
-	}
-
-	raw, err := os.ReadFile(resolved)
 	if err != nil {
 		return "", 0, err
 	}
@@ -852,7 +915,7 @@ func InstallRule(rulesDir, srcPath, overrideName string, force bool) (string, in
 		return "", 0, err
 	}
 
-	// Ensure existing rulesDir has no symlinks or invalid entries before writing.
+	// Check that rulesDir contains no symlinks or invalid files before writing.
 	if _, err := InspectRulesDir(rulesDir); err != nil {
 		return "", 0, err
 	}
@@ -867,7 +930,7 @@ func InstallRule(rulesDir, srcPath, overrideName string, force bool) (string, in
 	return ruleName, len(raw), nil
 }
 
-// ReadRule reads rulesDir/<name>.md after validating rulesDir.
+// ReadRule reads rulesDir/<name>.md after checking rulesDir.
 func ReadRule(rulesDir, rawName string) ([]byte, error) {
 	name, err := ValidateRuleName(rawName)
 	if err != nil {
@@ -877,7 +940,7 @@ func ReadRule(rulesDir, rawName string) ([]byte, error) {
 		return nil, err
 	}
 	target := filepath.Join(rulesDir, name+".md")
-	raw, ok, err := readSafeRegularFile(target, MaxRuleFileBytes)
+	raw, ok, err := readSafeRegularFile(target, maxRuleFileBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -893,7 +956,7 @@ func RemoveRule(rulesDir, rawName string) error {
 	if err != nil {
 		return err
 	}
-	if err := verifyOptionalPrivateDir(rulesDir); err != nil {
+	if err := verifyOptionalDir(rulesDir); err != nil {
 		return err
 	}
 	target := filepath.Join(rulesDir, name+".md")
@@ -924,9 +987,61 @@ func RemoveAllRules(rulesDir string) error {
 	return nil
 }
 
-// BuildGuestRulesStageScript returns a POSIX sh script that compiles rule files from
-// srcMount into stageRoot/AGENTS.md (always-on rules) and stageRoot/rules/*.md (conditional agy rules).
-func BuildGuestRulesStageScript(srcMount, stageRoot string) string {
+// DefaultEnvRuleName defines the stem of the default environment rule file.
+const DefaultEnvRuleName = "AGBOX_ENV_RULES"
+
+const defaultEnvRuleMarkdown = "" +
+	"# Operating Inside an agbox Sandbox\n\n" +
+	"## Guest Identity and Privileges\n\n" +
+	"- You run as `agent` (`1000:1000`) inside a disposable Linux microVM with passwordless `sudo`.\n" +
+	"- You control the guest OS. Use `sudo` to install packages, manage services, or run privileged tests.\n" +
+	"- Installed system packages and files outside `/workspace` disappear on exit unless the host uses `--persist`.\n\n" +
+	"## Workspace Shares and Permissions\n\n" +
+	"- Host shares appear at `/workspace/<name>`. The `/workspace` root directory itself rejects direct file creation (`EROFS`).\n" +
+	"- Assume `/workspace` masks `.git` and all other VCS directories and hooks by default (`ENOENT` or `EPERM`).\n" +
+	"- When `git` commands fail, search and read files directly with `rg` instead of running `git init`.\n" +
+	"- Stop and tell the user if `/workspace` returns `EROFS` (read-only share), `EPERM` (protected VCS path), or `ESTALE` (detached share).\n" +
+	"- Ask the user to grant access from the host with `agbox share add` or `agbox share set --rw`.\n" +
+	"- Never mount overlays or bind-mounts over `/workspace`, and never write project deliverables to `/tmp` or `/home/agent`.\n" +
+	"- Keep symlinks relative and inside the same share. Host confinement rejects symlinks that escape a share root.\n\n" +
+	"## Host Mounts, Hardware, and Network Boundaries\n\n" +
+	"- Treat `/home/agent/.agbox-*`, global skills, and global `AGENTS.md` files as read-only host mounts. Never unmount or shadow them.\n" +
+	"- `/dev/kvm` and host `msb` commands do not exist inside the microVM. Do not run nested microVM workloads.\n" +
+	"- Run unprivileged FUSE mount tests with `fusermount3`, or use `sudo` when `/dev/fuse` requires root access.\n" +
+	"- Outbound DNS and public internet work by default unless the host starts the sandbox with `--no-net`.\n" +
+	"- The default firewall blocks host, private LAN, link-local, multicast, and cloud metadata addresses. Stop and tell the user if a task needs `--net` changes.\n" +
+	"- Never print, log, or copy credentials from `/home/agent/.agbox-keys.sh` or environment variables into `/workspace`.\n"
+
+// EnsureDefaultEnvRule writes the default environment rule to rulesDir when missing.
+// It returns true when it creates the file, or false when the file already exists.
+func EnsureDefaultEnvRule(rulesDir string) (bool, error) {
+	if err := validateMountDir(rulesDir, "rules"); err != nil {
+		return false, err
+	}
+	if err := config.EnsurePrivateDir(filepath.Dir(rulesDir)); err != nil {
+		return false, err
+	}
+	if err := config.EnsurePrivateDir(rulesDir); err != nil {
+		return false, err
+	}
+	if _, err := InspectRulesDir(rulesDir); err != nil {
+		return false, err
+	}
+	dstPath := filepath.Join(rulesDir, DefaultEnvRuleName+".md")
+	_, err := os.Lstat(dstPath)
+	if err == nil {
+		return false, nil
+	}
+	if !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat default rule %s: %w", dstPath, err)
+	}
+	if err := writeModeFileAtomic(dstPath, []byte(defaultEnvRuleMarkdown), 0o644); err != nil {
+		return false, fmt.Errorf("write default rule %s: %w", dstPath, err)
+	}
+	return true, nil
+}
+
+func buildGuestRulesStageScript(srcMount, stageRoot string) string {
 	qSrc := msb.ShellQuote(srcMount)
 	qStage := msb.ShellQuote(stageRoot)
 	return fmt.Sprintf(`set -eu
@@ -938,8 +1053,11 @@ chmod 0755 "$stage" "$stage/rules"
 
 process_rule() {
   f="$1"
+  if [ -L "$f" ]; then
+    echo "agbox rejects symlinked rule $f" >&2
+    exit 1
+  fi
   [ -f "$f" ] || return 0
-  [ ! -L "$f" ] || exit 1
   first_line=$(sed -n '1p' "$f" | tr -d '\r')
   if [ "$first_line" = "---" ]; then
     fm=$(awk 'NR==1{next} /^---\r?$/{exit} {print}' "$f")
@@ -962,12 +1080,12 @@ process_rule() {
 }
 
 for prio in AGENTS.md GEMINI.md; do
-  if [ -f "$src/$prio" ]; then
+  if [ -e "$src/$prio" ] || [ -L "$src/$prio" ]; then
     process_rule "$src/$prio"
   fi
 done
 for f in "$src"/*.md; do
-  [ -e "$f" ] || continue
+  [ -e "$f" ] || [ -L "$f" ] || continue
   b=$(basename "$f")
   if [ "$b" = "AGENTS.md" ] || [ "$b" = "GEMINI.md" ]; then
     continue
@@ -980,8 +1098,8 @@ fi
 `, qSrc, qStage)
 }
 
-// BuildGuestRulesMountScript returns an idempotent root sh script that stages
-// /home/agent/.agbox-rules and bind-mounts read-only global rules for agy and opencode.
+// BuildGuestRulesMountScript returns a root sh script that stages /home/agent/.agbox-rules
+// and bind-mounts read-only global rules for agy and opencode.
 func BuildGuestRulesMountScript() string {
 	return `set -eu
 mkdir -p /home/agent/.gemini/config /home/agent/.config/opencode
@@ -993,7 +1111,7 @@ for mp in /home/agent/.gemini/config/AGENTS.md /home/agent/.config/opencode/AGEN
     umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
   fi
 done
-` + BuildGuestRulesStageScript(msb.GuestRulesMount, "/etc/agbox-global-rules") + `
+` + buildGuestRulesStageScript(msb.GuestRulesMount, "/etc/agbox-global-rules") + `
 if [ -s /etc/agbox-global-rules/AGENTS.md ]; then
   for dst in /home/agent/.gemini/config/AGENTS.md /home/agent/.config/opencode/AGENTS.md; do
     rm -rf "$dst"
@@ -1001,7 +1119,7 @@ if [ -s /etc/agbox-global-rules/AGENTS.md ]; then
     chown 1000:1000 "$dst"
     chmod 0644 "$dst"
     mount --bind /etc/agbox-global-rules/AGENTS.md "$dst"
-    mount -o remount,ro,bind "$dst" 2>/dev/null || true
+    mount -o remount,ro,bind "$dst"
   done
 fi
 if [ -n "$(ls -A /etc/agbox-global-rules/rules 2>/dev/null)" ]; then
@@ -1009,7 +1127,7 @@ if [ -n "$(ls -A /etc/agbox-global-rules/rules 2>/dev/null)" ]; then
   chown 1000:1000 /home/agent/.gemini/config/rules
   chmod 0755 /home/agent/.gemini/config/rules
   mount --bind /etc/agbox-global-rules/rules /home/agent/.gemini/config/rules
-  mount -o remount,ro,bind /home/agent/.gemini/config/rules 2>/dev/null || true
+  mount -o remount,ro,bind /home/agent/.gemini/config/rules
 fi
 `
 }
@@ -1052,7 +1170,7 @@ func IsProfileVolumeName(vol string) bool {
 	return err == nil
 }
 
-// ProfileMeta records metadata for a persistent conversation profile in $DATA_DIR/profiles/<name>/profile.json.
+// ProfileMeta records metadata for a conversation profile in $DATA_DIR/profiles/<name>/profile.json.
 type ProfileMeta struct {
 	Name      string `json:"name"`
 	Volume    string `json:"volume"`
@@ -1060,7 +1178,7 @@ type ProfileMeta struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// ProfileLock holds an exclusive flock on $DATA_DIR/profiles/<name>/profile.lock.
+// ProfileLock holds an exclusive flock on $DATA_DIR/profiles/.<name>.lock.
 type ProfileLock struct {
 	file *os.File
 }
@@ -1076,7 +1194,7 @@ func (l *ProfileLock) Unlock() error {
 	return err
 }
 
-// LockProfile acquires a non-blocking exclusive lock for profile name.
+// LockProfile acquires a non-blocking exclusive lock for profile rawName.
 func LockProfile(dataDir, rawName string) (*ProfileLock, error) {
 	name, err := ValidateProfileName(rawName)
 	if err != nil {
@@ -1089,27 +1207,39 @@ func LockProfile(dataDir, rawName string) (*ProfileLock, error) {
 	if err := config.EnsurePrivateDir(profilesRoot); err != nil {
 		return nil, err
 	}
-	profDir := filepath.Join(profilesRoot, name)
-	if err := config.EnsurePrivateDir(profDir); err != nil {
-		return nil, err
+	lockPath := filepath.Join(profilesRoot, "."+name+".lock")
+	if info, sErr := os.Lstat(lockPath); sErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing symlinked profile lock %s", lockPath)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("refusing non-regular profile lock %s", lockPath)
+		}
 	}
-	lockPath := filepath.Join(profDir, "profile.lock")
-	if info, sErr := os.Lstat(lockPath); sErr == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("refusing symlinked profile lock %s", lockPath)
-	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("refusing symlinked profile lock %s", lockPath)
+		}
 		return nil, fmt.Errorf("open profile lock %s: %w", lockPath, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	f := os.NewFile(uintptr(fd), lockPath)
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("profile %q is locked by another active agbox process", name)
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, fmt.Errorf("another active agbox process holds the lock on profile %q", name)
+		}
+		return nil, fmt.Errorf("lock profile %q: %w", name, err)
 	}
 	return &ProfileLock{file: f}, nil
 }
 
-// SaveProfileMeta writes profile.json atomically with mode 0600.
+// SaveProfileMeta writes profile.json atomically at mode 0600.
 func SaveProfileMeta(dataDir string, meta ProfileMeta) error {
+	return saveProfileMetaAt(dataDir, meta, time.Now)
+}
+
+func saveProfileMetaAt(dataDir string, meta ProfileMeta, now func() time.Time) error {
 	name, err := ValidateProfileName(meta.Name)
 	if err != nil {
 		return err
@@ -1118,7 +1248,10 @@ func SaveProfileMeta(dataDir string, meta ProfileMeta) error {
 		meta.Volume = FormatProfileVolumeName(name)
 	}
 	if meta.CreatedAt == "" {
-		meta.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+		if now == nil {
+			now = time.Now
+		}
+		meta.CreatedAt = now().UTC().Format(time.RFC3339)
 	}
 	if err := config.EnsurePrivateDir(dataDir); err != nil {
 		return err
@@ -1139,11 +1272,11 @@ func SaveProfileMeta(dataDir string, meta ProfileMeta) error {
 
 // ListProfiles returns sorted ProfileMeta entries stored under $DATA_DIR/profiles.
 func ListProfiles(dataDir string) ([]ProfileMeta, error) {
-	if err := verifyOptionalPrivateDir(dataDir); err != nil {
+	if err := verifyOptionalDir(dataDir); err != nil {
 		return nil, err
 	}
 	profilesRoot := filepath.Join(dataDir, "profiles")
-	if err := verifyOptionalPrivateDir(profilesRoot); err != nil {
+	if err := verifyOptionalDir(profilesRoot); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(profilesRoot)
@@ -1155,15 +1288,27 @@ func ListProfiles(dataDir string) ([]ProfileMeta, error) {
 	}
 	var out []ProfileMeta
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		entryName := entry.Name()
+		if strings.HasPrefix(entryName, ".") {
 			continue
 		}
-		name, vErr := ValidateProfileName(entry.Name())
+		fullDir := filepath.Join(profilesRoot, entryName)
+		info, lErr := os.Lstat(fullDir)
+		if lErr != nil {
+			return nil, lErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing symlinked profile directory %s", fullDir)
+		}
+		if !info.IsDir() {
+			continue
+		}
+		name, vErr := ValidateProfileName(entryName)
 		if vErr != nil {
 			continue
 		}
-		metaPath := filepath.Join(profilesRoot, name, "profile.json")
-		raw, exists, rErr := readSafeRegularFile(metaPath, MaxAuthFileBytes)
+		metaPath := filepath.Join(fullDir, "profile.json")
+		raw, exists, rErr := readSafeRegularFile(metaPath, maxProfileMetaBytes)
 		if rErr != nil {
 			return nil, rErr
 		}
@@ -1171,9 +1316,13 @@ func ListProfiles(dataDir string) ([]ProfileMeta, error) {
 			continue
 		}
 		var pm ProfileMeta
-		if err := json.Unmarshal(raw, &pm); err == nil && pm.Name != "" {
-			out = append(out, pm)
+		if err := json.Unmarshal(raw, &pm); err != nil {
+			return nil, fmt.Errorf("parse profile metadata %s: %w", metaPath, err)
 		}
+		if pm.Name != name {
+			return nil, fmt.Errorf("profile metadata name mismatch in %s: got %q, want %q", metaPath, pm.Name, name)
+		}
+		out = append(out, pm)
 	}
 	slices.SortFunc(out, func(a, b ProfileMeta) int {
 		return strings.Compare(a.Name, b.Name)
@@ -1182,32 +1331,32 @@ func ListProfiles(dataDir string) ([]ProfileMeta, error) {
 }
 
 // RemoveProfileDir deletes $DATA_DIR/profiles/<name>.
+// The caller must hold ProfileLock across RemoveProfileDir and unlock afterward.
 func RemoveProfileDir(dataDir, rawName string) error {
 	name, err := ValidateProfileName(rawName)
 	if err != nil {
 		return err
 	}
-	if err := verifyOptionalPrivateDir(dataDir); err != nil {
+	if err := verifyOptionalDir(dataDir); err != nil {
 		return err
 	}
 	profilesRoot := filepath.Join(dataDir, "profiles")
-	if err := verifyOptionalPrivateDir(profilesRoot); err != nil {
+	if err := verifyOptionalDir(profilesRoot); err != nil {
 		return err
 	}
 	profDir := filepath.Join(profilesRoot, name)
-	if err := verifyOptionalPrivateDir(profDir); err != nil {
+	if err := verifyOptionalDir(profDir); err != nil {
 		return err
 	}
 	return os.RemoveAll(profDir)
 }
 
-// BuildGuestProfileMountScript returns an idempotent root sh script that initializes
-// /home/agent/.agbox-profile on ext4 and bind-mounts agent conversation directories.
-// Global skills, hooks, plugins, and MCP configs remain outside the profile disk.
+// BuildGuestProfileMountScript returns a root sh script that initializes
+// /home/agent/.agbox-profile on ext4 and bind-mounts conversation directories.
 func BuildGuestProfileMountScript() string {
 	return `set -eu
 if ! grep -qs ' /home/agent/.agbox-profile ' /proc/self/mountinfo; then
-  echo "profile disk is not mounted at /home/agent/.agbox-profile" >&2
+  echo "agbox cannot find the profile disk at /home/agent/.agbox-profile" >&2
   exit 1
 fi
 mkdir -p \
@@ -1274,7 +1423,7 @@ sync
 `
 }
 
-// ValidateSessionID checks a conversation or session identifier passed to --session or --conversation.
+// ValidateSessionID checks a conversation or session ID passed to --session or --conversation.
 func ValidateSessionID(raw string) (string, error) {
 	if raw == "" {
 		return "", errors.New("session ID must not be empty")
@@ -1286,18 +1435,18 @@ func ValidateSessionID(raw string) (string, error) {
 		isAlnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 		if i == 0 {
 			if !isAlnum {
-				return "", fmt.Errorf("invalid session ID %q: must start with a letter or digit", raw)
+				return "", fmt.Errorf("invalid session ID %q: must start with an ASCII letter or digit", raw)
 			}
 			continue
 		}
 		if !isAlnum && r != '.' && r != '_' && r != ':' && r != '-' {
-			return "", fmt.Errorf("invalid session ID %q: only letters, digits, '.', '_', ':', and '-' are allowed", raw)
+			return "", fmt.Errorf("invalid session ID %q: use only ASCII letters, digits, '.', '_', ':', or '-'", raw)
 		}
 	}
 	return raw, nil
 }
 
-func verifyOptionalPrivateDir(dir string) error {
+func verifyOptionalDir(dir string) error {
 	if dir == "" {
 		return errors.New("directory path must not be empty")
 	}
@@ -1317,25 +1466,51 @@ func verifyOptionalPrivateDir(dir string) error {
 	return nil
 }
 
+func readRegularNoFollow(path string, maxBytes int64) ([]byte, error) {
+	data, _, err := readRegularNoFollowWithStat(path, maxBytes)
+	return data, err
+}
+
+func readRegularNoFollowWithStat(path string, maxBytes int64) ([]byte, os.FileInfo, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, nil, fmt.Errorf("refusing symlinked file %q", path)
+		}
+		if info, lErr := os.Lstat(path); lErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			return nil, nil, fmt.Errorf("refusing symlinked file %q", path)
+		}
+		return nil, nil, err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("refusing non-regular file %q", path)
+	}
+	if st.Size() > maxBytes {
+		return nil, nil, fmt.Errorf("%s exceeds %d bytes", path, maxBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, nil, fmt.Errorf("%s exceeds %d bytes", path, maxBytes)
+	}
+	return data, st, nil
+}
+
 func readSafeRegularFile(path string, maxBytes int64) ([]byte, bool, error) {
-	info, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		return nil, false, nil
-	}
+	raw, err := readRegularNoFollow(path, maxBytes)
 	if err != nil {
-		return nil, false, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, false, fmt.Errorf("refusing symlinked state file %q", path)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, false, fmt.Errorf("refusing non-regular state file %q", path)
-	}
-	if info.Size() > maxBytes {
-		return nil, false, fmt.Errorf("state file %q exceeds %d bytes", path, maxBytes)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
 		return nil, false, err
 	}
 	return raw, true, nil
@@ -1350,17 +1525,34 @@ func writeModeFileAtomic(path string, content []byte, mode fs.FileMode) error {
 	if err := config.EnsurePrivateDir(dir); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".tmp.*")
+	stageParent := filepath.Dir(dir)
+	if err := config.EnsurePrivateDir(stageParent); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlinked destination %q", path)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("refusing directory destination %q", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	stageDir, err := os.MkdirTemp(stageParent, ".agbox-stage-*")
+	if err != nil {
+		return fmt.Errorf("create staging directory: %w", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(stageDir)
+	}()
+
+	tmp, err := os.CreateTemp(stageDir, ".tmp.*")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
 	if err := tmp.Chmod(mode); err != nil {
 		_ = tmp.Close()
 		return err
@@ -1369,12 +1561,15 @@ func writeModeFileAtomic(path string, content []byte, mode fs.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		return err
+		return fmt.Errorf("commit file %s: %w", path, err)
 	}
-	cleanup = false
 	return nil
 }

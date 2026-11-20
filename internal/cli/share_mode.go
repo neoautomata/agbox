@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -13,201 +14,19 @@ import (
 	"agbox/internal/vcsfuse"
 )
 
-// ShareOpts holds parsed CLI arguments for `agbox share`.
-type ShareOpts struct {
-	Action    string // "list", "add", "set", "rm"
-	Sandbox   string
-	Target    string
-	Alias     string
-	ReadOnly  bool
-	HasAccess bool
-	VCSPolicy config.VCSPolicy
-	HasVCS    bool
-	Force     bool
-	AllowRoot bool
-}
-
-// ParseShareArgs parses CLI arguments for `agbox share` and rejects conflicting flags.
-func ParseShareArgs(args []string) (ShareOpts, error) {
-	var opts ShareOpts
-	var pos []string
-	sawRO := false
-	sawRW := false
-	vcsFlagCount := 0
-
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "--" {
-			pos = append(pos, args[i+1:]...)
-			break
-		}
-		if strings.HasPrefix(a, "--as=") {
-			if opts.Alias != "" {
-				return ShareOpts{}, errors.New("duplicate --as flag")
-			}
-			alias, err := pathsec.ValidateGuestAlias(strings.TrimPrefix(a, "--as="))
-			if err != nil {
-				return ShareOpts{}, err
-			}
-			opts.Alias = alias
-			continue
-		}
-		switch a {
-		case "-h", "--help":
-			return ShareOpts{}, ErrHelp
-		case "--allow-root":
-			opts.AllowRoot = true
-		case "--ro":
-			sawRO = true
-			opts.ReadOnly = true
-			opts.HasAccess = true
-		case "--rw":
-			sawRW = true
-			opts.ReadOnly = false
-			opts.HasAccess = true
-		case "--mask", "--mask-vcs":
-			vcsFlagCount++
-			opts.VCSPolicy = config.VCSMask
-			opts.HasVCS = true
-		case "--vcs":
-			vcsFlagCount++
-			opts.VCSPolicy = config.VCSAllow
-			opts.HasVCS = true
-		case "--vcs-hooks":
-			vcsFlagCount++
-			opts.VCSPolicy = config.VCSAllowHooks
-			opts.HasVCS = true
-		case "--as":
-			if i+1 >= len(args) {
-				return ShareOpts{}, errors.New("--as requires a guest share name")
-			}
-			if opts.Alias != "" {
-				return ShareOpts{}, errors.New("duplicate --as flag")
-			}
-			alias, err := pathsec.ValidateGuestAlias(args[i+1])
-			if err != nil {
-				return ShareOpts{}, err
-			}
-			opts.Alias = alias
-			i++
-		case "--force", "-f":
-			opts.Force = true
-		default:
-			if strings.HasPrefix(a, "-") {
-				return ShareOpts{}, fmt.Errorf("unknown share option: %s (run 'agbox share --help')", a)
-			}
-			pos = append(pos, a)
-		}
-	}
-
-	if sawRO && sawRW {
-		return ShareOpts{}, errors.New("conflicting share options: cannot combine --ro and --rw")
-	}
-	if vcsFlagCount > 1 {
-		return ShareOpts{}, errors.New("conflicting share options: specify at most one of --mask-vcs, --vcs, or --vcs-hooks")
-	}
-	if sawRO && opts.HasVCS && opts.VCSPolicy == config.VCSAllowHooks {
-		return ShareOpts{}, errors.New("conflicting share options: cannot combine --ro and --vcs-hooks")
-	}
-
-	if len(pos) == 0 {
-		return ShareOpts{}, errors.New("Usage: agbox share <list|add|set|rm> <sandbox> [...]")
-	}
-
-	opts.Action = pos[0]
-	switch opts.Action {
-	case "list", "ls":
-		opts.Action = "list"
-		if len(pos) != 2 {
-			return ShareOpts{}, errors.New("Usage: agbox share [--allow-root] list <sandbox>")
-		}
-		if opts.HasAccess || opts.HasVCS || opts.Alias != "" || opts.Force {
-			return ShareOpts{}, errors.New("agbox share list does not accept --ro, --rw, --vcs, --as, or --force")
-		}
-		sbx, err := validateTargetRunSandbox(pos[1], "inspect shares on")
-		if err != nil {
-			return ShareOpts{}, err
-		}
-		opts.Sandbox = sbx
-		return opts, nil
-
-	case "add":
-		if len(pos) != 3 {
-			return ShareOpts{}, errors.New("Usage: agbox share [--allow-root] add [--ro|--rw] [--mask-vcs|--vcs|--vcs-hooks] [--as NAME] <sandbox> <path[:opts]>")
-		}
-		if opts.Force {
-			return ShareOpts{}, errors.New("agbox share add does not accept --force")
-		}
-		sbx, err := validateTargetRunSandbox(pos[1], "modify shares on")
-		if err != nil {
-			return ShareOpts{}, err
-		}
-		opts.Sandbox = sbx
-		opts.Target = pos[2]
-		return opts, nil
-
-	case "set":
-		if len(pos) != 3 {
-			return ShareOpts{}, errors.New("Usage: agbox share [--allow-root] set [--ro|--rw] [--mask-vcs|--vcs|--vcs-hooks] [--force] <sandbox> <guest-name-or-path>")
-		}
-		if opts.Alias != "" {
-			return ShareOpts{}, errors.New("agbox share set does not accept --as")
-		}
-		if !opts.HasAccess && !opts.HasVCS {
-			return ShareOpts{}, errors.New("agbox share set requires at least one permission flag (--ro, --rw, --mask-vcs, --vcs, or --vcs-hooks)")
-		}
-		sbx, err := validateTargetRunSandbox(pos[1], "modify shares on")
-		if err != nil {
-			return ShareOpts{}, err
-		}
-		opts.Sandbox = sbx
-		opts.Target = pos[2]
-		return opts, nil
-
-	case "rm", "remove":
-		opts.Action = "rm"
-		if len(pos) != 3 {
-			return ShareOpts{}, errors.New("Usage: agbox share [--allow-root] rm [--force] <sandbox> <guest-name-or-path>")
-		}
-		if opts.HasAccess || opts.HasVCS || opts.Alias != "" {
-			return ShareOpts{}, errors.New("agbox share rm does not accept --ro, --rw, --vcs, or --as")
-		}
-		sbx, err := validateTargetRunSandbox(pos[1], "modify shares on")
-		if err != nil {
-			return ShareOpts{}, err
-		}
-		opts.Sandbox = sbx
-		opts.Target = pos[2]
-		return opts, nil
-
+func vcsPolicyRank(p config.VCSPolicy) int {
+	switch p {
+	case config.VCSAllow:
+		return 1
+	case config.VCSAllowHooks:
+		return 2
 	default:
-		return ShareOpts{}, fmt.Errorf("unknown share subcommand %q (expected list, add, set, or rm)", opts.Action)
+		return 0
 	}
 }
 
-// ShareUsageText returns the help message for `agbox share --help`.
-func ShareUsageText() string {
-	return `Usage:
-  agbox share [--allow-root] list <sandbox>
-      List shared directories and files on a running or suspended sandbox.
-
-  agbox share [--allow-root] add [--ro|--rw] [--mask-vcs|--vcs|--vcs-hooks] [--as NAME] <sandbox> <path[:opts]>
-      Attach a host directory or file at /workspace/<name> on a running or suspended sandbox.
-      Safe default: read-only with VCS metadata masked (ro,mask) unless --rw or :rw is passed.
-
-  agbox share [--allow-root] set [--ro|--rw] [--mask-vcs|--vcs|--vcs-hooks] [--force] <sandbox> <guest-name-or-path>
-      Update read-only, read-write, or VCS policy on an existing share.
-      Downgrading rw -> ro fails closed if guest processes hold open writable handles unless --force is passed.
-
-  agbox share [--allow-root] rm [--force] <sandbox> <guest-name-or-path>
-      Detach a share and revoke open host file descriptors immediately.
-      Fails closed if guest processes hold open writable handles unless --force is passed.
-`
-}
-
-// Share lists, adds, modifies, or removes shared paths on a running or suspended sandbox.
-func (a *App) Share(ctx context.Context, args []string) error {
-	opts, err := ParseShareArgs(args)
+func (a *appRuntime) share(ctx context.Context, args []string) error {
+	opts, err := parseShareArgs(args)
 	if err != nil {
 		return err
 	}
@@ -218,7 +37,7 @@ func (a *App) Share(ctx context.Context, args []string) error {
 		return fmt.Errorf("prepare data dir: %w", err)
 	}
 
-	dirID, err := RunDirIDFromSandbox(opts.Sandbox)
+	dirID, err := runDirIDFromSandbox(opts.Sandbox)
 	if err != nil {
 		return err
 	}
@@ -231,6 +50,16 @@ func (a *App) Share(ctx context.Context, args []string) error {
 	sb, exists := msb.FindSandbox(msb.ParseSandboxList(lsRes.Stdout), opts.Sandbox)
 	if !exists {
 		return fmt.Errorf("sandbox %q does not exist", opts.Sandbox)
+	}
+
+	if opts.Action != "list" {
+		if _, sErr := os.Lstat(runFilterDir); sErr == nil {
+			metaLock, lErr := lockRunMeta(runFilterDir)
+			if lErr != nil {
+				return lErr
+			}
+			defer metaLock.unlock()
+		}
 	}
 
 	runMetaPath := filepath.Join(runFilterDir, "run.meta")
@@ -247,7 +76,10 @@ func (a *App) Share(ctx context.Context, args []string) error {
 	} else {
 		meta, err = config.LoadRunMeta(suspMetaPath)
 		if err != nil {
-			return fmt.Errorf("sandbox %q is stopped and not suspended", opts.Sandbox)
+			if os.IsNotExist(err) {
+				return fmt.Errorf("sandbox %q is stopped and not suspended", opts.Sandbox)
+			}
+			return fmt.Errorf("load suspended metadata for %q: %w", opts.Sandbox, err)
 		}
 		metaPath = suspMetaPath
 	}
@@ -272,7 +104,7 @@ func (a *App) Share(ctx context.Context, args []string) error {
 	}
 }
 
-func (a *App) listSandboxShares(sandbox string, running bool, runFilterDir string, meta config.RunMeta) error {
+func (a *appRuntime) listSandboxShares(sandbox string, running bool, runFilterDir string, meta config.RunMeta) error {
 	if running && meta.WorkspaceHub {
 		sockPath := filepath.Join(runFilterDir, "ws.sock")
 		live, err := vcsfuse.ListHubShares(sockPath)
@@ -284,10 +116,7 @@ func (a *App) listSandboxShares(sandbox string, running bool, runFilterDir strin
 			return nil
 		}
 		for _, sh := range live {
-			mode := "rw"
-			if sh.ReadOnly {
-				mode = "ro"
-			}
+			mode := shareAccessMode(sh.ReadOnly)
 			kind := "dir"
 			if sh.IsFile {
 				kind = "file"
@@ -307,10 +136,7 @@ func (a *App) listSandboxShares(sandbox string, running bool, runFilterDir strin
 		return nil
 	}
 	for _, sh := range meta.Shares {
-		mode := "rw"
-		if sh.EffectiveReadOnly(meta.ReadOnly) {
-			mode = "ro"
-		}
+		mode := shareAccessMode(sh.EffectiveReadOnly(meta.ReadOnly))
 		kind := "dir"
 		if !sh.IsDir {
 			kind = "file"
@@ -322,7 +148,7 @@ func (a *App) listSandboxShares(sandbox string, running bool, runFilterDir strin
 	return nil
 }
 
-func (a *App) addSandboxShare(ctx context.Context, opts ShareOpts, running bool, runFilterDir, metaPath string, meta config.RunMeta) error {
+func (a *appRuntime) addSandboxShare(ctx context.Context, opts shareOpts, running bool, runFilterDir, metaPath string, meta config.RunMeta) error {
 	spec, err := pathsec.ParseShareSpec(opts.Target)
 	if err != nil {
 		return err
@@ -334,7 +160,7 @@ func (a *App) addSandboxShare(ctx context.Context, opts ShareOpts, running bool,
 		spec.GuestAlias = opts.Alias
 	}
 
-	// Safe default for `agbox share add`: read-only + VCS-masked unless explicitly overridden.
+	// Default agbox share add to read-only with VCS masked unless flags or modifiers override it.
 	defaultRO := true
 	if opts.HasAccess {
 		defaultRO = opts.ReadOnly
@@ -404,10 +230,7 @@ func (a *App) addSandboxShare(ctx context.Context, opts ShareOpts, running bool,
 		newTarget.GuestName = st.GuestName
 	}
 
-	accessMode := "rw"
-	if newTarget.ReadOnly {
-		accessMode = "ro"
-	}
+	accessMode := shareAccessMode(newTarget.ReadOnly)
 	meta.Shares = append(meta.Shares, config.ShareRecord{
 		Index:      maxIndex + 1,
 		HostPath:   newTarget.HostPath,
@@ -419,6 +242,12 @@ func (a *App) addSandboxShare(ctx context.Context, opts ShareOpts, running bool,
 		VCSPolicy:  newTarget.VCSPolicy,
 	})
 	if err := config.SaveRunMeta(metaPath, meta); err != nil {
+		if running {
+			sockPath := filepath.Join(runFilterDir, "ws.sock")
+			if rbErr := vcsfuse.RemoveHubShare(sockPath, newTarget.GuestName, true); rbErr != nil {
+				a.warnf("Could not roll back added share /workspace/%s: %v", newTarget.GuestName, rbErr)
+			}
+		}
 		return fmt.Errorf("save share metadata: %w", err)
 	}
 	if running {
@@ -429,7 +258,7 @@ func (a *App) addSandboxShare(ctx context.Context, opts ShareOpts, running bool,
 	return nil
 }
 
-func (a *App) setSandboxShare(ctx context.Context, opts ShareOpts, running bool, runFilterDir, metaPath string, meta config.RunMeta) error {
+func (a *appRuntime) setSandboxShare(ctx context.Context, opts shareOpts, running bool, runFilterDir, metaPath string, meta config.RunMeta) error {
 	idx, err := findShareRecordIndex(meta.Shares, opts.Target)
 	if err != nil {
 		return err
@@ -454,7 +283,7 @@ func (a *App) setSandboxShare(ctx context.Context, opts ShareOpts, running bool,
 		return errors.New("conflicting share options: read-only share cannot enable vcs-hooks")
 	}
 
-	// Re-validate against host path security policy (especially rw upgrades on single files or blocked paths).
+	// Re-check host path security policy before applying permission changes.
 	targetCheck, err := pathsec.ValidateShare(rec.HostPath, a.sharePolicy(nextRO))
 	if err != nil {
 		return err
@@ -480,16 +309,32 @@ func (a *App) setSandboxShare(ctx context.Context, opts ShareOpts, running bool,
 		}
 	}
 
-	accessMode := "rw"
-	if nextRO {
-		accessMode = "ro"
-	}
+	accessMode := shareAccessMode(nextRO)
 	rec.AccessMode = accessMode
 	rec.ReadOnly = nextRO
 	rec.VCSPolicy = nextVCS
 	rec.Masked = rec.IsDir && nextVCS == config.VCSMask
 	meta.Shares[idx] = rec
 	if err := config.SaveRunMeta(metaPath, meta); err != nil {
+		if running {
+			// Roll back privilege upgrades only. Never revert a downgrade to weaker isolation.
+			var origROPtr *bool
+			if curRO && !nextRO {
+				origRO := true
+				origROPtr = &origRO
+			}
+			var origVCSPtr *config.VCSPolicy
+			if vcsPolicyRank(nextVCS) > vcsPolicyRank(curVCS) {
+				origVCS := curVCS
+				origVCSPtr = &origVCS
+			}
+			if origROPtr != nil || origVCSPtr != nil {
+				sockPath := filepath.Join(runFilterDir, "ws.sock")
+				if _, rbErr := vcsfuse.SetHubShare(sockPath, rec.GuestName, origROPtr, origVCSPtr, true); rbErr != nil {
+					a.warnf("Could not roll back share upgrade on /workspace/%s: %v", rec.GuestName, rbErr)
+				}
+			}
+		}
 		return fmt.Errorf("save share metadata: %w", err)
 	}
 	if running {
@@ -499,7 +344,7 @@ func (a *App) setSandboxShare(ctx context.Context, opts ShareOpts, running bool,
 	return nil
 }
 
-func (a *App) removeSandboxShare(ctx context.Context, opts ShareOpts, running bool, runFilterDir, metaPath string, meta config.RunMeta) error {
+func (a *appRuntime) removeSandboxShare(ctx context.Context, opts shareOpts, running bool, runFilterDir, metaPath string, meta config.RunMeta) error {
 	idx, err := findShareRecordIndex(meta.Shares, opts.Target)
 	if err != nil {
 		return err
@@ -515,6 +360,7 @@ func (a *App) removeSandboxShare(ctx context.Context, opts ShareOpts, running bo
 
 	meta.Shares = append(meta.Shares[:idx], meta.Shares[idx+1:]...)
 	if err := config.SaveRunMeta(metaPath, meta); err != nil {
+		// Keep the share detached on metadata save failure so we never re-expose revoked access.
 		return fmt.Errorf("save share metadata: %w", err)
 	}
 	if running {
@@ -560,8 +406,8 @@ func findShareRecordIndex(shares []config.ShareRecord, query string) (int, error
 	return -1, fmt.Errorf("share %q is not configured on this sandbox", query)
 }
 
-func (a *App) dropGuestVFSCaches(ctx context.Context, sandbox string) {
-	_, _ = a.MSB.Run(ctx, msb.CommandRequest{
-		Args: []string{"exec", "-u", "root", sandbox, "--", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true"},
-	})
+func (a *appRuntime) dropGuestVFSCaches(ctx context.Context, sandbox string) {
+	if _, err := a.runGuestRootScript(ctx, sandbox, "flush guest VFS caches in "+sandbox, "sh", "sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true"); err != nil {
+		a.warnf("Could not flush guest VFS caches in %s: %v", sandbox, err)
+	}
 }

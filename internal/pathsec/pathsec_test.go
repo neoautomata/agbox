@@ -1,6 +1,8 @@
 package pathsec
 
 import (
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +34,7 @@ func TestIsSubpath(t *testing.T) {
 }
 
 func TestContainsVCSComponent(t *testing.T) {
-	vcs := DefaultVCSNames()
+	vcs := append([]string{""}, DefaultVCSNames()...)
 	if name, ok := ContainsVCSComponent("/home/u/proj/.git/config", vcs); !ok || name != ".git" {
 		t.Errorf("expected .git match, got (%q, %v)", name, ok)
 	}
@@ -60,8 +62,8 @@ func TestValidateShareHappyAndBoundaryConditions(t *testing.T) {
 	msbHome := filepath.Join(home, ".microsandbox")
 	pol := Policy{
 		HomeReal:  home,
-		Blocklist: DefaultBlocklist(home, dataDir, msbHome),
-		VCSNames:  DefaultVCSNames(),
+		Blocklist: append([]string{""}, DefaultBlocklist(home, dataDir, msbHome)...),
+		VCSNames:  nil, // exercise DefaultVCSNames fallback
 	}
 
 	// 1. Valid project directory and regular file.
@@ -83,19 +85,25 @@ func TestValidateShareHappyAndBoundaryConditions(t *testing.T) {
 		t.Fatalf("ValidateShare(fileInProj) = (%+v, %v)", ft, err)
 	}
 
-	// 2. Reject empty and newline paths.
+	// 2. Reject empty, root "/", and newline paths.
 	if _, err := ValidateShare("", pol); err == nil {
 		t.Errorf("expected error for empty path")
+	}
+	if _, err := ValidateShare("/", Policy{AllowOutsideHome: true}); err == nil {
+		t.Errorf("expected error for filesystem root /")
 	}
 	if _, err := ValidateShare(projDir+"\n", pol); err == nil {
 		t.Errorf("expected error for path with newline")
 	}
 
-	// 3. Reject nonexistent or dangling symlink.
+	// 3. Reject nonexistent or intermediate dangling symlink and wrap os.ErrNotExist.
 	dangling := filepath.Join(projDir, "dangling")
 	_ = os.Symlink("/nonexistent/target", dangling)
-	if _, err := ValidateShare(dangling, pol); err == nil {
-		t.Errorf("expected error for dangling symlink")
+	if _, err := ValidateShare(dangling, pol); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected errors.Is(err, os.ErrNotExist) for dangling symlink, got %v", err)
+	}
+	if _, err := ValidateShare(filepath.Join(dangling, "child.txt"), pol); err == nil {
+		t.Errorf("expected error for intermediate dangling symlink")
 	}
 
 	// 4. Reject colon or comma in path.
@@ -126,7 +134,7 @@ func TestValidateShareHappyAndBoundaryConditions(t *testing.T) {
 		t.Errorf("expected /etc to be blocked even with AllowOutsideHome=true")
 	}
 
-	// 6. Reject blocklisted paths (~/.ssh, ~/.gemini) and $HOME itself (contains blocklisted children).
+	// 6. Reject blocklisted paths (~/.ssh, ~/.gemini) and $HOME itself.
 	sshDir := filepath.Join(home, ".ssh")
 	_ = os.MkdirAll(sshDir, 0o700)
 	if _, err := ValidateShare(sshDir, pol); err == nil {
@@ -173,7 +181,7 @@ func TestValidateShareHappyAndBoundaryConditions(t *testing.T) {
 			t.Errorf("expected sharing VCS path %s to fail", blockedVCSPath)
 		}
 	}
-	// .github directory is allowed (CI workflows, not git repository storage).
+	// .github directory is allowed.
 	githubDir := filepath.Join(projDir, ".github")
 	_ = os.MkdirAll(githubDir, 0o700)
 	if _, err := ValidateShare(githubDir, pol); err != nil {
@@ -195,7 +203,7 @@ func TestValidateShareHappyAndBoundaryConditions(t *testing.T) {
 		t.Errorf("expected control character in path to be rejected")
 	}
 
-	// 9. Reject writable single file with nlink > 1, but allow when ReadOnly=true.
+	// 9. Reject writable single file with nlink > 1, and allow when ReadOnly=true.
 	hardlinkPeer := filepath.Join(projDir, "peer.go")
 	if err := os.Link(fileInProj, hardlinkPeer); err != nil {
 		t.Fatal(err)
@@ -210,23 +218,38 @@ func TestValidateShareHappyAndBoundaryConditions(t *testing.T) {
 	}
 	_ = os.Remove(hardlinkPeer)
 
-	// 10. Reject non-regular file (FIFO).
+	// 10. Reject non-regular files (FIFO and Unix domain socket).
 	fifoPath := filepath.Join(projDir, "my.fifo")
 	if err := syscall.Mkfifo(fifoPath, 0o600); err == nil {
 		if _, err := ValidateShare(fifoPath, pol); err == nil || !strings.Contains(err.Error(), "non-regular") {
 			t.Errorf("expected error for FIFO, got %v", err)
 		}
 	}
+	sockRoot, sErr := os.MkdirTemp("", "psock-")
+	if sErr == nil {
+		defer os.RemoveAll(sockRoot)
+		sockReal, _ := filepath.EvalSymlinks(sockRoot)
+		sockPath := filepath.Join(sockReal, "test.sock")
+		if ln, lErr := net.Listen("unix", sockPath); lErr == nil {
+			defer ln.Close()
+			if _, err := ValidateShare(sockPath, Policy{AllowOutsideHome: true}); err == nil || !strings.Contains(err.Error(), "non-regular") {
+				t.Errorf("expected error for Unix domain socket, got %v", err)
+			}
+		}
+	}
 }
 
-func TestAssignGuestNamesAndFormatVolumeSpec(t *testing.T) {
+func TestAssignGuestNamesChecked(t *testing.T) {
 	in := []ShareTarget{
 		{HostPath: "/home/u/a/app", BaseName: "app", IsDir: true},
-		{HostPath: "/home/u/b/app", BaseName: "app", IsDir: true},
+		{HostPath: "/home/u/b/app", BaseName: "", IsDir: true},
 		{HostPath: "/home/u/c/app", BaseName: "app", IsDir: true},
 		{HostPath: "/home/u/readme.md", BaseName: "readme.md", IsDir: false},
 	}
-	got := AssignGuestNames(in)
+	got, err := AssignGuestNamesChecked(in)
+	if err != nil {
+		t.Fatalf("AssignGuestNamesChecked failed: %v", err)
+	}
 	wantNames := []string{"app", "app-2", "app-3", "readme.md"}
 	for i, w := range wantNames {
 		if got[i].GuestName != w {
@@ -234,13 +257,38 @@ func TestAssignGuestNamesAndFormatVolumeSpec(t *testing.T) {
 		}
 	}
 
-	rwSpec := FormatVolumeSpec("/home/u/a/app", "app", false, 1000, 1000)
-	if rwSpec != "/home/u/a/app:/workspace/app:rw,uid=1000,gid=1000" {
-		t.Errorf("rwSpec = %q", rwSpec)
+	dupAliases := []ShareTarget{
+		{HostPath: "/home/u/a/app", GuestName: "shared", ExplicitAlias: true},
+		{HostPath: "/home/u/b/app", GuestName: "shared", ExplicitAlias: true},
 	}
-	roSpec := FormatVolumeSpec("/home/u/a/app", "app-2", true, 1000, 1000)
-	if roSpec != "/home/u/a/app:/workspace/app-2:ro,uid=1000,gid=1000" {
-		t.Errorf("roSpec = %q", roSpec)
+	if _, err := AssignGuestNamesChecked(dupAliases); err == nil {
+		t.Error("expected error for duplicate explicit aliases")
+	}
+
+	// Reject invalid explicit alias.
+	if _, err := AssignGuestNamesChecked([]ShareTarget{
+		{HostPath: "/home/u/a/app", GuestName: "../bad", ExplicitAlias: true},
+	}); err == nil {
+		t.Error("expected error for invalid explicit alias")
+	}
+
+	// Auto-assigned GuestName with spaces, backslashes, or >128 chars fails early unless ExplicitAlias is set.
+	for _, badBase := range []string{
+		"dir with space",
+		`dir\backslash`,
+		strings.Repeat("x", 129),
+	} {
+		if _, err := AssignGuestNamesChecked([]ShareTarget{
+			{HostPath: "/home/u/" + badBase, BaseName: badBase, IsDir: true},
+		}); err == nil {
+			t.Errorf("expected AssignGuestNamesChecked to reject auto-assigned basename %q", badBase)
+		}
+	}
+	aliased, err := AssignGuestNamesChecked([]ShareTarget{
+		{HostPath: "/home/u/dir with space", GuestName: "clean-name", ExplicitAlias: true, IsDir: true},
+	})
+	if err != nil || aliased[0].GuestName != "clean-name" {
+		t.Fatalf("expected explicit alias to override space basename, got (%+v, %v)", aliased, err)
 	}
 }
 
@@ -267,7 +315,6 @@ func TestDefaultBlocklistForRootAndNonRootHomes(t *testing.T) {
 		}
 	}
 
-	// Sensitive subpaths and /root itself (parent of /root/.ssh) remain blocked.
 	foundRootSSH := false
 	foundParentOfBlocked := false
 	for _, entry := range rootList {
@@ -333,14 +380,17 @@ func TestAllDefaultVCSNamesAndBlocklistCategories(t *testing.T) {
 		}
 	}
 
-	// Verify representative paths from every DefaultBlocklist security category are rejected.
+	// Verify representative paths from every DefaultBlocklist category (including [L1] additions) are rejected.
 	blockedDirs := []string{
 		filepath.Join(home, ".ssh"),
 		filepath.Join(home, ".gnupg"),
+		filepath.Join(home, ".pki"),
 		filepath.Join(home, ".aws"),
 		filepath.Join(home, ".kube"),
+		filepath.Join(home, ".terraform.d"),
 		filepath.Join(home, ".config", "gcloud"),
 		filepath.Join(home, ".config", "gh"),
+		filepath.Join(home, ".config", "rclone"),
 		filepath.Join(home, ".gemini"),
 		filepath.Join(home, ".antigravity"),
 		filepath.Join(home, ".claude"),
@@ -350,6 +400,8 @@ func TestAllDefaultVCSNamesAndBlocklistCategories(t *testing.T) {
 		filepath.Join(home, ".subversion"),
 		filepath.Join(home, ".bazaar"),
 		filepath.Join(home, ".config", "direnv"),
+		filepath.Join(home, ".local", "share", "fish"),
+		filepath.Join(home, ".config", "emacs"),
 		filepath.Join(home, ".local", "bin"),
 		filepath.Join(home, "bin"),
 		dataDir,
@@ -372,9 +424,16 @@ func TestAllDefaultVCSNamesAndBlocklistCategories(t *testing.T) {
 		filepath.Join(home, ".bashrc"),
 		filepath.Join(home, ".zshrc"),
 		filepath.Join(home, ".profile"),
+		filepath.Join(home, ".pam_environment"),
+		filepath.Join(home, ".emacs"),
 		filepath.Join(home, ".envrc"),
 		filepath.Join(home, ".npmrc"),
 		filepath.Join(home, ".netrc"),
+		filepath.Join(home, ".pgpass"),
+		filepath.Join(home, ".my.cnf"),
+		filepath.Join(home, ".vault-token"),
+		filepath.Join(home, ".gem", "credentials"),
+		filepath.Join(home, ".m2", "settings.xml"),
 	}
 	for _, bf := range blockedFiles {
 		if err := os.MkdirAll(filepath.Dir(bf), 0o700); err != nil {
@@ -406,8 +465,9 @@ func TestParseShareSpecAndResolveConflicts(t *testing.T) {
 	dirA := filepath.Join(home, "projA")
 	dirB := filepath.Join(home, "projB")
 	dirC := filepath.Join(home, "projC")
+	spaceDir := filepath.Join(home, "space dir")
 	nestedInA := filepath.Join(dirA, "subpkg")
-	for _, d := range []string{dirA, dirB, dirC, nestedInA} {
+	for _, d := range []string{dirA, dirB, dirC, spaceDir, nestedInA} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -417,21 +477,24 @@ func TestParseShareSpecAndResolveConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. Valid modifier parsing (including trailing slash before :ro).
+	// 1. Valid modifier parsing (including trailing slash before :ro and mask-vcs alias).
 	s1, err := ParseShareSpec(dirA)
 	if err != nil || s1.HasAccessOpt || s1.HasVCSOpt || s1.RawPath != dirA {
 		t.Fatalf("ParseShareSpec(dirA) = %+v, %v", s1, err)
 	}
-	s2, err := ParseShareSpec(dirB + "/:ro,mask,as=docs")
+	s2, err := ParseShareSpec(dirB + "/:ro,mask-vcs,as=docs")
 	if err != nil || !s2.HasAccessOpt || !s2.ReadOnly || !s2.HasVCSOpt || s2.VCSPolicy != config.VCSMask || s2.GuestAlias != "docs" {
-		t.Fatalf("ParseShareSpec(dirB:ro,mask,as=docs) = %+v, %v", s2, err)
+		t.Fatalf("ParseShareSpec(dirB:ro,mask-vcs,as=docs) = %+v, %v", s2, err)
 	}
 	s3, err := ParseShareSpec(dirC + ":rw,vcs-hooks")
 	if err != nil || s3.ReadOnly || s3.VCSPolicy != config.VCSAllowHooks {
 		t.Fatalf("ParseShareSpec(dirC:rw,vcs-hooks) = %+v, %v", s3, err)
 	}
+	if pureSpec, pErr := parseShareSpecWithStat("proj:vcs", nil); pErr != nil || pureSpec.VCSPolicy != config.VCSAllow {
+		t.Fatalf("parseShareSpecWithStat(proj:vcs, nil) = (%+v, %v)", pureSpec, pErr)
+	}
 
-	// 2. Conflicting, duplicate, or invalid inline modifiers must fail.
+	// 2. Conflicting, duplicate, or invalid inline modifiers must fail (both with and without slashes).
 	colonOnDisk := filepath.Join(home, "literal:ro")
 	if err := os.MkdirAll(colonOnDisk, 0o700); err != nil {
 		t.Fatal(err)
@@ -439,12 +502,18 @@ func TestParseShareSpecAndResolveConflicts(t *testing.T) {
 	for _, bad := range []string{
 		"",
 		":ro",
+		"foo:bar",
+		"a,b:ro",
+		"a:b:ro",
 		dirA + ":",
 		dirA + ":ro,",
 		dirA + ":ro,rw",
+		dirA + ":rw,ro",
 		dirA + ":ro,ro",
 		dirA + ":mask,vcs",
+		dirA + ":vcs,mask",
 		dirA + ":vcs,vcs-hooks",
+		dirA + ":vcs-hooks,vcs",
 		dirA + ":ro,vcs-hooks",
 		dirA + ":as=a,as=b",
 		dirA + ":as=.git",
@@ -461,7 +530,7 @@ func TestParseShareSpecAndResolveConflicts(t *testing.T) {
 	resolved, err := ResolveShareSpecs([]ShareSpec{s1, s2, s3}, ResolveOpts{
 		Policy:     pol,
 		DefaultRO:  false,
-		DefaultVCS: config.VCSMask,
+		DefaultVCS: "",
 	})
 	if err != nil || len(resolved) != 3 {
 		t.Fatalf("ResolveShareSpecs = %+v, %v", resolved, err)
@@ -476,7 +545,31 @@ func TestParseShareSpecAndResolveConflicts(t *testing.T) {
 		t.Errorf("resolved[2] = %+v, want rw + vcs-hooks", resolved[2])
 	}
 
-	// 4. Global locked flag conflicts, file VCS modifier conflict, duplicate host path, nested path, and duplicate alias must fail.
+	// 4. Unlocked DefaultRO=true + DefaultVCS=VCSAllowHooks allows per-share :rw override (e.g. share add --vcs-hooks sbx dir:rw).
+	specExplicitRW, err := ParseShareSpec(dirC + ":rw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hookTargets, err := ResolveShareSpecs([]ShareSpec{specExplicitRW}, ResolveOpts{
+		Policy:     pol,
+		DefaultRO:  true,
+		LockRO:     false,
+		DefaultVCS: config.VCSAllowHooks,
+	})
+	if err != nil || len(hookTargets) != 1 || hookTargets[0].ReadOnly || hookTargets[0].VCSPolicy != config.VCSAllowHooks {
+		t.Fatalf("ResolveShareSpecs(DefaultRO=true, LockRO=false, DefaultVCS=vcs-hooks, :rw) = (%+v, %v)", hookTargets, err)
+	}
+	// Without :rw, DefaultRO=true + DefaultVCS=VCSAllowHooks still fails per-share check.
+	if _, err := ResolveShareSpecs([]ShareSpec{s1}, ResolveOpts{
+		Policy:     pol,
+		DefaultRO:  true,
+		LockRO:     false,
+		DefaultVCS: config.VCSAllowHooks,
+	}); err == nil || !strings.Contains(err.Error(), "read-only share cannot enable vcs-hooks") {
+		t.Errorf("expected per-share ro + vcs-hooks rejection, got %v", err)
+	}
+
+	// 5. Global locked flag conflicts, file VCS modifier conflict, duplicate host path, nested path, duplicate alias, and space basename without alias must fail.
 	if _, err := ResolveShareSpecs([]ShareSpec{s3}, ResolveOpts{Policy: pol, DefaultRO: true, LockRO: true}); err == nil {
 		t.Error("expected LockRO + :rw conflict to fail")
 	}
@@ -499,5 +592,140 @@ func TestParseShareSpecAndResolveConflicts(t *testing.T) {
 	alias2, _ := ParseShareSpec(dirB + ":as=same")
 	if _, err := ResolveShareSpecs([]ShareSpec{alias1, alias2}, ResolveOpts{Policy: pol}); err == nil {
 		t.Error("expected duplicate explicit alias to fail")
+	}
+	spaceSpec, _ := ParseShareSpec(spaceDir)
+	if _, err := ResolveShareSpecs([]ShareSpec{spaceSpec}, ResolveOpts{Policy: pol}); err == nil {
+		t.Error("expected space basename without as=<alias> to fail in ResolveShareSpecs")
+	}
+}
+
+func TestValidateGuestAlias(t *testing.T) {
+	validCases := []string{
+		"my-app",
+		"proj_1",
+		"docs",
+		strings.Repeat("a", 128),
+	}
+	for _, alias := range validCases {
+		if got, err := ValidateGuestAlias(alias); err != nil || got != alias {
+			t.Errorf("ValidateGuestAlias(%q) = (%q, %v), want success", alias, got, err)
+		}
+	}
+
+	invalidCases := []struct {
+		name  string
+		alias string
+	}{
+		{"empty", ""},
+		{"too long", strings.Repeat("a", 129)},
+		{"dot", "."},
+		{"dotdot", ".."},
+		{"slash", "a/b"},
+		{"backslash", "a\\b"},
+		{"colon", "a:b"},
+		{"comma", "a,b"},
+		{"space", "a b"},
+		{"tab", "a\tb"},
+		{"newline", "a\nb"},
+		{"control byte", "a\x01b"},
+		{"delete byte", "a\x7fb"},
+		{"zero width space", "alias\u200B"},
+		{"zero width non joiner", "alias\u200C"},
+		{"zero width joiner", "alias\u200D"},
+		{"left to right mark", "alias\u200E"},
+		{"right to left mark", "alias\u200F"},
+		{"left to right embedding", "alias\u202A"},
+		{"right to left override", "alias\u202E"},
+		{"left to right isolate", "alias\u2066"},
+		{"pop directional isolate", "alias\u2069"},
+		{"byte order mark", "alias\uFEFF"},
+		{"vcs git", ".git"},
+		{"vcs jj", ".jj"},
+		{"vcs gitignore", ".gitignore"},
+		{"vcs hg", ".hg"},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ValidateGuestAlias(tc.alias); err == nil {
+				t.Errorf("ValidateGuestAlias(%q) succeeded, want error", tc.alias)
+			}
+		})
+	}
+}
+
+func TestResolveShareSpecsConflictPermutations(t *testing.T) {
+	pol := Policy{HomeReal: "/home/user", AllowOutsideHome: true}
+
+	// LockRO + DefaultRO true with DefaultVCS VCSAllowHooks fails immediately.
+	_, err := ResolveShareSpecs(nil, ResolveOpts{
+		Policy:     pol,
+		DefaultRO:  true,
+		LockRO:     true,
+		DefaultVCS: config.VCSAllowHooks,
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot combine --ro and --vcs-hooks") {
+		t.Fatalf("expected LockRO + DefaultRO + VCSAllowHooks conflict error, got %v", err)
+	}
+
+	// LockRO true rejects disagreeing access modifier.
+	specRW := ShareSpec{RawPath: "/home/user", ReadOnly: false, HasAccessOpt: true}
+	_, err = ResolveShareSpecs([]ShareSpec{specRW}, ResolveOpts{
+		Policy:    pol,
+		DefaultRO: true,
+		LockRO:    true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "flag and modifier disagree") {
+		t.Errorf("expected LockRO conflict error, got %v", err)
+	}
+
+	// LockVCS true rejects disagreeing VCS modifier.
+	specVCS := ShareSpec{RawPath: "/home/user", VCSPolicy: config.VCSAllow, HasVCSOpt: true}
+	_, err = ResolveShareSpecs([]ShareSpec{specVCS}, ResolveOpts{
+		Policy:     pol,
+		DefaultVCS: config.VCSMask,
+		LockVCS:    true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "flag (mask) and modifier (vcs) disagree") {
+		t.Errorf("expected LockVCS conflict error, got %v", err)
+	}
+
+	// Read-only share cannot enable vcs-hooks.
+	specHooks := ShareSpec{RawPath: "/home/user", VCSPolicy: config.VCSAllowHooks, HasVCSOpt: true}
+	_, err = ResolveShareSpecs([]ShareSpec{specHooks}, ResolveOpts{
+		Policy:    pol,
+		DefaultRO: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "read-only share cannot enable vcs-hooks") {
+		t.Errorf("expected ro + vcs-hooks conflict error, got %v", err)
+	}
+}
+
+func TestValidateShareEmptyAndRelativeHomeReal(t *testing.T) {
+	tmp := t.TempDir()
+	for _, badHome := range []string{"", "relative/home"} {
+		pol := Policy{
+			HomeReal:         badHome,
+			AllowOutsideHome: false,
+		}
+		_, err := ValidateShare(tmp, pol)
+		if err == nil || !strings.Contains(err.Error(), "outside $HOME") {
+			t.Fatalf("expected outside $HOME error for HomeReal=%q, got %v", badHome, err)
+		}
+	}
+}
+
+func TestUnicodeBidiRejection(t *testing.T) {
+	bidiPaths := []string{
+		"/home/user/proj\u200B",
+		"/home/user/proj\u202A",
+		"/home/user/proj\uFEFF",
+	}
+	for _, p := range bidiPaths {
+		if _, err := ParseShareSpec(p); err == nil {
+			t.Errorf("expected ParseShareSpec to reject bidi path %q", p)
+		}
+		if _, err := ValidateShare(p, Policy{AllowOutsideHome: true}); err == nil {
+			t.Errorf("expected ValidateShare to reject bidi path %q", p)
+		}
 	}
 }

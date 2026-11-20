@@ -21,19 +21,14 @@ import (
 )
 
 const (
-	// MaxAgentBinaryBytes caps each cached agent binary at 1 GiB.
-	MaxAgentBinaryBytes = 1024 * 1024 * 1024
-
-	// MinAgentBinaryBytes requires at least a 64-byte 64-bit ELF header.
-	MinAgentBinaryBytes = 64
-
-	// MaxAgentsManifestBytes caps $DATA_DIR/agents/manifest.json at 64 KiB.
-	MaxAgentsManifestBytes = 64 * 1024
+	maxAgentBinaryBytes    = 1024 * 1024 * 1024
+	minAgentBinaryBytes    = 64
+	maxAgentsManifestBytes = 64 * 1024
 )
 
 var elfMagic = []byte{0x7f, 'E', 'L', 'F'}
 
-// CachedAgentInfo describes one verified agent binary stored in $DATA_DIR/agents.
+// CachedAgentInfo describes one checked agent binary stored in $DATA_DIR/agents.
 type CachedAgentInfo struct {
 	Agent     string `json:"agent"`
 	BinName   string `json:"bin_name"`
@@ -47,37 +42,66 @@ type agentsManifest struct {
 	Agents map[string]CachedAgentInfo `json:"agents"`
 }
 
-// AgentBinName maps an agbox agent identifier to its binary filename in $DATA_DIR/agents/bin.
-func AgentBinName(agent string) (string, error) {
-	switch agent {
-	case "antigravity":
-		return "agy", nil
-	case "opencode":
-		return "opencode", nil
-	default:
-		return "", fmt.Errorf("unsupported agent %q (expected antigravity or opencode)", agent)
+func agentBinName(agent string) (string, error) {
+	for _, entry := range supportedAgents {
+		if entry.agent == agent {
+			return entry.binName, nil
+		}
 	}
+	return "", fmt.Errorf("unsupported agent %q (expected antigravity or opencode)", agent)
 }
 
 func agentFromBinName(binName string) (string, bool) {
-	switch binName {
-	case "agy":
-		return "antigravity", true
-	case "opencode":
-		return "opencode", true
-	default:
-		return "", false
+	for _, entry := range supportedAgents {
+		if entry.binName == binName {
+			return entry.agent, true
+		}
 	}
+	return "", false
 }
 
-// EnsureAgentsDir creates $DATA_DIR/agents (0700) and $DATA_DIR/agents/bin (0755)
-// while rejecting symlinks and unsafe path delimiters.
-func EnsureAgentsDir(agentsDir string) error {
-	if agentsDir == "" {
-		return errors.New("agents directory path must not be empty")
+func lockAgentsCache(agentsDir string) (*os.File, error) {
+	dataDir := filepath.Dir(agentsDir)
+	if err := config.EnsurePrivateDir(dataDir); err != nil {
+		return nil, err
 	}
-	if strings.ContainsAny(agentsDir, ":,") {
-		return fmt.Errorf("agents directory %q cannot contain ':' or ','", agentsDir)
+	lockPath := filepath.Join(dataDir, ".agents.lock")
+	if info, sErr := os.Lstat(lockPath); sErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing symlinked agents lock %s", lockPath)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("refusing non-regular agents lock %s", lockPath)
+		}
+	}
+	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("refusing symlinked agents lock %s", lockPath)
+		}
+		return nil, fmt.Errorf("open agents lock %s: %w", lockPath, err)
+	}
+	f := os.NewFile(uintptr(fd), lockPath)
+	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("lock agents cache: %w", err)
+	}
+	return f, nil
+}
+
+func unlockAgentsCache(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+}
+
+// EnsureAgentsDir creates $DATA_DIR/agents (0700) and $DATA_DIR/agents/bin (0755).
+// It rejects symlinks, control characters, and mount delimiters.
+func EnsureAgentsDir(agentsDir string) error {
+	if err := validateMountDir(agentsDir, "agents"); err != nil {
+		return err
 	}
 	if err := config.EnsurePrivateDir(agentsDir); err != nil {
 		return fmt.Errorf("prepare agents dir: %w", err)
@@ -94,28 +118,25 @@ func EnsureAgentsDir(agentsDir string) error {
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return fmt.Errorf("create agents bin dir %q: %w", binDir, err)
 	}
-	info, err := os.Lstat(binDir)
+	dirFD, err := syscall.Open(binDir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("stat agents bin dir %q: %w", binDir, err)
+		return fmt.Errorf("open agents bin dir %q: %w", binDir, err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("refusing non-directory agents bin path %q", binDir)
-	}
-	if err := os.Chmod(binDir, 0o755); err != nil {
+	defer syscall.Close(dirFD)
+	if err := syscall.Fchmod(dirFD, 0o755); err != nil {
 		return fmt.Errorf("chmod agents bin dir %q: %w", binDir, err)
 	}
 	return nil
 }
 
-// InspectAgentsDir validates $DATA_DIR/agents and returns sorted metadata for cached
-// agent binaries. Any symlink, unexpected entry, hardlink, non-ELF file, or SHA-256
-// mismatch against manifest.json fails closed with an error.
+// InspectAgentsDir checks $DATA_DIR/agents and returns sorted metadata for cached binaries.
+// It fails closed on symlinks, unexpected entries, hardlinks, non-ELF files, or SHA-256 mismatches.
 func InspectAgentsDir(agentsDir string) ([]CachedAgentInfo, error) {
 	if agentsDir == "" {
 		return nil, nil
 	}
-	if strings.ContainsAny(agentsDir, ":,") {
-		return nil, fmt.Errorf("agents directory %q cannot contain ':' or ','", agentsDir)
+	if err := validateMountDir(agentsDir, "agents"); err != nil {
+		return nil, err
 	}
 	rootInfo, err := os.Lstat(agentsDir)
 	if err != nil {
@@ -157,8 +178,8 @@ func InspectAgentsDir(agentsDir string) ([]CachedAgentInfo, error) {
 			if !st.Mode().IsRegular() {
 				return nil, fmt.Errorf("agents manifest %s is not a regular file", full)
 			}
-			if st.Size() > MaxAgentsManifestBytes {
-				return nil, fmt.Errorf("agents manifest %s exceeds %d bytes", full, MaxAgentsManifestBytes)
+			if st.Size() > maxAgentsManifestBytes {
+				return nil, fmt.Errorf("agents manifest %s exceeds %d bytes", full, maxAgentsManifestBytes)
 			}
 			hasManifest = true
 		default:
@@ -169,7 +190,7 @@ func InspectAgentsDir(agentsDir string) ([]CachedAgentInfo, error) {
 	manifest := agentsManifest{Agents: map[string]CachedAgentInfo{}}
 	if hasManifest {
 		mPath := filepath.Join(agentsDir, "manifest.json")
-		mBytes, err := readRegularNoFollow(mPath, MaxAgentsManifestBytes)
+		mBytes, err := readRegularNoFollow(mPath, maxAgentsManifestBytes)
 		if err != nil {
 			return nil, fmt.Errorf("read agents manifest: %w", err)
 		}
@@ -230,29 +251,32 @@ func InspectAgentsDir(agentsDir string) ([]CachedAgentInfo, error) {
 }
 
 func verifyAgentBinaryFile(path string) (string, int64, error) {
-	info, err := os.Lstat(path)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return "", 0, fmt.Errorf("refusing symlinked agent binary %s", path)
+		}
+		if info, lErr := os.Lstat(path); lErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			return "", 0, fmt.Errorf("refusing symlinked agent binary %s", path)
+		}
+		return "", 0, fmt.Errorf("open %s: %w", path, err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil {
 		return "", 0, fmt.Errorf("stat %s: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return "", 0, fmt.Errorf("refusing symlinked agent binary %s", path)
 	}
 	if !info.Mode().IsRegular() {
 		return "", 0, fmt.Errorf("refusing non-regular agent binary %s", path)
 	}
-	if info.Size() < MinAgentBinaryBytes || info.Size() > MaxAgentBinaryBytes {
+	if info.Size() < minAgentBinaryBytes || info.Size() > maxAgentBinaryBytes {
 		return "", 0, fmt.Errorf("agent binary %s has invalid size %d bytes", path, info.Size())
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink != 1 {
 		return "", 0, fmt.Errorf("refusing hardlinked agent binary %s (nlink=%d)", path, st.Nlink)
 	}
-
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return "", 0, fmt.Errorf("open %s: %w", path, err)
-	}
-	f := os.NewFile(uintptr(fd), path)
-	defer f.Close()
 
 	var hdr [4]byte
 	if _, err := io.ReadFull(f, hdr[:]); err != nil {
@@ -264,7 +288,7 @@ func verifyAgentBinaryFile(path string) (string, int64, error) {
 
 	h := sha256.New()
 	_, _ = h.Write(hdr[:])
-	nRest, err := io.Copy(h, io.LimitReader(f, MaxAgentBinaryBytes))
+	nRest, err := io.Copy(h, io.LimitReader(f, maxAgentBinaryBytes))
 	if err != nil {
 		return "", 0, fmt.Errorf("hash %s: %w", path, err)
 	}
@@ -275,32 +299,14 @@ func verifyAgentBinaryFile(path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), total, nil
 }
 
-func readRegularNoFollow(path string, maxBytes int64) ([]byte, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	f := os.NewFile(uintptr(fd), path)
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", path)
-	}
-	if st.Size() > maxBytes {
-		return nil, fmt.Errorf("%s exceeds %d bytes", path, maxBytes)
-	}
-	return io.ReadAll(io.LimitReader(f, maxBytes+1))
-}
-
-// AgentBinaryCaptureWriter streams a binary from msb stdout into a private temporary
-// file on the host while enforcing MaxAgentBinaryBytes and computing its SHA-256 digest.
+// AgentBinaryCaptureWriter streams a binary into a private staging file on the host.
+// It enforces maxAgentBinaryBytes and computes the SHA-256 digest.
 type AgentBinaryCaptureWriter struct {
+	Now       func() time.Time
 	agentsDir string
 	agent     string
 	binName   string
+	stageDir  string
 	tmpFile   *os.File
 	tmpPath   string
 	hasher    hash.Hash
@@ -309,46 +315,56 @@ type AgentBinaryCaptureWriter struct {
 	overflow  bool
 }
 
-// NewAgentBinaryCaptureWriter prepares a temporary file inside $DATA_DIR/agents/bin
+// NewAgentBinaryCaptureWriter creates a temporary file inside $DATA_DIR/.agbox-stage-*
 // to receive a streamed ELF binary for agent.
 func NewAgentBinaryCaptureWriter(agentsDir, agent string) (*AgentBinaryCaptureWriter, error) {
-	binName, err := AgentBinName(agent)
+	binName, err := agentBinName(agent)
 	if err != nil {
 		return nil, err
 	}
 	if err := EnsureAgentsDir(agentsDir); err != nil {
 		return nil, err
 	}
-	// Create the temp file inside agentsDir (mode 0700) on the same filesystem,
-	// then atomically rename the verified ELF binary into bin/<binName>.
-	tmp, err := os.CreateTemp(agentsDir, ".tmp-"+binName+"-*")
+	stageParent := filepath.Dir(agentsDir)
+	if err := config.EnsurePrivateDir(stageParent); err != nil {
+		return nil, err
+	}
+	stageDir, err := os.MkdirTemp(stageParent, ".agbox-stage-*")
 	if err != nil {
+		return nil, fmt.Errorf("create staging directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(stageDir, ".tmp-"+binName+"-*")
+	if err != nil {
+		_ = os.RemoveAll(stageDir)
 		return nil, fmt.Errorf("create temp agent binary: %w", err)
 	}
 	if err := tmp.Chmod(0o600); err != nil {
 		tmpName := tmp.Name()
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
+		_ = os.RemoveAll(stageDir)
 		return nil, err
 	}
 	return &AgentBinaryCaptureWriter{
+		Now:       time.Now,
 		agentsDir: agentsDir,
 		agent:     agent,
 		binName:   binName,
+		stageDir:  stageDir,
 		tmpFile:   tmp,
 		tmpPath:   tmp.Name(),
 		hasher:    sha256.New(),
 	}, nil
 }
 
-// Write appends p to the temporary file up to MaxAgentBinaryBytes.
+// Write appends p to the temporary file up to maxAgentBinaryBytes.
 func (w *AgentBinaryCaptureWriter) Write(p []byte) (int, error) {
 	if w.tmpFile == nil {
-		return 0, errors.New("capture writer is closed")
+		return 0, errors.New("capture writer closed")
 	}
-	if int64(len(p))+w.written > MaxAgentBinaryBytes {
+	if int64(len(p))+w.written > maxAgentBinaryBytes {
 		w.overflow = true
-		return 0, fmt.Errorf("agent binary stream exceeds maximum size (%d bytes)", MaxAgentBinaryBytes)
+		return 0, fmt.Errorf("agent binary stream exceeds %d bytes", maxAgentBinaryBytes)
 	}
 	if len(w.header) < len(elfMagic) {
 		need := len(elfMagic) - len(w.header)
@@ -365,12 +381,12 @@ func (w *AgentBinaryCaptureWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// Written returns the number of bytes written to the temporary binary file so far.
+// Written returns the number of bytes written to the temporary binary file.
 func (w *AgentBinaryCaptureWriter) Written() int64 {
 	return w.written
 }
 
-// Abort closes and deletes the temporary file without updating the cache.
+// Abort closes and deletes the temporary staging files without modifying the cache.
 func (w *AgentBinaryCaptureWriter) Abort() {
 	if w.tmpFile != nil {
 		_ = w.tmpFile.Close()
@@ -380,21 +396,25 @@ func (w *AgentBinaryCaptureWriter) Abort() {
 		_ = os.Remove(w.tmpPath)
 		w.tmpPath = ""
 	}
+	if w.stageDir != "" {
+		_ = os.RemoveAll(w.stageDir)
+		w.stageDir = ""
+	}
 }
 
-// Commit verifies the captured ELF binary, moves it atomically to $DATA_DIR/agents/bin/<binName>
-// with mode 0755, and updates $DATA_DIR/agents/manifest.json.
+// Commit checks the captured ELF binary, replaces $DATA_DIR/agents/bin/<binName>
+// atomically at mode 0755, and updates $DATA_DIR/agents/manifest.json under flock.
 func (w *AgentBinaryCaptureWriter) Commit(version string) (CachedAgentInfo, error) {
 	defer w.Abort()
 
 	if w.tmpFile == nil {
-		return CachedAgentInfo{}, errors.New("capture writer already finalized")
+		return CachedAgentInfo{}, errors.New("capture writer already closed")
 	}
-	if w.overflow || w.written > MaxAgentBinaryBytes {
-		return CachedAgentInfo{}, fmt.Errorf("agent binary exceeds %d bytes", MaxAgentBinaryBytes)
+	if w.overflow || w.written > maxAgentBinaryBytes {
+		return CachedAgentInfo{}, fmt.Errorf("agent binary exceeds %d bytes", maxAgentBinaryBytes)
 	}
-	if w.written < MinAgentBinaryBytes {
-		return CachedAgentInfo{}, fmt.Errorf("captured %s binary is too small (%d bytes)", w.agent, w.written)
+	if w.written < minAgentBinaryBytes {
+		return CachedAgentInfo{}, fmt.Errorf("captured %s binary is smaller than %d bytes (%d)", w.agent, minAgentBinaryBytes, w.written)
 	}
 	if !bytes.Equal(w.header, elfMagic) {
 		return CachedAgentInfo{}, fmt.Errorf("captured %s stream is not a valid ELF binary", w.agent)
@@ -410,6 +430,16 @@ func (w *AgentBinaryCaptureWriter) Commit(version string) (CachedAgentInfo, erro
 	}
 	w.tmpFile = nil
 
+	lockFile, err := lockAgentsCache(w.agentsDir)
+	if err != nil {
+		return CachedAgentInfo{}, err
+	}
+	defer unlockAgentsCache(lockFile)
+
+	nowFn := w.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
 	cleanVer := sanitizeSingleLineVersion(version)
 	info := CachedAgentInfo{
 		Agent:     w.agent,
@@ -417,7 +447,7 @@ func (w *AgentBinaryCaptureWriter) Commit(version string) (CachedAgentInfo, erro
 		Version:   cleanVer,
 		SHA256:    hex.EncodeToString(w.hasher.Sum(nil)),
 		SizeBytes: w.written,
-		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: nowFn().UTC().Format(time.RFC3339),
 	}
 
 	manifest, err := loadAgentsManifestForUpdate(w.agentsDir)
@@ -427,19 +457,74 @@ func (w *AgentBinaryCaptureWriter) Commit(version string) (CachedAgentInfo, erro
 	manifest.Agents[w.agent] = info
 
 	dstPath := filepath.Join(w.agentsDir, "bin", w.binName)
+	backupPath := ""
+	dstInfo, statErr := os.Lstat(dstPath)
+	dstExisted := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return CachedAgentInfo{}, statErr
+	}
+	if dstExisted {
+		if dstInfo.Mode()&os.ModeSymlink != 0 || !dstInfo.Mode().IsRegular() {
+			return CachedAgentInfo{}, fmt.Errorf("refusing non-regular existing binary %s", dstPath)
+		}
+		backupPath = filepath.Join(w.stageDir, ".backup-"+w.binName)
+		if err := copyBinaryForBackup(dstPath, backupPath); err != nil {
+			return CachedAgentInfo{}, fmt.Errorf("back up existing %s binary: %w", w.agent, err)
+		}
+	}
+
 	if err := os.Rename(w.tmpPath, dstPath); err != nil {
 		return CachedAgentInfo{}, fmt.Errorf("install %s binary: %w", w.agent, err)
 	}
 	w.tmpPath = ""
 
 	if err := saveAgentsManifestAtomic(w.agentsDir, manifest); err != nil {
-		return CachedAgentInfo{}, err
+		outErr := err
+		if dstExisted {
+			if rbErr := os.Rename(backupPath, dstPath); rbErr != nil {
+				outErr = errors.Join(outErr, fmt.Errorf("restore %s binary backup: %w", w.agent, rbErr))
+			}
+		} else {
+			if rmErr := os.Remove(dstPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				outErr = errors.Join(outErr, fmt.Errorf("remove uncommitted %s binary: %w", w.agent, rmErr))
+			}
+		}
+		return CachedAgentInfo{}, outErr
 	}
 	return info, nil
 }
 
-// InstallAgentBinaryFromReader streams an ELF binary from r and commits it to $DATA_DIR/agents.
-func InstallAgentBinaryFromReader(agentsDir, agent, version string, r io.Reader) (CachedAgentInfo, error) {
+func copyBinaryForBackup(srcPath, dstPath string) error {
+	fd, err := syscall.Open(srcPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
+	in := os.NewFile(uintptr(fd), srcPath)
+	defer in.Close()
+
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("refusing non-regular source %s", srcPath)
+	}
+	out, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, io.LimitReader(in, maxAgentBinaryBytes)); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+func installAgentBinaryFromReader(agentsDir, agent, version string, r io.Reader) (CachedAgentInfo, error) {
 	cw, err := NewAgentBinaryCaptureWriter(agentsDir, agent)
 	if err != nil {
 		return CachedAgentInfo{}, err
@@ -452,8 +537,17 @@ func InstallAgentBinaryFromReader(agentsDir, agent, version string, r io.Reader)
 }
 
 // RemoveCachedAgent deletes one ("antigravity" or "opencode") or "all" cached binaries
-// from $DATA_DIR/agents while keeping $DATA_DIR/agents/bin mounted cleanly.
+// from $DATA_DIR/agents while keeping $DATA_DIR/agents/bin intact.
 func RemoveCachedAgent(agentsDir, target string) error {
+	var targets []string
+	switch {
+	case target == "all":
+		targets = supportedAgentNames()
+	case isSupportedAgent(target):
+		targets = []string{target}
+	default:
+		return fmt.Errorf("unsupported agent %q (expected antigravity, opencode, or all)", target)
+	}
 	if agentsDir == "" {
 		return nil
 	}
@@ -463,23 +557,22 @@ func RemoveCachedAgent(agentsDir, target string) error {
 	if err := EnsureAgentsDir(agentsDir); err != nil {
 		return err
 	}
+	lockFile, err := lockAgentsCache(agentsDir)
+	if err != nil {
+		return err
+	}
+	defer unlockAgentsCache(lockFile)
+
 	manifest, err := loadAgentsManifestForUpdate(agentsDir)
 	if err != nil {
+		if target != "all" {
+			return err
+		}
 		manifest = agentsManifest{Agents: map[string]CachedAgentInfo{}}
 	}
 
-	var targets []string
-	switch target {
-	case "all":
-		targets = []string{"antigravity", "opencode"}
-	case "antigravity", "opencode":
-		targets = []string{target}
-	default:
-		return fmt.Errorf("unsupported agent %q (expected antigravity, opencode, or all)", target)
-	}
-
 	for _, ag := range targets {
-		binName, _ := AgentBinName(ag)
+		binName, _ := agentBinName(ag)
 		binPath := filepath.Join(agentsDir, "bin", binName)
 		if err := os.Remove(binPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove %s: %w", binPath, err)
@@ -499,7 +592,7 @@ func RemoveCachedAgent(agentsDir, target string) error {
 func loadAgentsManifestForUpdate(agentsDir string) (agentsManifest, error) {
 	m := agentsManifest{Agents: map[string]CachedAgentInfo{}}
 	mPath := filepath.Join(agentsDir, "manifest.json")
-	raw, err := readRegularNoFollow(mPath, MaxAgentsManifestBytes)
+	raw, err := readRegularNoFollow(mPath, maxAgentsManifestBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return m, nil
@@ -521,36 +614,9 @@ func saveAgentsManifestAtomic(agentsDir string, m agentsManifest) error {
 		return fmt.Errorf("marshal agents manifest: %w", err)
 	}
 	raw = append(raw, '\n')
-	tmp, err := os.CreateTemp(agentsDir, ".manifest-*")
-	if err != nil {
-		return fmt.Errorf("create temp manifest: %w", err)
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(raw); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, filepath.Join(agentsDir, "manifest.json")); err != nil {
+	if err := writeModeFileAtomic(filepath.Join(agentsDir, "manifest.json"), raw, 0o600); err != nil {
 		return fmt.Errorf("save agents manifest: %w", err)
 	}
-	cleanup = false
 	return nil
 }
 
@@ -568,9 +634,8 @@ func sanitizeSingleLineVersion(v string) string {
 	return b.String()
 }
 
-// BuildAgentUpdateScript returns the bash script executed inside the disposable
-// agbox-update-<pid> microVM to install or update agent, plus the guest command
-// that streams the resulting ELF binary to stdout.
+// BuildAgentUpdateScript builds the script to update an agent inside a disposable sandbox.
+// It also returns guest commands that stream the ELF binary and read its version.
 func BuildAgentUpdateScript(agent, openCodeVer, agyURL string) (updateScript string, streamCmd string, verCmd string, err error) {
 	switch agent {
 	case "antigravity":
@@ -578,7 +643,7 @@ func BuildAgentUpdateScript(agent, openCodeVer, agyURL string) (updateScript str
 			agyURL = config.DefaultAgyInstallerURL
 		}
 		installCmd := fmt.Sprintf(
-			"if [ -x /home/agent/.local/bin/agy ]; then /home/agent/.local/bin/agy update || (curl --proto '=https' --tlsv1.2 -fsSL -- %s | bash); else curl --proto '=https' --tlsv1.2 -fsSL -- %s | bash; fi",
+			"set -o pipefail; if [ -x /home/agent/.local/bin/agy ]; then /home/agent/.local/bin/agy update || (curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -- %s | bash); else curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -- %s | bash; fi",
 			msb.ShellQuote(agyURL),
 			msb.ShellQuote(agyURL),
 		)
@@ -597,7 +662,7 @@ su - %s -c "/home/agent/.local/bin/agy --version" >/tmp/agbox-agy-version.txt
 		}
 		script := fmt.Sprintf(`set -euo pipefail
 if ! command -v npm >/dev/null 2>&1; then
-  echo "npm is not installed in this base snapshot (create-base with 'opencode' or 'both' first)" >&2
+  echo "This base snapshot does not contain npm. Run 'agbox create-base opencode' or 'agbox create-base both'." >&2
   exit 1
 fi
 npm install -g --no-fund --no-audit %s
@@ -613,14 +678,19 @@ su - %s -c "opencode --version" >/tmp/agbox-opencode-version.txt
 	}
 }
 
-// BuildGuestAgentsMountScript returns the root-executed POSIX shell script that
-// bind-mounts cached agent binaries from GuestAgentsMount read-only (ro,bind)
-// onto /home/agent/.local/bin/agy, /usr/local/bin/agy, and /usr/local/bin/opencode.
+// BuildGuestAgentsMountScript returns a root sh script that bind-mounts cached binaries read-only.
 func BuildGuestAgentsMountScript() string {
 	return fmt.Sprintf(`set -eu
 src=%s
 umount /home/agent/.local/bin/agy 2>/dev/null || true
 umount /usr/local/bin/opencode 2>/dev/null || true
+
+if [ -f /home/agent/.local/bin/agy ] && [ ! -L /home/agent/.local/bin/agy ] && [ ! -s /home/agent/.local/bin/agy ]; then
+  rm -f /home/agent/.local/bin/agy
+fi
+if [ -L /usr/local/bin/agy ] && [ ! -e /usr/local/bin/agy ]; then
+  rm -f /usr/local/bin/agy
+fi
 
 if [ -f /usr/local/bin/opencode ] && [ ! -L /usr/local/bin/opencode ] && [ ! -s /usr/local/bin/opencode ] && [ -x /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe ]; then
   ln -sfn ../lib/node_modules/opencode-ai/bin/opencode.exe /usr/local/bin/opencode
@@ -634,7 +704,7 @@ if [ -f "$src/bin/agy" ] && [ ! -L "$src/bin/agy" ]; then
     install -m 0755 -o 1000 -g 1000 /dev/null /home/agent/.local/bin/agy
   fi
   mount --bind "$src/bin/agy" /home/agent/.local/bin/agy
-  mount -o remount,ro,bind /home/agent/.local/bin/agy 2>/dev/null || true
+  mount -o remount,ro,bind /home/agent/.local/bin/agy
   ln -sfn /home/agent/.local/bin/agy /usr/local/bin/agy
 fi
 
@@ -644,7 +714,7 @@ if [ -f "$src/bin/opencode" ] && [ ! -L "$src/bin/opencode" ]; then
     install -m 0755 /dev/null /usr/local/bin/opencode
   fi
   mount --bind "$src/bin/opencode" /usr/local/bin/opencode
-  mount -o remount,ro,bind /usr/local/bin/opencode 2>/dev/null || true
+  mount -o remount,ro,bind /usr/local/bin/opencode
 fi
 `, msb.ShellQuote(msb.GuestAgentsMount))
 }

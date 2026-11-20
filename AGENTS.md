@@ -1,179 +1,220 @@
 # AGENTS.md
 
-This file defines the architecture, safe-by-default security invariants, upstream `msb` contracts, `test.sh` rules, coding conventions, and verification steps for `agbox`. Every change to this repository must preserve these rules.
+This file defines the architecture, the Safe-by-Default security rules, the upstream `msb` contracts, the `test.sh` rules, the style rules, and the verification steps for `agbox`. Every change must keep these rules.
 
-______________________________________________________________________
+## 1. Project overview and architecture
 
-## 1. Project Overview and Architecture
+`agbox` runs AI coding agents (`opencode` and `agy`) in isolated Linux microVMs. A microVM runs on `msb` (`libkrun` and `/dev/kvm`). This file calls one microVM a sandbox. One binary (`cmd/agbox`) serves both the user CLI and the embedded FUSE daemon (`agbox __filter ...`).
 
-`agbox` runs AI coding agents (`opencode` and `agy`) inside isolated Linux `msb` (`libkrun` and `/dev/kvm`) microVMs. A single compiled binary (`cmd/agbox`) serves both the user CLI and the embedded FUSE filesystem daemon (`agbox __filter ...`).
-
-### Repository and Documentation Map
+### Repository map
 
 | Path | Responsibility |
 |---|---|
-| `cmd/agbox` | Main entrypoint. Routes `__filter` directly to `vcsfuse` and forwards all other commands to `cli.Main`. |
-| `internal/config` | Environment parsing, private state directories (`0700` and `0600`), snapshot numbering, and `run.meta` serialization. |
-| `internal/pathsec` | Host path canonicalization, `$HOME` containment, credential and VCS blocklists, share modifier parsing, alias validation, and disjointness checks. |
-| `internal/vcsfuse` | Loopback FUSE filter and multiplexed `/workspace` Workspace Hub (`openat2` confinement, VCS/hook masking, guest `1000:1000` ownership mapping, FD revocation, and `ws.sock` control server). |
-| `internal/mounttab` | `/proc/self/mountinfo` parsing, `/proc/<pid>/cmdline` verification before signaling, and mount-verified directory cleanup. |
-| `internal/msb` | `msb` argument builders, default-deny network rules, `--mount-disk` and volume inspection helpers, guest provisioning scripts, developer categories, and the `Runner` interface. |
-| `internal/persist` | Zero-share `agbox auth` credential capture, verified read-only `$DATA_DIR/agents` binary cache, read-only `$DATA_DIR/skills` and `$DATA_DIR/rules`, and `flock`-guarded `--profile` volumes. |
-| `internal/cli` | Pure flag parsers, subcommand dispatch, and orchestration over injected interfaces (`msb.Runner`, `mounttab.Controller`, `FilterStarter`, `HubStarter`). |
-| `install.sh` | Idempotent prerequisite check, static build, and user binary installation script. |
-| `test.sh` | Automated end-to-end verification harness covering static checks, race-tested unit tests, CLI security contracts, live FUSE mounts, and live microVM workflows. |
-| `README.md` | High-level overview, chronological quick start, security properties table, and test overview. |
-| `USER_GUIDE.md` | Step-by-step user workflows, package categories, full CLI reference, and environment variable documentation. |
-| `AGENTS.md` | Fresh-context onboarding, security invariants, upstream `msb` contracts, `test.sh` authoring rules, and verification checklist. |
+| `cmd/agbox` | Entrypoint. Routes `__filter` to `vcsfuse` and all other commands to `cli.Main`. |
+| `internal/config` | Environment parsing, private state directories (`0700`, `0600`), snapshot numbers, and `run.meta` files. |
+| `internal/pathsec` | Path canonicalization, `$HOME` containment, blocklists, share modifiers, alias checks, and disjointness checks. |
+| `internal/vcsfuse` | Loopback FUSE filter and the `/workspace` Workspace Hub. It owns `openat2` confinement, VCS and hook protection, guest `1000:1000` ownership mapping, descriptor revocation, and the `ws.sock` control server. |
+| `internal/mounttab` | `/proc/self/mountinfo` parsing, `/proc/<pid>/cmdline` checks before signals, and mount-verified directory cleanup. |
+| `internal/msb` | `msb` argument builders, default-deny network rules, volume helpers, guest scripts, categories, and the `Runner` interface. |
+| `internal/persist` | Credential capture, the agent cache, skills, rules, and `flock`-guarded profile volumes. |
+| `internal/cli` | Argument parsers, mode dispatch, and orchestration. `cli.Main` is the only export. Files: `cli.go`, `parse.go`, `usage.go`, `base.go`, `run.go`, `lifecycle.go`, `persist_modes.go`, `share_mode.go`, `update_mode.go`. |
+| `install.sh` | Idempotent prerequisite check, static build, and atomic install. |
+| `AGBOX_ENV_RULES.md` | Default guest rules. `install.sh` and `agbox setup` install them into `$DATA_DIR/rules`. |
+| `test.sh` | End-to-end verification harness. |
+| `README.md` | Overview, quick start, and security summary. |
+| `USER_GUIDE.md` | User workflows, categories, CLI reference, and environment variables. |
+| `AGENTS.md` | Onboarding, security rules, `msb` contracts, `test.sh` rules, and the verification checklist. |
 
-Prefer pure functions for parsing, validation, and command construction. Inject external side effects through interfaces instead of package-level globals so tests run deterministically without root or `/dev/kvm`.
+Write pure functions for parsing, validation, and command construction. Inject side effects through interfaces and function fields. For example, `msb.Runner`, `mounttab.Controller`, and the `StartFilter` and `StartHub` fields of the `cli` runtime. Tests then run without root and without `/dev/kvm`.
 
-### Installed Binary vs Source Tree
+`persist_test.go` compares the headings of `AGBOX_ENV_RULES.md` with `defaultEnvRuleMarkdown` in `internal/persist/persist.go`. Edit both files together.
 
-- `./install.sh` compiles `./cmd/agbox` and installs the binary to `~/.local/bin/agbox` (or `/usr/local/bin/agbox` with `--allow-root`, overridden by `AGBOX_INSTALL_DIR`).
-- Editing Go source code in `/workspace/agbox` does not update `~/.local/bin/agbox` until `./install.sh` runs again.
-- Non-disruptive `./test.sh` runs build and execute an isolated binary inside `$TEST_ROOT/bin/agbox` and leave the host installed binary untouched.
-- Disruptive `./test.sh --disruptive` runs back up the existing installed binary (`ORIG_INSTALL_BIN`), run `agbox remove --yes` to verify a clean-slate installation (`./install.sh`, `agbox setup`, `create-base`, and `edit-base`), run `agbox remove --yes` again on exit so live host state is cleared, and restore the backed-up installed binary.
+### Installed binary and source tree
 
-______________________________________________________________________
+- `./install.sh` builds `./cmd/agbox` with `CGO_ENABLED=0`. It stages the binary in the install directory and replaces the target with `mv -f`. It refuses a symlink or a directory at the target.
+- The install directory is `~/.local/bin` (`/usr/local/bin` with `--allow-root`). `AGBOX_INSTALL_DIR` overrides it.
+- A source edit does not change the installed binary until you run `./install.sh` again.
+- `./test.sh` builds an isolated binary in `$TEST_ROOT/bin/agbox`. It leaves the installed binary unchanged.
+- `./test.sh --disruptive` copies the installed binary to `ORIG_INSTALL_BIN` and runs `agbox remove --yes`. On exit, it runs `agbox remove --yes` again and restores the binary.
 
-## 2. Safe-by-Default Security Rules (Non-Negotiable)
+## 2. Safe-by-Default security rules
 
-All defaults must choose the most restrictive behavior. Any privilege expansion requires an explicit CLI flag or documented environment variable.
+Every default must choose the most restrictive behavior. Each privilege increase needs an explicit CLI flag or a documented environment variable.
 
-### Fail Closed Everywhere
+### Fail closed
 
-- Abort immediately if any validation, FUSE mount, socket bind, network rule, snapshot lookup, or secret transfer fails.
-- Never fall back to weaker isolation (such as raw directory mounts when `AGBOX_MASK_VCS=strict` or unauthenticated sockets) on error.
-- Clean up partial microVMs, mounts, and state directories on failure.
-- Exit silently with a child status code only for direct interactive session exits (`--cmd` and TUI). Print `[agbox] ERROR: ...` with captured `msb` diagnostics for every setup, mount, or `msb` failure.
+- Stop on any failed validation, FUSE mount, socket bind, network rule, snapshot lookup, or secret transfer.
+- Never fall back to weaker isolation. The only documented exception is `AGBOX_MASK_VCS=auto` (see the next section).
+- Delete partial sandboxes, mounts, and state directories on failure.
+- Exit silently with the child status only for direct interactive exits (`--cmd` and terminal UI). For every other failure, print `[agbox] ERROR: ...` with the captured `msb` diagnostics.
 
-### Host Execution and State Permissions
+### Host execution and state
 
-- Reject host `root` execution (`euid == 0`) unless `--allow-root` or `AGBOX_ALLOW_ROOT=1` is set.
-- Create host state directories with `config.EnsurePrivateDir` (`Lstat` symlink rejection and mode `0700`) and write metadata or secret files at mode `0600`.
-- Redirect background FUSE daemon `stderr` (`StartHubSubprocess` and `StartSubprocess`) to a private mode `0600` `.err` log file inside the run directory (`ws.err` or `m*.err`), never inheriting `os.Stdout` or `os.Stderr`, so shell command-substitution pipes (`$(agbox run -d ... 2>&1)`) never hang after the CLI exits.
-- Before signaling any recorded FUSE PID, verify `/proc/<pid>/cmdline` matches `agbox __filter` (`mounttab.IsFilterCmdline`).
-- Before calling `os.RemoveAll` on any run directory, unmount FUSE shares and verify zero active mounts remain in `/proc/self/mountinfo` (`mounttab.TeardownFilterDir`).
+- Reject host `root` (`euid == 0`) unless you pass `--allow-root` or set `AGBOX_ALLOW_ROOT=1`.
+- Create state directories with `config.EnsurePrivateDir`. It rejects symlinks and sets mode `0700`. Write metadata and secret files at mode `0600`.
+- Redirect background FUSE daemon `stderr` to a private `.err` file (`ws.err` or `m*.err`, mode `0600`). Never inherit `os.Stdout` or `os.Stderr`. This stops `$(agbox run -d ... 2>&1)` from hanging.
+- Before a signal, check that `/proc/<pid>/cmdline` matches `agbox __filter` and the target directory (`mounttab.IsFilterCmdline`).
+- Before `os.RemoveAll` on a run directory, unmount the FUSE shares. Then check that zero mounts remain in `/proc/self/mountinfo` (`mounttab.TeardownFilterDir`).
 
-### Host Shares, Guest Ownership Mapping, and FUSE Confinement
+### Shares, ownership mapping, and FUSE confinement
 
-- Mount zero host paths and start zero FUSE daemons when `agbox run` receives no share paths and `--share-hub` is not set.
-- Reject conflicting CLI flags or share modifiers with an explicit error (for example, `--ro` with `--rw`, `:ro,rw`, `:mask,vcs`, or `:ro,vcs-hooks`). Never resolve conflicts silently.
-- Validate every host share with `pathsec.ValidateShare` on `run`, `resume`, and `agbox share add`:
-  - Resolve symlinks and reject missing paths, dangling symlinks, and control characters.
-  - Enforce `$HOME` containment unless `AGBOX_ALLOW_OUTSIDE_HOME=1`.
-  - Enforce the credential, agent-state, shell-config, `DATA_DIR`, `MSB_HOME`, VCS, and system blocklists (including parent directories of blocklisted paths).
-  - Reject overlapping or nested host directory shares within the same sandbox (`pathsec.CheckDisjointHostPaths`).
+```mermaid
+flowchart TD
+    A["Host Share Path"] --> B{"pathsec.ValidateShare"}
+    B -->|"Symlink, Blocklist, or Outside HOME"| C["Reject with Error"]
+    B -->|"Valid Path"| D{"VCS Policy"}
+    D -->|"mask (default)"| E["vcsfuse: Mask 22 VCS Names"]
+    D -->|":vcs"| F["vcsfuse: Expose VCS, Protect Hooks and Config"]
+    D -->|":vcs-hooks"| G["vcsfuse: Expose VCS, Writable Hooks"]
+    E --> H["msb sandbox: /workspace (rw,stat-virt=off,1000:1000)"]
+    F --> H
+    G --> H
+```
+
+- Mount zero host paths and start zero FUSE daemons when `agbox run` gets no path and no `--share-hub`.
+- Reject conflicting flags and modifiers with an error. Examples: `--ro` with `--rw`, `:ro,rw`, `:mask,vcs`, `:ro,vcs-hooks`, and `:vcs` on a single-file share. Never resolve a conflict silently.
+- Run `pathsec.ValidateShare` on every share in `run`, `resume`, and `share add`:
+  - Resolve symlinks. Reject missing paths, dangling symlinks, and control characters.
+  - Require `$HOME` containment unless `AGBOX_ALLOW_OUTSIDE_HOME=1`.
+  - Apply the blocklists for credentials, agent state, shell configs, `DATA_DIR`, `MSB_HOME`, VCS, and system paths. Include the parent directories of blocked paths.
+  - Reject overlapping or nested host directories in one sandbox (`pathsec.CheckDisjointHostPaths`).
   - Require `st_nlink == 1` on writable single-file shares.
-- Keep all Workspace Hub shares inside `vcsfuse` (`openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, `nosuid,nodev`, regular files and intra-share relative symlinks only, `setuid`/`setgid` stripped, raw `ioctl` blocked, and non-`user.*` xattrs blocked):
-  - Default VCS policy is `mask` (`VCSMask`), which hides and write-protects all 22 VCS admin directories and control files case-insensitively.
-  - `:vcs` (`VCSAllow`) exposes VCS metadata for `git`/`jj` operations while write-protecting `.git/hooks`, `.git/**/hooks`, `.jj/**/hooks`, `.svn/**/hooks`, `_darcs/**/prefs`, `.pijul/**/hooks`, `.hg/hgrc`, and top-level VCS admin directory deletion/renaming with `EPERM`.
-  - Writable VCS hooks require explicit `:vcs-hooks` (`--vcs-hooks`) on a writable share.
-  - `vcsfuse` (`WorkspaceHub` and `StartSubprocess`) maps host file ownership to guest `agent` (`1000:1000`) in memory (`guestIDMap`). Because FUSE handles UID/GID translation internally, `/workspace` mounts into `msb` with `:rw,stat-virt=off` and triggers zero `user.msb.*` xattr probes or writes on host files.
-- When `AGBOX_MASK_VCS=off` (`--no-mask`) mounts a host share directly without FUSE:
-  - Read-only direct shares mount with `:ro,stat-virt=relaxed,uid=1000,gid=1000`.
-  - Writable direct shares whose host UID/GID already matches `1000:1000`, or whose host filesystem lacks `user.*` extended attribute support, mount with `:rw,stat-virt=off`.
-  - Other writable direct shares mount with `:rw,stat-virt=relaxed,host-perms=mirror,uid=1000,gid=1000`.
-- Default `agbox share add` to **`ro,mask`** unless `--rw` (`:rw`) or `--vcs` (`:vcs`) is explicitly passed.
-- Bind `$DATA_DIR/run/<id>/ws.sock` at mode `0600` inside a `0700` directory and verify peer UID via `SO_PEERCRED` on every connection.
-- Fail `agbox share rm` and `agbox share set --ro` when open writable file handles exist unless `--force` is passed. Immediately revoke open descriptors (`ESTALE` on detach, `EROFS` on read-only downgrade) and flush guest VFS caches.
+- Keep Workspace Hub shares inside `vcsfuse`. Use `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, `nosuid,nodev`, stripped `setuid` and `setgid` bits, blocked `ioctl`, and restricted `user.*` extended attributes.
+- The default VCS policy is `mask`. It hides and write-protects 22 names case-insensitively:
+  - Git: `.git`, `.gitignore`, `.gitattributes`, `.gitmodules`, `.mailmap`
+  - Jujutsu and Sapling: `.jj`, `.sl`
+  - Subversion: `.svn`
+  - Mercurial: `.hg`, `.hgignore`, `.hgsub`, `.hgsubstate`, `.hgtags`, `.hgeol`
+  - Bazaar, Darcs, Pijul: `.bzr`, `.bzrignore`, `_darcs`, `.pijul`
+  - Fossil: `.fossil-settings`, `.fslckout`, `_fossil_`
+  - CVS: `.cvsignore`
+- The `:vcs` policy (`VCSAllow`) exposes VCS metadata. It returns `EPERM` for writes to these paths:
+  - Hooks: `.git/hooks`, `.git/**/hooks`, `.jj/**/hooks`, `.svn/**/hooks`, `.pijul/**/hooks`, and `_darcs/**/prefs`.
+  - Git config files: `.git/config`, `.git/config.worktree`, `.git/commondir`, `.git/gitdir`, `.git/modules/**/config`, `.git/worktrees/**/config`, and `.git/worktrees/**/config.worktree`.
+  - Submodules or worktrees named `refs`, `logs`, or `objects` keep the same Git config protection.
+  - Other executable config files: `.jj/**/config.toml`, `.jj/**/config`, `.sl/config`, `.sl/hgrc*`, `.bzr/**/branch.conf`, `.bzr/**/locations.conf`, and `.hg/hgrc*`.
+  - Entries named `.git`, `.jj`, `.hg`, `.svn`, `_darcs`, `.pijul`, `.fossil-settings`, `_fossil_`, `.bzr`, or `.sl`. Create, `mkdir`, link, delete, and rename fail.
+- `Rename` rejects `RENAME_WHITEOUT` and unknown flags. It walks the moved subtree through pinned `openat2` descriptors. It checks symlink targets again at the new depth, in both directions of `RENAME_EXCHANGE`.
+- `Link` rejects hardlinks that cross a VCS or hook boundary with `EPERM`.
+- `Rename` rejects multi-link regular files (`st_nlink != 1`) that cross a VCS or hook boundary with `EPERM`.
+- `Link` and `Rename` promote open file and directory handles on valid same-boundary links and single-link moves. Policy downgrades then count and revoke those handles.
+- The `:vcs-hooks` policy (`--vcs-hooks`) makes hooks writable. It needs a writable share.
+- `vcsfuse` maps host ownership to the guest `agent` (`1000:1000`) in memory. `/workspace` mounts with `:rw,stat-virt=off`. This causes no `user.msb.*` xattr probes and no xattr writes on host files.
+- `AGBOX_MASK_VCS=off` (`--no-mask`) mounts shares directly without FUSE:
+  - Read-only shares use `:ro,stat-virt=relaxed,uid=1000,gid=1000`.
+  - Writable shares use `:rw,stat-virt=off` when the host UID and GID are `1000:1000` or the filesystem has no `user.*` xattr support.
+  - Other writable shares use `:rw,stat-virt=relaxed,host-perms=mirror,uid=1000,gid=1000`.
+- `AGBOX_MASK_VCS=strict` is the default. It never falls back to a direct mount. `AGBOX_MASK_VCS=auto` falls back to a direct mount with a warning in three cases. The cases are an unsupported `DATA_DIR`, a missing hub starter, and a failed hub start. `--share-hub` never falls back. `DATA_DIR` must not contain whitespace or backslashes when masking is on.
+- `agbox share add` defaults to read-only with masked VCS. Only `--rw` or `:rw` makes a share writable. `--vcs` changes only the VCS policy.
+- Bind `$DATA_DIR/run/<id>/ws.sock` at mode `0600` in a `0700` directory. Check the peer UID with `SO_PEERCRED` on every connection.
+- `agbox share rm` and `agbox share set --ro` fail when open writable handles exist, unless you pass `--force`. Revoke open descriptors at once. Return `ESTALE` on detach, `EROFS` on a read-only downgrade, and a masked result on a VCS downgrade. Flush the guest VFS lookup caches.
 
-### Networking, Secrets, Read-Only Host Caches, and Profile Disks
+### Networking, secrets, caches, and profile disks
 
-- Keep `--net public` default-deny (`--net-default deny`) with explicit `allow@dns` (on group profiles) before `deny@host`, `deny@loopback`, `deny@private`, `deny@link-local`, `deny@multicast`, `deny@meta`, and cloud IMDS CIDR blocks (with IPv6 CIDRs bracketed as `[fe80::/10]` and `[fd00:ec2::254/128]`), all placed before `allow@public`.
-- Keep `--serve` host port forwarding bound strictly to `127.0.0.1`, and pair published guest ports with `--net-rule allow:ingress@loopback:<proto>:<guestPort>` under default-deny policy.
-- Enforce `--proto '=https' --tlsv1.2` on all `curl` downloads.
-- Never pass API keys or auth tokens in CLI arguments or bake them into snapshots. Stream secrets over `stdin` into `0600` files inside the guest.
-- Run `agbox auth` and `agbox update` inside disposable zero-share microVMs. `agbox update` must pass zero API keys and zero saved login tokens, verify ELF magic (`\x7fELF`), size bounds, `st_nlink == 1`, and SHA-256 digests in `manifest.json`.
-- Mount `$DATA_DIR/skills`, `$DATA_DIR/rules`, and `$DATA_DIR/agents` read-only with `:ro,stat-virt=relaxed,uid=1000,gid=1000` and re-bind them read-only (`ro,bind`) inside the guest after rejecting symlinks via `Lstat`.
-- Always pass an explicit `-u root` or `-u agent` flag to `msb exec`. Because `msb snap restore -u agent` sets the default `msb exec` user to `agent`, every privileged guest setup or cache-flush command must pass `-u root`.
-- Guard each `--profile` `ext4` disk volume with an exclusive host `flock` (`profile.lock`), resolve the backing `disk.raw` file via `msb.ResolveVolumeDiskPath` (`msb volume inspect` with fallback to `<MSB_HOME>/volumes/<vol>/disk.raw`), and attach it with `--mount-disk <disk.raw>:/home/agent/.agbox-profile:rw,format=raw,fstype=ext4`.
+- `--net public` is the default. It uses `--net-default deny`. Order the rules like this:
+  1. `allow@dns`
+  1. `deny@host` rules
+  1. All deny groups and CIDRs
+  1. `allow@public`
+- The deny groups are `loopback`, `private`, `link-local`, `multicast`, and `meta`. The deny CIDRs are `0.0.0.0/8`, `100.64.0.0/10`, `100.100.100.200/32`, `168.63.129.16/32`, `169.254.0.0/16`, `240.0.0.0/4`, `[::/128]`, `[::ffff:0:0/96]`, `[64:ff9b::/96]`, `[fe80::/10]`, and `[fd00:ec2::254/128]`. Wrap IPv6 CIDRs in brackets.
+- Bind `--serve` host forwarding to `127.0.0.1` only. Pair each published guest port with `--net-rule allow:ingress@loopback:<proto>:<guestPort>`. Skip that rule under `--no-net`.
+- The `--serve` readiness probe never follows redirects.
+- Use `--proto '=https' --proto-redir '=https' --tlsv1.2` on every `curl` download.
+- Never pass API keys or tokens in CLI arguments. Never bake them into snapshots. Stream them over `stdin` into `0600` guest files.
+- `pushKeys` checks that `/home/agent` is not a symlink. It deletes `/home/agent/.agbox-keys.sh` before it writes. It sets mode `0600` after the write. `agbox auth` never prints captured stdout in errors.
+- Run `agbox auth` and `agbox update` in disposable zero-share sandboxes. `agbox update` passes zero API keys and zero saved credentials. It checks ELF magic (`\x7fELF`), size bounds, `st_nlink == 1`, and SHA-256 digests in `manifest.json`. An exclusive `flock` on `$DATA_DIR/.agents.lock` guards updates.
+- Mount `$DATA_DIR/skills`, `$DATA_DIR/rules`, and `$DATA_DIR/agents` read-only with `:ro,stat-virt=relaxed,uid=1000,gid=1000`. Reject symlinks with `Lstat`. Bind-mount them read-only (`ro,bind`) in the guest.
+- `install.sh` and `agbox setup` install `AGBOX_ENV_RULES.md` into `$DATA_DIR/rules`. The runner stages it and bind-mounts it onto the guest `AGENTS.md` paths. The file says that the `/workspace` root rejects file creation with `EROFS`.
+- Pass `-u root` or `-u agent` to every `msb exec`. `msb snap restore -u agent` sets the default `msb exec` user to `agent`. Pass `-u root` for guest setup and cache flushes.
+- Guard each `--profile` `ext4` volume with an exclusive host `flock` on `$DATA_DIR/profiles/.<name>.lock`. The lock file stays outside the profile directory. Refresh `msb ls` after you take the lock. Hold the lock during `profile rm`. Find the `disk.raw` file with `msb.ResolveVolumeDiskPath`. Attach it with `--mount-disk <disk.raw>:/home/agent/.agbox-profile:rw,format=raw,fstype=ext4`.
+- A profile name has 48 characters or fewer. A run name has 63 characters or fewer. `agbox` reserves the names `base` and `run-<digits>`.
 
-### Base-Image Agent Defaults
+### Base image defaults
 
-- `create-base` installs `shellcheck` and `mdformat` in every base snapshot alongside `git`, `ripgrep`, `curl`, `less`, `procps`, and `sudo`.
-- `create-base` initializes default guest agent configs inside `/home/agent` (without overwriting user customizations on `edit-base` or `--profile`):
-  - `agy` (`/home/agent/.gemini/antigravity-cli/settings.json`): `"toolPermission": "always-proceed"` (`turbo`), `"queuedMessages": "send-immediately"`, `"allowNonWorkspaceAccess": true`, and `"trustedWorkspaces": ["/workspace"]`.
-  - `opencode` (`/home/agent/.config/opencode/opencode.json`): `"permission": "allow"` (`general.followup` defaults to `"steer"`).
+- `create-base` installs `shellcheck` and `mdformat` in every snapshot. It also installs `git`, `ripgrep`, `curl`, `less`, `procps`, and `sudo`.
+- `create-base` writes agent settings only when the file does not exist. It never overwrites a user file on `edit-base` or `--profile`:
+  - `agy` (`/home/agent/.gemini/antigravity-cli/settings.json`): `"toolPermission": "always-proceed"`, `"queuedMessages": "send-immediately"`, `"allowNonWorkspaceAccess": true`, and `"trustedWorkspaces": ["/workspace"]`.
+  - `opencode` (`/home/agent/.config/opencode/opencode.json`): `"permission": "allow"`. The default for `general.followup` is `"steer"`.
 
-______________________________________________________________________
+## 3. Upstream `msb` contracts
 
-## 3. Upstream `msb` Integration Contracts and Pitfalls
+Changes in `internal/msb`, `internal/cli`, or `internal/vcsfuse` must respect these `msb` behaviors:
 
-Changes touching `internal/msb`, `internal/cli`, or `internal/vcsfuse` must respect these upstream `microsandbox` (`msb`) behaviors:
+- **Streaming and user.** A non-TTY `msb exec` hides child output unless you pass `--stream`. `--stream` fails unless you pipe stdin or pass `--no-stdin`. Always pass `-u root` or `-u agent`.
+- **`stat-virt` modes.** `msb snap restore -v` defaults to `stat-virt=strict`. It probes mount roots with `setxattr` and fails with `EROFS` on `/workspace`. Mount `/workspace` with `:rw,stat-virt=off` and no `uid=` or `gid=`. Mount read-only caches with `:ro,stat-virt=relaxed,uid=1000,gid=1000`.
+- **Disk volumes.** `msb snap restore -v` forces `VolumeKind::Directory`. It rejects `--kind disk` volumes such as `agbox-profile-<name>`. Attach profile disks with `--mount-disk <disk.raw>:<guest>:rw,format=raw,fstype=ext4`.
+- **Guest flush.** Run `msb stop -t 10` before `msb rm -f` (`destroySandbox`) when a sandbox has a profile disk. This flushes guest pages and the journal to `disk.raw`. `agbox stop` writes a `deleting` marker in `$DATA_DIR/run/<id>`. Other sessions then skip the duplicate teardown. `destroySandbox` treats `sandbox not found` as success.
+- **Firewall order.** Keep `--net-default deny`. Put `allow@dns` before `deny@host`. Put all deny groups and CIDRs before `allow@public`. Wrap IPv6 CIDRs in square brackets.
+- **No nesting.** An agent inside an `agbox` sandbox has no `/dev/kvm`. A minimal container may also lack `fusermount`. Inside such a sandbox, run `./test.sh --skip-vm`. Use `sudo ./test.sh --allow-root --skip-vm` when direct FUSE mounts need root. Run the KVM checks on the host.
 
-- **`msb exec` streaming and user selection:** Non-TTY `msb exec` suppresses child stdout and stderr unless `--stream` is passed. Passing `--stream` fails unless stdin is piped or `--no-stdin` is passed. Always pass `-u root` or `-u agent` explicitly because `msb snap restore -u agent` changes the default `msb exec` user to `agent`.
-- **`stat-virt` modes on FUSE and host mounts:** `msb snap restore -v` defaults to `stat-virt=strict`, which probes writeable mount roots with `setxattr(..., "user.msb._probe", ...)` and aborts with `EROFS` on the synthetic read-only `/workspace` Workspace Hub root. Both `strict` and `relaxed` also write `user.msb.override_stat` xattrs onto host files during writes, and `msb` rejects combining `stat-virt=off` with `uid=` or `gid=`. Therefore `WorkspaceHub` (`/workspace`) must mount `:rw,stat-virt=off` without `uid=`/`gid=` while `vcsfuse` presents `1000:1000` in memory. Read-only host caches (`skills`, `rules`, `agents`) must mount `:ro,stat-virt=relaxed,uid=1000,gid=1000`.
-- **Disk volumes vs directory volumes on `snap restore`:** `msb snap restore -v` hardcodes `VolumeKind::Directory` and rejects `--kind disk` named volumes (`agbox-profile-<name>`). Always attach profile disk volumes with `--mount-disk <disk.raw>:<guest>:rw,format=raw,fstype=ext4` instead of `-v`.
-- **Guest `ext4` flush before `msb rm -f`:** `msb rm -f` kills the VMM immediately without running guest filesystem teardown. Always run `msb stop -t 10` before `msb rm -f` (`destroySandbox`) whenever deleting a running sandbox that mounted a `--profile` `ext4` disk so dirty guest pages and journal writes flush to `disk.raw`. Before calling `destroySandbox`, `App.Stop` writes a `deleting` marker in `$DATA_DIR/run/<id>` when that directory exists so concurrent foreground sessions skip duplicate teardown, and `destroySandbox` treats `msb rm -f` `sandbox not found` as clean completion after a confirmed stop or when concurrent teardown is allowed.
-- **Firewall rule ordering and IPv6 syntax:** Keep `--net-default deny`, place `allow@dns` before `deny@host`, place all `deny@...` groups and CIDRs before `allow@public`, and wrap IPv6 CIDRs in square brackets (`[fe80::/10]`, `[fd00:ec2::254/128]`).
-- **No nesting inside microVMs:** An agent running inside an `agbox` microVM (`libkrun`) does not have `/dev/kvm` access (and minimal containers may also lack `fusermount`). Inside such environments, run `./test.sh --skip-vm` (or `sudo ./test.sh --allow-root --skip-vm` when root is needed for direct FUSE mounts), and run KVM checks on the host.
+## 4. `test.sh` rules
 
-______________________________________________________________________
+Every `test.sh` edit and every new user-visible feature must follow these rules.
 
-## 4. `test.sh` Requirements, Modes, and Authoring Rules
+### Non-disruptive default
 
-Every edit to `test.sh` or any new feature that adds user-visible behavior must obey all test suite requirements below.
+- Non-disruptive runs must not change host state. Host binaries, `AGBOX_DATA_DIR`, `MSB_HOME`, snapshots, profiles, and running sandboxes stay as they are.
+- Check `99-verify-host-unchanged` records host fingerprints before the tests. It fails when a host binary, data directory, `MSB_HOME` file, sandbox, snapshot, or volume changes.
+- `--disruptive` runs `99-verify-disruptive-cleanup` instead. It checks that `agbox remove --yes` deleted all live state.
+- `test.sh` puts `TEST_ROOT` under `~/.cache/agbox-e2e-<id>`. This satisfies `$HOME` containment without weakening `AGBOX_ALLOW_OUTSIDE_HOME`. The harness deletes `~/.cache` on exit if it created that directory.
+- `test.sh` prepares an isolated `RUNTIME_DATA_DIR` for sandbox checks. It copies existing `run/<id>` markers there. It adds `SUITE_ID` to temporary sandbox and profile names.
 
-### Non-Disruptive Default Guarantee
+### Modes and options
 
-- Running `./test.sh` or `./test.sh --full` MUST NOT modify, stop, overwrite, or delete any existing host binary (`~/.local/bin/agbox`), `AGBOX_DATA_DIR`, `MSB_HOME`, base snapshots, profile disk volumes, or running or suspended sandboxes.
-- Check `99-verify-host-unchanged` snapshots host fingerprints (`BASELINE_DIR`) before tests start and fails the suite if any pre-existing host binary, `DATA_DIR` file, `MSB_HOME` state, sandbox list, snapshot list, or volume list changed.
-- `test.sh` places `TEST_ROOT` under `~/.cache/agbox-e2e-<id>` (and removes `~/.cache` on exit if it created that parent directory) so temporary test shares satisfy `$HOME` containment without weakening `AGBOX_ALLOW_OUTSIDE_HOME`.
-- When preparing isolated `RUNTIME_DATA_DIR` for VM checks, `test.sh` copies existing `run/<id>` state markers into `RUNTIME_DATA_DIR/run/` so `agbox run` orphan reaping never terminates pre-existing host sandboxes, probes whether `msb` honors an isolated `MSB_HOME`, and namespaces every temporary sandbox and profile with `SUITE_ID`.
-
-### Execution Modes and Options
-
-| Flag | Coverage and Host State Behavior |
+| Flag | Coverage |
 |---|---|
-| *(default)* | Non-disruptive quick suite: static/style (`01`), `go vet` (`02`), `go test -race` (`03`), binary build (`04`), CLI help/tamper (`05`–`07`), FUSE Workspace Hub (`08`), KVM preflight & isolated base (`09`–`11`), and core VM checks (`20`–`23`), plus host invariance check (`99`). |
-| `--full` | Non-disruptive extended suite: adds egress firewall (`30`), open-FD revocation (`31`), profile `flock` contention & orphan reaping (`32`), authenticated `--serve` + `suspend`/`resume` (`33`), non-disruptive live `update` check when host config allows (`34`), and full isolated lifecycle (`40`). |
-| `--disruptive` | Clean-slate host suite: backs up the installed `agbox` binary (`ORIG_INSTALL_BIN`), runs `remove --yes`, `./install.sh`, `create-base`, and `edit-base` (`10`–`12`), runs VM checks (`20`–`23`), runs `remove --yes`, and restores the backed-up binary on exit (`99`). |
-| `--full --disruptive` | Maximum coverage: combines the clean-slate host lifecycle (`10`–`12`), core VM checks (`20`–`23`), extended VM checks (`30`–`40`), final `remove --yes` cleanup, and binary backup restoration (`99`). |
-| `--skip-vm` | Runs offline phases (`01`–`08`) without requiring `/dev/kvm` or `msb`. Safe inside containers and nested VMs. |
-| `--filter <substr>` | Runs only checks whose `<id>-<slug>` name contains `<substr>` (plus prerequisite dependencies when needed). |
-| `--log-dir <dir>` | Overrides the default `/tmp/agbox-test-logs-<timestamp>-<pid>` log directory. |
-| `-v`, `--verbose` | Streams live check output to stdout in addition to per-check log files. |
-| `--allow-root` | Passes `--allow-root` to `./install.sh` and `agbox` invocations when running under root (`euid == 0`). |
+| none | Quick non-disruptive suite: `01` to `08`, `09` to `11`, `20` to `23`, and `99`. |
+| `--full` (alias `--long`) | Adds `30` to `34` and the isolated lifecycle check `40`. |
+| `--disruptive` | Clean-slate host suite. Backs up the installed binary. Runs `remove --yes`, `./install.sh`, `create-base`, and `edit-base` (`10` to `12`). Then runs `20` to `23` and `99`. |
+| `--full --disruptive` | Runs both suites. Check `40` does not run, because `10` to `12` cover it. |
+| `--skip-vm` | Runs `01` to `08` only. Needs no `/dev/kvm` and no `msb`. |
+| `--filter <text>` | Runs checks whose ID or description contains `<text>`, plus required setup checks. |
+| `--log-dir <dir>` | Writes logs to `<dir>`. The default is a new `mktemp` directory under `/tmp`. |
+| `-v`, `--verbose` | Also streams check output to stdout. |
+| `--allow-root` | Passes `--allow-root` to `./install.sh` and `agbox` when `euid == 0`. |
 
-### Automation, Resilience, and Diagnostics Rules
+### Automation and diagnostics
 
-- **Completely automated execution:** Every check must run unattended from start to finish with zero interactive prompts (`</dev/null`, `--yes`, and `with_timeout` or `with_timeout_stdin` bounds on every external command).
-- **Continue on failure:** `run_check` executes each check in an isolated subshell (`set -Eeuo pipefail`) so an earlier failure still lets independent checks and `99-verify-host-unchanged` run, then prints a final `PASS` / `FAIL` / `SKIP` summary with exact log file paths.
-- **Never swallow error diagnostics or hang on detached pipes:** `run_capture` captures expected-success output via a temporary regular file inside `$TEST_ROOT` instead of a `$(...)` pipe so detached daemons cannot block capture, and prints captured stderr and stdout before returning non-zero. Keep `err_out="$(... 2>&1)" || rc=$?` only for foreground expected-failure assertions, bind every `curl` check with explicit `--connect-timeout` and `--max-time` bounds, and dump background daemon logs (such as `fd-run.log` or `lkp.log`) whenever `wait_for_sandbox_running` times out.
-- **Guaranteed teardown on exit or signal:** Register `trap global_cleanup EXIT` alongside `trap 'handle_interrupt INT 130' INT`, `TERM` (`143`), and `HUP` (`129`). `_run_with_timeout` tracks `ACTIVE_CHILD_PGID` using background `timeout ... &` plus `wait` so signals interrupt immediately, kill GNU `timeout`'s separate process group (`kill_active_child`), run `global_cleanup` once, unmount active FUSE mounts via `/proc/self/mountinfo`, delete temporary directories and `SUITE_ID` sandboxes/volumes, restore the disruptive binary backup, and exit with the signal code.
+- Run every check without prompts. Use `</dev/null`, `--yes`, and `with_timeout` on every external command. Wrap every direct `msb` call in `with_timeout`.
+- `run_check` runs each check in an isolated subshell (`set -Eeuo pipefail`). A failure never blocks independent checks. The harness prints a final summary with log paths.
+- `run_capture` writes expected-success output to a temporary file, not a `$(...)` pipe. This stops detached daemons from hanging the capture. It prints the output on failure. Put timeouts on `curl`. Dump background logs when startup times out.
+- Register `trap global_cleanup EXIT INT TERM HUP`. `_run_with_timeout` tracks `ACTIVE_CHILD_PGID` so signals interrupt at once. On a signal, kill active process groups, unmount FUSE shares, delete temporary resources, and restore binary backups.
+- Pass paths and sockets to `python3` helpers through `sys.argv`. Never interpolate them into code. Read lists with `while IFS= read -r`.
 
-### Check Numbering Layout
+### Check layout
 
-- `01`–`07`: Offline static, style, `go vet`, `go test -race`, binary builds, CLI flag/security tamper checks, and fake-`msb` CLI contracts.
-- `08`: Live FUSE Workspace Hub mount, VCS masking, and `:ro` enforcement (`agbox __filter`).
-- `09`–`12`: KVM/`msb` preflight and either non-disruptive isolated base bootstrap or disruptive clean-slate `remove`, `install.sh`, `create-base`, and `edit-base`.
-- `20`–`23`: Default quick live microVM suite (ephemeral run/shares/secrets, persistence/profiles, `--persist`/`--remote-control`/dynamic shares/suspend/resume, `--serve --probe`).
-- `30`–`34`, `40`: `--full` extended VM suite (egress firewall, open-FD revocation, profile lock & orphan reaping, password `--serve`, live `update`, and isolated end-to-end lifecycle).
-- `99`: Post-suite host state invariance check (`verify-host-unchanged`).
+| Checks | Coverage |
+|---|---|
+| `01` | Static style: `bash -n`, `gofmt`, semicolons in Go comments, error strings, and Markdown prose, and `mdformat --check`. |
+| `02` to `04` | `go vet`, `go test -race`, and binary builds. |
+| `05` | `--help` output for all 15 modes, category listing, and flag rejection. |
+| `06` | Offline security checks: share conflicts, `share set` and `share rm` errors, guest alias escapes, `--share-hub` with `--no-mask`, `run --name run-123`, hardlinked single files, `--net` conflicts, and tamper checks. |
+| `07` | Fake-`msb` error checks. Each non-zero `msb` exit shows diagnostics for `stop`, `profile`, and `remove`. |
+| `08` | Live Workspace Hub: VCS masking, `:ro`, single-file slots, `:vcs` config protection, rename escapes, hook downgrade, `rw` to `ro`, and `rm` with and without `force`. |
+| `09` to `12` | KVM and `msb` preflight, then an isolated base bootstrap or the disruptive clean-slate steps. |
+| `20` to `23` | Core sandbox checks: shares, secrets, global rules mounts, persistence, profiles, dynamic shares with `--rw --vcs-hooks` downgrade, suspend, resume, and `--serve --probe`. |
+| `30` to `34`, `40` | Extended checks: firewall, descriptor revocation (including VCS descriptors on `share set --mask-vcs`), profile lock, password `--serve`, live `update`, and the isolated lifecycle. |
+| `99` | Host state check (`verify-host-unchanged` or `verify-disruptive-cleanup`). |
 
-______________________________________________________________________
+## 5. Code and documentation style
 
-## 5. Code and Documentation Style
-
-- Write comments, CLI help text, error messages, and Markdown documentation in clear technical English inspired by ASD-STE100:
+- Write comments, help text, error messages, and Markdown in Simplified Technical English (ASD-STE100):
   - Use active voice and concrete verbs.
-  - Keep sentences short and focused on one instruction or claim.
-  - Keep noun clusters to three words or fewer where practical.
-  - Avoid marketing adjectives and vague qualifiers.
-  - **Do not use semicolons (`;`) in Go `//` comments, error strings, CLI help text, `README.md`, `USER_GUIDE.md`, or `AGENTS.md` prose.** Split compound clauses into separate sentences instead.
-- Format all Go files with `gofmt`, format all Markdown files with `mdformat`, and keep bash scripts clean under `bash -n` and `shellcheck`.
+  - Write one instruction per sentence. Keep procedures to 20 words or fewer and descriptions to 25 words or fewer.
+  - Keep noun clusters to three words or fewer.
+  - Avoid marketing adjectives and vague words.
+  - Use one term for one concept.
+  - Do not use semicolons in comments, error strings, help text, or Markdown prose.
+- Use only GitHub Flavored Markdown that `mdformat` keeps unchanged. Alerts, tables, Mermaid fences, and `<details>` blocks with blank lines inside are safe. Footnotes are not safe.
+- Format Go files with `gofmt` and Markdown files with `mdformat`. Keep bash scripts clean under `bash -n` and `shellcheck`.
 
-______________________________________________________________________
+## 6. Verification checklist
 
-## 6. Verification Checklist
-
-Run these commands from `/workspace/agbox` before finishing any change:
+Run these commands from `/workspace/agbox` before you finish a change:
 
 ```bash
 gofmt -w ./cmd ./internal
-mdformat README.md USER_GUIDE.md AGENTS.md
+mdformat README.md USER_GUIDE.md AGENTS.md AGBOX_ENV_RULES.md
 bash -n install.sh test.sh
 go vet ./...
 go test -count=1 -race ./...
@@ -181,4 +222,4 @@ go build -o /dev/null ./cmd/agbox
 ./test.sh --skip-vm
 ```
 
-In containers without `fusermount`, also verify live FUSE checks with `sudo ./test.sh --allow-root --skip-vm`. On a host with KVM and `msb` available, run `./test.sh` (or `./test.sh --full --disruptive` before a release) and run `./install.sh` when updating the host installed binary.
+In a container without `fusermount`, also run `sudo ./test.sh --allow-root --skip-vm`. On a host with KVM and `msb`, run `./test.sh`. Before a release, run `./test.sh --full --disruptive` and `./install.sh`.

@@ -1,31 +1,28 @@
-// Package vcsfuse implements a hardened loopback FUSE filesystem and a
-// multiplexed Workspace Hub for host shares.
+// Package vcsfuse implements a loopback FUSE filesystem and a
+// Workspace Hub for host shares.
 //
 // Security properties:
-//   - Masks all DefaultHiddenEntries case-insensitively at every depth when
-//     VCSPolicy is VCSMask (Lookup returns ENOENT and directory streams omit
-//     them) and blocks all writes to those names with EPERM.
-//   - Protects VCS hook directories (.git/**/hooks, .jj/**/hooks, .svn/**/hooks,
-//     _darcs/**/prefs, .pijul/**/hooks, and .hg/hgrc) with EPERM when VCSPolicy
-//     is VCSAllow, unless VCSAllowHooks is explicitly configured.
-//   - Enforces per-share read-only mode (EROFS on all mutating FUSE operations
-//     and stripped write mode bits) even against root inside the guest VM.
-//   - Pins each share root directory descriptor and resolves every path with
-//     Linux openat2 (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS) so host symlinks
-//     cannot escape the share or redirect writes.
-//   - Rejects unattached or deleted child inodes with ENOENT so they never
-//     resolve to the share root.
-//   - Validates symlink targets on both Symlink and Readlink to allow only
-//     relative intra-share targets permitted by the active VCS policy.
-//   - Mounts with nosuid,nodev and restricts Open and Mknod to regular files
-//     (blocking FIFOs, sockets, and device nodes with EPERM).
-//   - Strips setuid and setgid bits on creation and blocks setuid/setgid modes
-//     and cross-UID/GID ownership changes in Setattr with EPERM.
-//   - Wraps open handles in safeFile and filteredDir to block raw FD passthrough,
-//     block host filesystem ioctl calls, and allow immediate host FD revocation
-//     when a share is removed or downgraded to read-only.
-//   - Permits only user.<name> extended attributes, blocking security.*,
-//     system.*, and trusted.* attributes.
+//   - The filesystem masks VCS entries case-insensitively when VCSPolicy is
+//     VCSMask. Lookup returns ENOENT, directory streams omit entries, and writes
+//     return EPERM.
+//   - The filesystem write-protects VCS hooks and executable VCS config files
+//     with EPERM when VCSPolicy is VCSAllow.
+//   - The filesystem enforces read-only mode on designated shares. Mutating
+//     operations return EROFS, and attributes omit write permission bits.
+//   - The filesystem pins each share root directory descriptor. It resolves
+//     paths with Linux openat2 to block symlink traversal outside the share.
+//   - The filesystem rejects unattached or deleted child inodes with ENOENT.
+//     Child inodes never fall back to the share root.
+//   - The filesystem checks symlink targets on Symlink, Readlink, and Rename.
+//     It allows only relative intra-share paths permitted by the VCS policy.
+//   - The filesystem mounts with nosuid and nodev flags. It opens entries with
+//     O_PATH first to block FIFOs and device nodes with EPERM before open.
+//   - The filesystem strips setuid and setgid bits on creation. Setattr blocks
+//     privilege escalation, non-regular targets, and cross-UID ownership changes.
+//   - The filesystem wraps handles in safeFile and filteredDir. Handles block
+//     ioctl calls and revoke host descriptors during share deletion or downgrade.
+//   - The filesystem allows only user extended attributes. It blocks security,
+//     system, and trusted attributes with EPERM.
 package vcsfuse
 
 import (
@@ -34,6 +31,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -55,18 +54,27 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// DefaultHiddenEntries lists all VCS directories and control files masked in
+const (
+	// SubcommandName is the internal argv[1] token for background FUSE daemons.
+	SubcommandName = "__filter"
+
+	maxSymlinkTargetBytes = 64 * 1024
+	maxRenameWalkDepth    = 128
+	maxRenameWalkEntries  = 100000
+	daemonStartupTimeout  = 3 * time.Second
+)
+
+var nextSafeFileID atomic.Uint64
+
+// defaultHiddenEntries returns all VCS directories and control files masked in
 // directory shares that use VCSMask.
-var DefaultHiddenEntries = pathsec.DefaultVCSNames()
+func defaultHiddenEntries() []string {
+	return pathsec.DefaultVCSNames()
+}
 
-// SubcommandName is the internal argv[1] token used when agbox starts a
-// background FUSE filter daemon.
-const SubcommandName = "__filter"
-
-// IsProtectedXattr reports whether setting or removing attr is forbidden.
-// Only user.* extended attributes are allowed. This blocks security.*,
-// system.*, and trusted.* attributes.
-func IsProtectedXattr(attr string) bool {
+// isProtectedXattr reports whether the filter blocks setting or removing attr.
+// The filter allows only user.<name> extended attributes.
+func isProtectedXattr(attr string) bool {
 	if !strings.HasPrefix(attr, "user.") {
 		return true
 	}
@@ -76,7 +84,7 @@ func IsProtectedXattr(attr string) bool {
 // buildHiddenSet converts entry names into a lowercase lookup map.
 func buildHiddenSet(entries []string) map[string]struct{} {
 	if len(entries) == 0 {
-		entries = DefaultHiddenEntries
+		entries = defaultHiddenEntries()
 	}
 	set := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
@@ -101,20 +109,19 @@ func isInvalidComponent(name string) bool {
 		strings.ContainsRune(name, '/') || strings.ContainsRune(name, 0)
 }
 
-// isTopLevelVCSAdminDir reports whether name is a VCS metadata directory whose
-// removal or rename could displace a protected hooks directory under VCSAllow.
+// isTopLevelVCSAdminDir reports whether name is a VCS metadata directory or
+// pointer file name protected against creation, deletion, or rename under VCSAllow.
 func isTopLevelVCSAdminDir(name string) bool {
 	switch strings.ToLower(name) {
-	case ".git", ".jj", ".hg", ".svn", "_darcs", ".pijul", ".fossil-settings", "_fossil_":
+	case ".git", ".jj", ".hg", ".svn", "_darcs", ".pijul", ".fossil-settings", "_fossil_", ".bzr", ".sl":
 		return true
 	default:
 		return false
 	}
 }
 
-// isProtectedVCSHookRelPath reports whether relPath is at or inside a VCS hook
-// location (.git/**/hooks, .jj/**/hooks, .svn/**/hooks, _darcs/**/prefs,
-// .pijul/**/hooks, or .hg/hgrc).
+// isProtectedVCSHookRelPath reports whether relPath targets a VCS hook or
+// executable VCS config file protected under VCSAllow.
 func isProtectedVCSHookRelPath(relPath string) bool {
 	if relPath == "" || relPath == "." {
 		return false
@@ -126,23 +133,83 @@ func isProtectedVCSHookRelPath(relPath string) bool {
 		}
 		segs = append(segs, strings.ToLower(raw))
 	}
-	seenGitOrJJOrSvnOrPijul := false
-	seenDarcs := false
+
+	inGit := false
+	inGitSafeData := false
+	inJJ := false
+	inJJSafeData := false
+	inSvnOrPijul := false
+	inDarcs := false
+	inHg := false
+	inSl := false
+	inBzr := false
+
 	for i, seg := range segs {
-		if seenGitOrJJOrSvnOrPijul && seg == "hooks" {
+		if (inGit || inJJ || inSvnOrPijul) && seg == "hooks" {
 			return true
 		}
-		if seenDarcs && seg == "prefs" {
+		if inGit && !inGitSafeData && (seg == "config" || seg == "config.worktree" || seg == "commondir" || seg == "gitdir") {
 			return true
 		}
-		if seg == ".hg" && i+1 < len(segs) && segs[i+1] == "hgrc" {
+		if inJJ && !inJJSafeData && (seg == "config.toml" || seg == "config") {
 			return true
 		}
+		if inDarcs && seg == "prefs" {
+			return true
+		}
+		if inHg && i > 0 && segs[i-1] == ".hg" && strings.HasPrefix(seg, "hgrc") {
+			return true
+		}
+		if inSl && (seg == "config" || strings.HasPrefix(seg, "hgrc")) {
+			return true
+		}
+		if inBzr && (seg == "branch.conf" || seg == "locations.conf") {
+			return true
+		}
+
+		if inGit && (seg == "refs" || seg == "logs" || seg == "objects") && i > 0 && segs[i-1] != "modules" && segs[i-1] != "worktrees" {
+			inGitSafeData = true
+		}
+		if inJJ && (seg == "op_heads" || seg == "op_store" || seg == "working_copy") {
+			inJJSafeData = true
+		}
+
 		switch seg {
-		case ".git", ".jj", ".svn", ".pijul":
-			seenGitOrJJOrSvnOrPijul = true
+		case ".git":
+			inGit = true
+			inGitSafeData = false
+		case ".jj":
+			inJJ = true
+			inJJSafeData = false
+		case ".svn", ".pijul":
+			inSvnOrPijul = true
 		case "_darcs":
-			seenDarcs = true
+			inDarcs = true
+		case ".hg":
+			inHg = true
+		case ".sl":
+			inSl = true
+		case ".bzr":
+			inBzr = true
+		}
+	}
+	return false
+}
+
+// isVCSAdminPath reports whether relPath is at or inside a VCS directory or control file.
+func isVCSAdminPath(relPath string, hidden map[string]struct{}) bool {
+	if relPath == "" || relPath == "." {
+		return false
+	}
+	if len(hidden) == 0 {
+		hidden = buildHiddenSet(nil)
+	}
+	for _, part := range strings.Split(relPath, "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		if isHiddenEntry(part, hidden) {
+			return true
 		}
 	}
 	return false
@@ -155,17 +222,9 @@ func joinRelPath(parentRel, name string) string {
 	return parentRel + "/" + name
 }
 
-// ValidateSymlinkTarget checks whether creating or reading a symlink named
-// linkName inside parentRelPath with value target is safe under VCSMask.
-// It rejects empty targets, absolute targets, hidden VCS components, and
-// relative targets that escape above the share root.
-func ValidateSymlinkTarget(parentRelPath, linkName, target string, hidden map[string]struct{}) syscall.Errno {
-	return ValidateSymlinkTargetForPolicy(parentRelPath, linkName, target, hidden, config.VCSMask)
-}
-
-// ValidateSymlinkTargetForPolicy validates a symlink target within a share
-// according to policy while always enforcing relative intra-share confinement.
-func ValidateSymlinkTargetForPolicy(parentRelPath, linkName, target string, hidden map[string]struct{}, policy config.VCSPolicy) syscall.Errno {
+// validateSymlinkTargetForPolicy checks a symlink target within a share under policy.
+// It rejects empty targets, absolute paths, escaping '..' segments, and policy-blocked paths.
+func validateSymlinkTargetForPolicy(parentRelPath, linkName, target string, hidden map[string]struct{}, policy config.VCSPolicy) syscall.Errno {
 	if isInvalidComponent(linkName) {
 		return syscall.EINVAL
 	}
@@ -173,6 +232,9 @@ func ValidateSymlinkTargetForPolicy(parentRelPath, linkName, target string, hidd
 		policy = config.VCSMask
 	}
 	if policy == config.VCSMask && isHiddenEntry(linkName, hidden) {
+		return syscall.EPERM
+	}
+	if policy == config.VCSAllow && isTopLevelVCSAdminDir(linkName) {
 		return syscall.EPERM
 	}
 	if target == "" || strings.ContainsRune(target, 0) {
@@ -225,10 +287,8 @@ func ValidateSymlinkTargetForPolicy(parentRelPath, linkName, target string, hidd
 	return 0
 }
 
-// pinnedRoot holds an open directory file descriptor for a share root (or the
-// parent directory of a single-file share). All path resolutions run relative
-// to this descriptor with RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS so host
-// symlinks cannot escape the share.
+// pinnedRoot holds an open directory descriptor for a share root or parent directory.
+// Path lookups run relative to this descriptor with RESOLVE_BENEATH and RESOLVE_NO_SYMLINKS.
 type pinnedRoot struct {
 	mu         sync.RWMutex
 	fd         int
@@ -239,6 +299,16 @@ type pinnedRoot struct {
 }
 
 func newPinnedRoot(srcDir string) (*pinnedRoot, syscall.Stat_t, error) {
+	return newPinnedRootWithIDs(srcDir, os.Geteuid, os.Getegid)
+}
+
+func newPinnedRootWithIDs(srcDir string, geteuid, getegid func() int) (*pinnedRoot, syscall.Stat_t, error) {
+	if geteuid == nil {
+		geteuid = os.Geteuid
+	}
+	if getegid == nil {
+		getegid = os.Getegid
+	}
 	fd, err := unix.Open(srcDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, syscall.Stat_t{}, err
@@ -252,8 +322,8 @@ func newPinnedRoot(srcDir string) (*pinnedRoot, syscall.Stat_t, error) {
 		fd:         fd,
 		revokedErr: syscall.EBADF,
 		dev:        uint64(st.Dev),
-		euid:       os.Geteuid(),
-		egid:       os.Getegid(),
+		euid:       geteuid(),
+		egid:       getegid(),
 	}
 	runtime.SetFinalizer(pr, (*pinnedRoot).Close)
 	return pr, st, nil
@@ -336,6 +406,22 @@ func uint32ToVCSPolicy(v uint32) config.VCSPolicy {
 	}
 }
 
+// isVCSPolicyMoreRestrictive reports whether next restricts VCS access more than prev.
+func isVCSPolicyMoreRestrictive(prev, next config.VCSPolicy) bool {
+	return vcsPolicyRank(next) < vcsPolicyRank(prev)
+}
+
+func vcsPolicyRank(p config.VCSPolicy) int {
+	switch p {
+	case config.VCSAllowHooks:
+		return 2
+	case config.VCSAllow:
+		return 1
+	default:
+		return 0
+	}
+}
+
 type guestIDMap struct {
 	enabled bool
 	uid     uint32
@@ -367,7 +453,7 @@ func (m guestIDMap) applyStatx(out *fuse.StatxOut) {
 	}
 }
 
-// shareSlot holds dynamic permission state, open file handles, and the pinned
+// shareSlot holds dynamic permission state, open handles, and the pinned
 // host directory descriptor for one mounted share.
 type shareSlot struct {
 	slotID    uint64
@@ -376,6 +462,8 @@ type shareSlot struct {
 	isFile    bool
 	fileName  string
 	root      *pinnedRoot
+	initDev   uint64
+	initIno   uint64
 	hidden    map[string]struct{}
 	idMap     guestIDMap
 
@@ -383,15 +471,14 @@ type shareSlot struct {
 	vcsPolicy atomic.Uint32
 	revoked   atomic.Bool
 
+	renameMu sync.RWMutex
+
 	filesMu sync.Mutex
 	files   map[*safeFile]struct{}
+	dirs    map[*filteredDir]struct{}
 
 	inodeMu sync.RWMutex
 	inode   *fs.Inode
-}
-
-func newShareSlot(slotID uint64, guestName, hostPath string, isFile bool, fileName string, pr *pinnedRoot, hidden map[string]struct{}, readOnly bool, policy config.VCSPolicy) *shareSlot {
-	return newShareSlotWithIDMap(slotID, guestName, hostPath, isFile, fileName, pr, hidden, readOnly, policy, guestIDMap{})
 }
 
 func newShareSlotWithIDMap(slotID uint64, guestName, hostPath string, isFile bool, fileName string, pr *pinnedRoot, hidden map[string]struct{}, readOnly bool, policy config.VCSPolicy, idMap guestIDMap) *shareSlot {
@@ -405,6 +492,7 @@ func newShareSlotWithIDMap(slotID uint64, guestName, hostPath string, isFile boo
 		hidden:    hidden,
 		idMap:     idMap,
 		files:     make(map[*safeFile]struct{}),
+		dirs:      make(map[*filteredDir]struct{}),
 	}
 	s.readOnly.Store(readOnly)
 	s.vcsPolicy.Store(vcsPolicyToUint32(policy))
@@ -441,6 +529,30 @@ func (s *shareSlot) isRevoked() bool {
 	return s != nil && s.revoked.Load()
 }
 
+func (s *shareSlot) rlockRename() {
+	if s != nil {
+		s.renameMu.RLock()
+	}
+}
+
+func (s *shareSlot) runlockRename() {
+	if s != nil {
+		s.renameMu.RUnlock()
+	}
+}
+
+func (s *shareSlot) lockRename() {
+	if s != nil {
+		s.renameMu.Lock()
+	}
+}
+
+func (s *shareSlot) unlockRename() {
+	if s != nil {
+		s.renameMu.Unlock()
+	}
+}
+
 func (s *shareSlot) registerFile(sf *safeFile) syscall.Errno {
 	if s == nil {
 		return 0
@@ -451,6 +563,13 @@ func (s *shareSlot) registerFile(sf *safeFile) syscall.Errno {
 		return syscall.ESTALE
 	}
 	if sf.writable && s.readOnly.Load() {
+		return syscall.EROFS
+	}
+	pol := s.getVCSPolicy()
+	if sf.isVCS.Load() && pol == config.VCSMask {
+		return syscall.ESTALE
+	}
+	if sf.writable && sf.isHook.Load() && pol == config.VCSAllow {
 		return syscall.EROFS
 	}
 	s.files[sf] = struct{}{}
@@ -466,6 +585,132 @@ func (s *shareSlot) unregisterFile(sf *safeFile) {
 	s.filesMu.Unlock()
 }
 
+// registerDir records an open directory handle in the slot after checking policy.
+func (s *shareSlot) registerDir(d *filteredDir) syscall.Errno {
+	if s == nil {
+		return 0
+	}
+	s.filesMu.Lock()
+	defer s.filesMu.Unlock()
+	if s.revoked.Load() {
+		return syscall.ESTALE
+	}
+	if d.isVCS.Load() && s.getVCSPolicy() == config.VCSMask {
+		return syscall.ESTALE
+	}
+	if s.dirs == nil {
+		s.dirs = make(map[*filteredDir]struct{})
+	}
+	s.dirs[d] = struct{}{}
+	return 0
+}
+
+// unregisterDir deletes an open directory handle from the slot.
+func (s *shareSlot) unregisterDir(d *filteredDir) {
+	if s == nil {
+		return
+	}
+	s.filesMu.Lock()
+	delete(s.dirs, d)
+	s.filesMu.Unlock()
+}
+
+type movedHandleTarget struct {
+	dev    uint64
+	ino    uint64
+	dstRel string
+}
+
+const (
+	movedFlagVCS uint8 = 1 << iota
+	movedFlagHook
+)
+
+// promoteOpenHandles updates VCS and hook flags on open file and directory handles matching targets.
+func (s *shareSlot) promoteOpenHandles(targets []movedHandleTarget) {
+	if s == nil || len(targets) == 0 {
+		return
+	}
+	var flagsByID map[[2]uint64]uint8
+	for _, t := range targets {
+		if t.ino == 0 {
+			continue
+		}
+		var mask uint8
+		if isVCSAdminPath(t.dstRel, s.hidden) {
+			mask |= movedFlagVCS
+		}
+		if isProtectedVCSHookRelPath(t.dstRel) {
+			mask |= movedFlagHook
+		}
+		if mask == 0 {
+			continue
+		}
+		if flagsByID == nil {
+			flagsByID = make(map[[2]uint64]uint8, len(targets))
+		}
+		flagsByID[[2]uint64{t.dev, t.ino}] |= mask
+	}
+	if len(flagsByID) == 0 {
+		return
+	}
+
+	var toRevokeESTALE []*safeFile
+	var toRevokeEROFS []*safeFile
+	var dirToRevokeESTALE []*filteredDir
+
+	s.filesMu.Lock()
+	pol := s.getVCSPolicy()
+	for sf := range s.files {
+		mask := flagsByID[[2]uint64{sf.dev, sf.ino}]
+		if mask == 0 {
+			continue
+		}
+		dstVCS := mask&movedFlagVCS != 0
+		dstHook := mask&movedFlagHook != 0
+		if dstVCS {
+			sf.isVCS.Store(true)
+		}
+		if dstHook {
+			sf.isHook.Store(true)
+		}
+		if dstVCS && pol == config.VCSMask {
+			toRevokeESTALE = append(toRevokeESTALE, sf)
+			delete(s.files, sf)
+		} else if sf.writable && dstHook && pol == config.VCSAllow {
+			toRevokeEROFS = append(toRevokeEROFS, sf)
+			delete(s.files, sf)
+		}
+	}
+	for d := range s.dirs {
+		mask := flagsByID[[2]uint64{d.dev, d.ino}]
+		if mask&movedFlagVCS == 0 {
+			continue
+		}
+		d.isVCS.Store(true)
+		if pol == config.VCSMask {
+			dirToRevokeESTALE = append(dirToRevokeESTALE, d)
+			delete(s.dirs, d)
+		}
+	}
+	s.filesMu.Unlock()
+
+	for _, sf := range toRevokeESTALE {
+		sf.revoke(syscall.ESTALE)
+	}
+	for _, sf := range toRevokeEROFS {
+		sf.revoke(syscall.EROFS)
+	}
+	for _, d := range dirToRevokeESTALE {
+		d.revoke(syscall.ESTALE)
+	}
+}
+
+// promoteOpenHandlesForRename updates VCS and hook flags on open handles matching dev and ino.
+func (s *shareSlot) promoteOpenHandlesForRename(dev, ino uint64, dstRel string) {
+	s.promoteOpenHandles([]movedHandleTarget{{dev: dev, ino: ino, dstRel: dstRel}})
+}
+
 func (s *shareSlot) openWritableCount() int {
 	if s == nil {
 		return 0
@@ -475,6 +720,38 @@ func (s *shareSlot) openWritableCount() int {
 	n := 0
 	for sf := range s.files {
 		if sf.writable && !sf.isRevoked() {
+			n++
+		}
+	}
+	return n
+}
+
+// openWritableVCSCount returns the number of active writable VCS file descriptors.
+func (s *shareSlot) openWritableVCSCount() int {
+	if s == nil {
+		return 0
+	}
+	s.filesMu.Lock()
+	defer s.filesMu.Unlock()
+	n := 0
+	for sf := range s.files {
+		if sf.writable && sf.isVCS.Load() && !sf.isRevoked() {
+			n++
+		}
+	}
+	return n
+}
+
+// openWritableHookCount returns the number of active writable VCS hook or config descriptors.
+func (s *shareSlot) openWritableHookCount() int {
+	if s == nil {
+		return 0
+	}
+	s.filesMu.Lock()
+	defer s.filesMu.Unlock()
+	n := 0
+	for sf := range s.files {
+		if sf.writable && sf.isHook.Load() && !sf.isRevoked() {
 			n++
 		}
 	}
@@ -499,6 +776,56 @@ func (s *shareSlot) revokeWritableFiles(errno syscall.Errno) {
 	}
 }
 
+// revokeVCSDescriptors revokes all open file and directory handles on VCS paths.
+func (s *shareSlot) revokeVCSDescriptors(errno syscall.Errno) {
+	if s == nil {
+		return
+	}
+	s.filesMu.Lock()
+	var fileTargets []*safeFile
+	for sf := range s.files {
+		if sf.isVCS.Load() {
+			fileTargets = append(fileTargets, sf)
+			delete(s.files, sf)
+		}
+	}
+	var dirTargets []*filteredDir
+	for d := range s.dirs {
+		if d.isVCS.Load() {
+			dirTargets = append(dirTargets, d)
+			delete(s.dirs, d)
+		}
+	}
+	s.filesMu.Unlock()
+
+	for _, sf := range fileTargets {
+		sf.revoke(errno)
+	}
+	for _, d := range dirTargets {
+		d.revoke(errno)
+	}
+}
+
+// revokeWritableHookFiles revokes all open writable handles on protected VCS paths.
+func (s *shareSlot) revokeWritableHookFiles(errno syscall.Errno) {
+	if s == nil {
+		return
+	}
+	s.filesMu.Lock()
+	var targets []*safeFile
+	for sf := range s.files {
+		if sf.writable && sf.isHook.Load() {
+			targets = append(targets, sf)
+			delete(s.files, sf)
+		}
+	}
+	s.filesMu.Unlock()
+
+	for _, sf := range targets {
+		sf.revoke(errno)
+	}
+}
+
 func (s *shareSlot) revokeAll(errno syscall.Errno) {
 	if s == nil {
 		return
@@ -510,10 +837,19 @@ func (s *shareSlot) revokeAll(errno syscall.Errno) {
 		targets = append(targets, sf)
 	}
 	s.files = make(map[*safeFile]struct{})
+
+	dirTargets := make([]*filteredDir, 0, len(s.dirs))
+	for d := range s.dirs {
+		dirTargets = append(dirTargets, d)
+	}
+	s.dirs = make(map[*filteredDir]struct{})
 	s.filesMu.Unlock()
 
 	for _, sf := range targets {
 		sf.revoke(errno)
+	}
+	for _, d := range dirTargets {
+		d.revoke(errno)
 	}
 	if s.root != nil {
 		s.root.Revoke(errno)
@@ -543,9 +879,9 @@ func computeStableIno(slotID, rootDev, dev, ino uint64) uint64 {
 	mixed := (swapped ^ swappedRoot) ^ ino
 	if slotID > 0 {
 		mixed ^= splitmix64(slotID)
-		if mixed <= 1 {
-			mixed += 2
-		}
+	}
+	if mixed <= 1 {
+		mixed += 2
 	}
 	return mixed
 }
@@ -554,9 +890,152 @@ func isWriteOpenFlags(flags uint32) bool {
 	return flags&uint32(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_APPEND|syscall.O_TRUNC|os.O_CREATE) != 0
 }
 
-// FilteredNode wraps fs.LoopbackNode to enforce VCS policy, read-only status,
-// and host boundary rules on every directory and file operation.
-type FilteredNode struct {
+func sanitizeOpenFlags(flags uint32, readOnly bool) int {
+	stripped := uint32(syscall.O_APPEND | fuse.FMODE_EXEC | os.O_CREATE | syscall.O_EXCL | syscall.O_NOCTTY)
+	openFlags := int(flags &^ stripped)
+	if readOnly {
+		openFlags = (openFlags &^ (syscall.O_WRONLY | syscall.O_RDWR | syscall.O_APPEND | syscall.O_TRUNC | os.O_CREATE)) | syscall.O_RDONLY
+	}
+	return openFlags
+}
+
+// openRegularViaOPath opens rel with O_PATH|O_NOFOLLOW, verifies S_IFREG, and
+// reopens the pinned inode via /proc/self/fd/<fd> so FIFOs and devices never open.
+func openRegularViaOPath(root *pinnedRoot, rel string, flags uint32, readOnly bool, requireSingleLink bool) (int, syscall.Stat_t, syscall.Errno) {
+	if root == nil {
+		return -1, syscall.Stat_t{}, syscall.EIO
+	}
+	pathFD, err := root.openat2(rel, unix.O_PATH|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, syscall.Stat_t{}, fs.ToErrno(err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(pathFD, &st); err != nil {
+		_ = unix.Close(pathFD)
+		return -1, syscall.Stat_t{}, fs.ToErrno(err)
+	}
+	fileType := st.Mode & syscall.S_IFMT
+	if fileType == syscall.S_IFDIR {
+		_ = unix.Close(pathFD)
+		return -1, syscall.Stat_t{}, syscall.EISDIR
+	}
+	if fileType != syscall.S_IFREG {
+		_ = unix.Close(pathFD)
+		return -1, syscall.Stat_t{}, syscall.EPERM
+	}
+	if flags&uint32(syscall.O_DIRECTORY) != 0 {
+		_ = unix.Close(pathFD)
+		return -1, syscall.Stat_t{}, syscall.ENOTDIR
+	}
+	if requireSingleLink && st.Nlink != 1 {
+		_ = unix.Close(pathFD)
+		return -1, syscall.Stat_t{}, syscall.EPERM
+	}
+
+	openFlags := sanitizeOpenFlags(flags, readOnly) | unix.O_CLOEXEC
+	procPath := fmt.Sprintf("/proc/self/fd/%d", pathFD)
+	fd, err := unix.Open(procPath, openFlags, 0)
+	_ = unix.Close(pathFD)
+	if err != nil {
+		return -1, syscall.Stat_t{}, fs.ToErrno(err)
+	}
+
+	var st2 syscall.Stat_t
+	if err := syscall.Fstat(fd, &st2); err != nil {
+		_ = unix.Close(fd)
+		return -1, syscall.Stat_t{}, fs.ToErrno(err)
+	}
+	if (st2.Mode&syscall.S_IFMT) != syscall.S_IFREG || st2.Dev != st.Dev || st2.Ino != st.Ino {
+		_ = unix.Close(fd)
+		return -1, syscall.Stat_t{}, syscall.EPERM
+	}
+	return fd, st2, 0
+}
+
+// applyProcFDSetattr applies chmod, truncate, and utimensat via /proc/self/fd/<fd>.
+func applyProcFDSetattr(fd int, in *fuse.SetAttrIn, isDir bool) syscall.Errno {
+	if isDir {
+		if _, ok := in.GetSize(); ok {
+			return syscall.EISDIR
+		}
+	}
+	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
+	if m, ok := in.GetMode(); ok {
+		if err := syscall.Chmod(procPath, sanitizeCreateMode(m)); err != nil {
+			return fs.ToErrno(err)
+		}
+	}
+	if sz, ok := in.GetSize(); ok {
+		if err := syscall.Truncate(procPath, int64(sz)); err != nil {
+			return fs.ToErrno(err)
+		}
+	}
+	mtime, mok := in.GetMTime()
+	atime, aok := in.GetATime()
+	if mok || aok {
+		ts, tErr := buildTimespecs(atime, aok, mtime, mok)
+		if tErr != 0 {
+			return tErr
+		}
+		if err := unix.UtimesNanoAt(unix.AT_FDCWD, procPath, ts, 0); err != nil {
+			return fs.ToErrno(err)
+		}
+	}
+	return 0
+}
+
+// listFilteredXattrs lists extended attributes on /proc/self/fd/<fd> and keeps only user.<name>.
+func listFilteredXattrs(fd int, dest []byte) (uint32, syscall.Errno) {
+	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
+	sz, err := unix.Listxattr(procPath, nil)
+	if err != nil {
+		return 0, fs.ToErrno(err)
+	}
+	if sz <= 0 {
+		return 0, 0
+	}
+	raw := make([]byte, sz)
+	nRead, err := unix.Listxattr(procPath, raw)
+	if err != nil {
+		return 0, fs.ToErrno(err)
+	}
+	var filtered []byte
+	for _, entry := range bytes.Split(raw[:nRead], []byte{0}) {
+		if len(entry) == 0 {
+			continue
+		}
+		if !isProtectedXattr(string(entry)) {
+			filtered = append(filtered, entry...)
+			filtered = append(filtered, 0)
+		}
+	}
+	if len(dest) == 0 {
+		return uint32(len(filtered)), 0
+	}
+	if len(dest) < len(filtered) {
+		return uint32(len(filtered)), syscall.ERANGE
+	}
+	copy(dest, filtered)
+	return uint32(len(filtered)), 0
+}
+
+func readlinkAtBounded(dirFD int, name string) ([]byte, syscall.Errno) {
+	for size := 256; size <= maxSymlinkTargetBytes; size *= 2 {
+		buf := make([]byte, size)
+		sz, err := unix.Readlinkat(dirFD, name, buf)
+		if err != nil {
+			return nil, fs.ToErrno(err)
+		}
+		if sz < len(buf) {
+			return buf[:sz], 0
+		}
+	}
+	return nil, syscall.ENAMETOOLONG
+}
+
+// filteredNode wraps fs.LoopbackNode to enforce VCS policy, read-only status,
+// and host confinement rules on every directory and file operation.
+type filteredNode struct {
 	*fs.LoopbackNode
 	root   *pinnedRoot
 	slot   *shareSlot
@@ -565,42 +1044,46 @@ type FilteredNode struct {
 	isRoot bool
 }
 
-func (n *FilteredNode) activeIDMap() guestIDMap {
+func (n *filteredNode) activeIDMap() guestIDMap {
 	if n.slot != nil {
 		return n.slot.idMap
 	}
 	return n.idMap
 }
 
-func (n *FilteredNode) OnForget() {
+func (n *filteredNode) OnForget() {
 	if n.isRoot && n.root != nil && (n.slot == nil || n.slot.slotID == 0) {
 		n.root.Close()
 	}
 }
 
-func (n *FilteredNode) vcsPolicy() config.VCSPolicy {
+func (n *filteredNode) vcsPolicy() config.VCSPolicy {
 	if n.slot != nil {
 		return n.slot.getVCSPolicy()
 	}
 	return config.VCSMask
 }
 
-func (n *FilteredNode) isReadOnly() bool {
+func (n *filteredNode) isReadOnly() bool {
 	return n.slot != nil && n.slot.isReadOnly()
 }
 
-func (n *FilteredNode) isHidden(name string) bool {
+func (n *filteredNode) isHidden(name string) bool {
 	if n.vcsPolicy() != config.VCSMask {
 		return false
 	}
 	return isHiddenEntry(name, n.hidden)
 }
 
-func (n *FilteredNode) isHookProtectedRel(rel string) bool {
+func (n *filteredNode) isHookProtectedRel(rel string) bool {
 	return n.vcsPolicy() == config.VCSAllow && isProtectedVCSHookRelPath(rel)
 }
 
-func (n *FilteredNode) checkMutationOnSelf() (string, syscall.Errno) {
+func (n *filteredNode) isRevoked() bool {
+	return n.slot != nil && n.slot.isRevoked()
+}
+
+func (n *filteredNode) checkMutationOnSelf() (string, syscall.Errno) {
 	if n.slot != nil && n.slot.isRevoked() {
 		return "", syscall.ESTALE
 	}
@@ -617,7 +1100,7 @@ func (n *FilteredNode) checkMutationOnSelf() (string, syscall.Errno) {
 	return rel, 0
 }
 
-func (n *FilteredNode) checkWritableChild(name string, disallowTopVCSAdmin bool) (string, syscall.Errno) {
+func (n *filteredNode) checkWritableChild(name string, disallowTopVCSAdmin bool) (string, syscall.Errno) {
 	if isInvalidComponent(name) {
 		return "", syscall.EINVAL
 	}
@@ -646,14 +1129,14 @@ func (n *FilteredNode) checkWritableChild(name string, disallowTopVCSAdmin bool)
 	return parentRel, 0
 }
 
-func (n *FilteredNode) relPath() string {
+func (n *filteredNode) relPath() string {
 	var rootInode *fs.Inode
 	if n.slot != nil {
 		n.slot.inodeMu.RLock()
 		rootInode = n.slot.inode
 		n.slot.inodeMu.RUnlock()
 	}
-	if rootInode == nil {
+	if rootInode == nil || rootInode.Root() != n.Root() {
 		if n.RootData != nil && n.RootData.RootNode != nil {
 			rootInode = n.RootData.RootNode.EmbeddedInode()
 		} else {
@@ -663,7 +1146,7 @@ func (n *FilteredNode) relPath() string {
 	return n.Path(rootInode)
 }
 
-func (n *FilteredNode) validatedRelPath() (string, syscall.Errno) {
+func (n *filteredNode) validatedRelPath() (string, syscall.Errno) {
 	if n.slot != nil && n.slot.isRevoked() {
 		return "", syscall.ESTALE
 	}
@@ -677,7 +1160,7 @@ func (n *FilteredNode) validatedRelPath() (string, syscall.Errno) {
 		}
 		return "", syscall.ENOENT
 	}
-	if strings.HasPrefix(rel, ".deleted") || strings.HasPrefix(rel, ".go-fuse.") {
+	if strings.HasPrefix(rel, ".go-fuse.") {
 		return "", syscall.ENOENT
 	}
 	hideVCS := n.vcsPolicy() == config.VCSMask
@@ -698,7 +1181,7 @@ func (n *FilteredNode) validatedRelPath() (string, syscall.Errno) {
 	return rel, 0
 }
 
-func (n *FilteredNode) openDirFD() (int, syscall.Errno) {
+func (n *filteredNode) openDirFD() (int, syscall.Errno) {
 	rel, errno := n.validatedRelPath()
 	if errno != 0 {
 		return -1, errno
@@ -710,7 +1193,7 @@ func (n *FilteredNode) openDirFD() (int, syscall.Errno) {
 	return fd, 0
 }
 
-func (n *FilteredNode) openNodeOPath() (int, string, syscall.Errno) {
+func (n *filteredNode) openNodeOPath() (int, string, syscall.Errno) {
 	rel, errno := n.validatedRelPath()
 	if errno != 0 {
 		return -1, "", errno
@@ -722,7 +1205,7 @@ func (n *FilteredNode) openNodeOPath() (int, string, syscall.Errno) {
 	return fd, rel, 0
 }
 
-func (n *FilteredNode) openParentAndName() (int, string, string, syscall.Errno) {
+func (n *filteredNode) openParentAndName() (int, string, string, syscall.Errno) {
 	rel, errno := n.validatedRelPath()
 	if errno != 0 {
 		return -1, "", "", errno
@@ -745,7 +1228,7 @@ func (n *FilteredNode) openParentAndName() (int, string, string, syscall.Errno) 
 	return fd, parentRel, baseName, 0
 }
 
-func (n *FilteredNode) stableAttr(st *syscall.Stat_t, btime *syscall.Timespec) fs.StableAttr {
+func (n *filteredNode) stableAttr(st *syscall.Stat_t, btime *syscall.Timespec) fs.StableAttr {
 	gen := uint64(1)
 	if btime != nil && (btime.Sec != 0 || btime.Nsec != 0) {
 		gen = uint64(btime.Sec)*1e9 + uint64(btime.Nsec)
@@ -761,22 +1244,21 @@ func (n *FilteredNode) stableAttr(st *syscall.Stat_t, btime *syscall.Timespec) f
 	}
 }
 
-func (n *FilteredNode) applyAttrMask(attr *fuse.Attr, rel string) {
+func (n *filteredNode) applyAttrMask(attr *fuse.Attr, rel string) {
 	if n.slot != nil {
 		attr.Mode = n.slot.maskMode(attr.Mode, n.isHookProtectedRel(rel))
 	}
 	n.activeIDMap().applyAttr(attr)
 }
 
-func (n *FilteredNode) newChildInode(ctx context.Context, name string, st *syscall.Stat_t, btime *syscall.Timespec) *fs.Inode {
-	child := &FilteredNode{
+func (n *filteredNode) newChildInode(ctx context.Context, st *syscall.Stat_t, btime *syscall.Timespec) *fs.Inode {
+	child := &filteredNode{
 		LoopbackNode: &fs.LoopbackNode{RootData: n.RootData},
 		root:         n.root,
 		slot:         n.slot,
 		hidden:       n.hidden,
 		idMap:        n.activeIDMap(),
 	}
-	_ = name
 	return n.NewInode(ctx, child, n.stableAttr(st, btime))
 }
 
@@ -791,11 +1273,11 @@ func statAtNoFollow(dirFD int, name string, st *syscall.Stat_t, btime *syscall.T
 	if err == nil {
 		fillStatFromStatx(&sx, st)
 		if sx.Mask&unix.STATX_BTIME != 0 {
-			*btime = syscall.Timespec(unix.NsecToTimespec(sx.Btime.Sec*1e9 + int64(sx.Btime.Nsec)))
+			*btime = syscall.Timespec{Sec: int64(sx.Btime.Sec), Nsec: int64(sx.Btime.Nsec)}
 		}
 		return nil
 	}
-	if !errors.Is(err, unix.ENOSYS) {
+	if !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EINVAL) {
 		return err
 	}
 	if name == "" {
@@ -820,9 +1302,9 @@ func fillStatFromStatx(sx *unix.Statx_t, st *syscall.Stat_t) {
 	st.Size = int64(sx.Size)
 	st.Blksize = int64(sx.Blksize)
 	st.Blocks = int64(sx.Blocks)
-	st.Atim = syscall.Timespec(unix.NsecToTimespec(sx.Atime.Sec*1e9 + int64(sx.Atime.Nsec)))
-	st.Mtim = syscall.Timespec(unix.NsecToTimespec(sx.Mtime.Sec*1e9 + int64(sx.Mtime.Nsec)))
-	st.Ctim = syscall.Timespec(unix.NsecToTimespec(sx.Ctime.Sec*1e9 + int64(sx.Ctime.Nsec)))
+	st.Atim = syscall.Timespec{Sec: int64(sx.Atime.Sec), Nsec: int64(sx.Atime.Nsec)}
+	st.Mtim = syscall.Timespec{Sec: int64(sx.Mtime.Sec), Nsec: int64(sx.Mtime.Nsec)}
+	st.Ctim = syscall.Timespec{Sec: int64(sx.Ctime.Sec), Nsec: int64(sx.Ctime.Nsec)}
 }
 
 func copyUnixStat(u *unix.Stat_t, st *syscall.Stat_t) {
@@ -843,10 +1325,6 @@ func copyUnixStat(u *unix.Stat_t, st *syscall.Stat_t) {
 
 func sanitizeCreateMode(mode uint32) uint32 {
 	return (mode & 0o7777) &^ uint32(syscall.S_ISUID|syscall.S_ISGID)
-}
-
-func validateSetAttrIn(in *fuse.SetAttrIn, euid, egid int) syscall.Errno {
-	return validateSetAttrInWithIDMap(in, euid, egid, guestIDMap{})
 }
 
 func validateSetAttrInWithIDMap(in *fuse.SetAttrIn, euid, egid int, idMap guestIDMap) syscall.Errno {
@@ -872,15 +1350,20 @@ func validateSetAttrInWithIDMap(in *fuse.SetAttrIn, euid, egid int, idMap guestI
 	return 0
 }
 
-// safeFile wraps an open host regular file descriptor while hiding raw fd
-// passthrough and ioctl. It guards every syscall with an RWMutex so removing
-// or downgrading a share can immediately close the underlying host descriptor
-// without racing in-flight operations.
+// safeFile wraps an open host regular file descriptor and blocks raw fd
+// passthrough and ioctl. An RWMutex guards syscalls so revoke closes the
+// host descriptor without racing active operations.
 type safeFile struct {
+	id         uint64
 	mu         sync.RWMutex
 	osFile     *os.File
 	raw        *fs.LoopbackFile
 	slot       *shareSlot
+	relPath    string
+	dev        uint64
+	ino        uint64
+	isVCS      atomic.Bool
+	isHook     atomic.Bool
 	idMap      guestIDMap
 	writable   bool
 	revokedErr syscall.Errno
@@ -895,21 +1378,34 @@ func (f *safeFile) activeIDMap() guestIDMap {
 	return f.idMap
 }
 
-func newRegisteredSafeFile(fd int, slot *shareSlot, writable bool, euid, egid int) (*safeFile, syscall.Errno) {
+func newRegisteredSafeFile(fd int, st *syscall.Stat_t, slot *shareSlot, relPath string, writable bool, euid, egid int) (*safeFile, syscall.Errno) {
 	osf := os.NewFile(uintptr(fd), "")
 	var idMap guestIDMap
+	var hidden map[string]struct{}
 	if slot != nil {
 		idMap = slot.idMap
+		hidden = slot.hidden
+	}
+	var dev, ino uint64
+	if st != nil {
+		dev = uint64(st.Dev)
+		ino = st.Ino
 	}
 	sf := &safeFile{
+		id:       nextSafeFileID.Add(1),
 		osFile:   osf,
 		raw:      fs.NewLoopbackFileFromOS(osf),
 		slot:     slot,
+		relPath:  relPath,
+		dev:      dev,
+		ino:      ino,
 		idMap:    idMap,
 		writable: writable,
 		euid:     euid,
 		egid:     egid,
 	}
+	sf.isVCS.Store(isVCSAdminPath(relPath, hidden))
+	sf.isHook.Store(isProtectedVCSHookRelPath(relPath))
 	if errno := slot.registerFile(sf); errno != 0 {
 		_ = osf.Close()
 		sf.osFile = nil
@@ -943,14 +1439,39 @@ func (f *safeFile) revoke(errno syscall.Errno) {
 	}
 }
 
-func (f *safeFile) withFDRead(fn func(fd int) syscall.Errno) syscall.Errno {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+// checkAccessLocked checks revocation and live slot policies under f.mu.
+func (f *safeFile) checkAccessLocked(writeOp bool) syscall.Errno {
 	if f.revokedErr != 0 {
 		return f.revokedErr
 	}
-	if f.osFile == nil {
+	if f.slot != nil {
+		if f.slot.isRevoked() {
+			return syscall.ESTALE
+		}
+		pol := f.slot.getVCSPolicy()
+		if f.isVCS.Load() && pol == config.VCSMask {
+			return syscall.ESTALE
+		}
+		if writeOp {
+			if f.slot.isReadOnly() {
+				return syscall.EROFS
+			}
+			if f.isHook.Load() && pol == config.VCSAllow {
+				return syscall.EROFS
+			}
+		}
+	}
+	if f.osFile == nil || f.raw == nil {
 		return syscall.EBADF
+	}
+	return 0
+}
+
+func (f *safeFile) withFDRead(fn func(fd int) syscall.Errno) syscall.Errno {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if errno := f.checkAccessLocked(false); errno != 0 {
+		return errno
 	}
 	sc, err := f.osFile.SyscallConn()
 	if err != nil {
@@ -980,14 +1501,8 @@ func (f *safeFile) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadR
 func (f *safeFile) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return 0, f.revokedErr
-	}
-	if f.slot != nil && f.slot.isReadOnly() {
-		return 0, syscall.EROFS
-	}
-	if f.raw == nil {
-		return 0, syscall.EBADF
+	if errno := f.checkAccessLocked(true); errno != 0 {
+		return 0, errno
 	}
 	return f.raw.Write(ctx, data, off)
 }
@@ -1010,10 +1525,7 @@ func (f *safeFile) Release(ctx context.Context) syscall.Errno {
 func (f *safeFile) Flush(ctx context.Context) syscall.Errno {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return 0
-	}
-	if f.raw == nil {
+	if f.revokedErr != 0 || f.raw == nil {
 		return 0
 	}
 	return f.raw.Flush(ctx)
@@ -1022,11 +1534,8 @@ func (f *safeFile) Flush(ctx context.Context) syscall.Errno {
 func (f *safeFile) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return f.revokedErr
-	}
-	if f.raw == nil {
-		return syscall.EBADF
+	if errno := f.checkAccessLocked(false); errno != 0 {
+		return errno
 	}
 	return f.raw.Fsync(ctx, flags)
 }
@@ -1034,11 +1543,8 @@ func (f *safeFile) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 func (f *safeFile) Getlk(ctx context.Context, owner uint64, lk *fuse.FileLock, flags uint32, out *fuse.FileLock) syscall.Errno {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return f.revokedErr
-	}
-	if f.raw == nil {
-		return syscall.EBADF
+	if errno := f.checkAccessLocked(false); errno != 0 {
+		return errno
 	}
 	return f.raw.Getlk(ctx, owner, lk, flags, out)
 }
@@ -1046,11 +1552,8 @@ func (f *safeFile) Getlk(ctx context.Context, owner uint64, lk *fuse.FileLock, f
 func (f *safeFile) Setlk(ctx context.Context, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return f.revokedErr
-	}
-	if f.raw == nil {
-		return syscall.EBADF
+	if errno := f.checkAccessLocked(false); errno != 0 {
+		return errno
 	}
 	return f.raw.Setlk(ctx, owner, lk, flags)
 }
@@ -1058,11 +1561,8 @@ func (f *safeFile) Setlk(ctx context.Context, owner uint64, lk *fuse.FileLock, f
 func (f *safeFile) Setlkw(ctx context.Context, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return f.revokedErr
-	}
-	if f.raw == nil {
-		return syscall.EBADF
+	if errno := f.checkAccessLocked(false); errno != 0 {
+		return errno
 	}
 	return f.raw.Setlkw(ctx, owner, lk, flags)
 }
@@ -1070,16 +1570,14 @@ func (f *safeFile) Setlkw(ctx context.Context, owner uint64, lk *fuse.FileLock, 
 func (f *safeFile) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return f.revokedErr
-	}
-	if f.raw == nil {
-		return syscall.EBADF
+	if errno := f.checkAccessLocked(false); errno != 0 {
+		return errno
 	}
 	errno := f.raw.Getattr(ctx, out)
 	if errno == 0 {
-		if f.slot != nil && f.slot.isReadOnly() {
-			out.Mode = f.slot.maskMode(out.Mode, false)
+		if f.slot != nil {
+			hookProt := f.isHook.Load() && f.slot.getVCSPolicy() == config.VCSAllow
+			out.Mode = f.slot.maskMode(out.Mode, hookProt)
 		}
 		f.activeIDMap().applyAttr(&out.Attr)
 	}
@@ -1089,26 +1587,20 @@ func (f *safeFile) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno
 func (f *safeFile) Lseek(ctx context.Context, off uint64, whence uint32) (uint64, syscall.Errno) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return 0, f.revokedErr
-	}
-	if f.raw == nil {
-		return 0, syscall.EBADF
+	if errno := f.checkAccessLocked(false); errno != 0 {
+		return 0, errno
 	}
 	return f.raw.Lseek(ctx, off, whence)
 }
 
 func (f *safeFile) Allocate(ctx context.Context, off uint64, sz uint64, mode uint32) syscall.Errno {
+	if !f.writable {
+		return syscall.EBADF
+	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return f.revokedErr
-	}
-	if f.slot != nil && f.slot.isReadOnly() {
-		return syscall.EROFS
-	}
-	if f.raw == nil {
-		return syscall.EBADF
+	if errno := f.checkAccessLocked(true); errno != 0 {
+		return errno
 	}
 	return f.raw.Allocate(ctx, off, sz, mode)
 }
@@ -1116,14 +1608,8 @@ func (f *safeFile) Allocate(ctx context.Context, off uint64, sz uint64, mode uin
 func (f *safeFile) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.revokedErr != 0 {
-		return f.revokedErr
-	}
-	if f.slot != nil && f.slot.isReadOnly() {
-		return syscall.EROFS
-	}
-	if f.raw == nil {
-		return syscall.EBADF
+	if errno := f.checkAccessLocked(true); errno != 0 {
+		return errno
 	}
 	if errno := validateSetAttrInWithIDMap(in, f.euid, f.egid, f.activeIDMap()); errno != 0 {
 		return errno
@@ -1132,12 +1618,16 @@ func (f *safeFile) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.At
 	cleanIn.Valid &^= fuse.FATTR_UID | fuse.FATTR_GID
 	errno := f.raw.Setattr(ctx, &cleanIn, out)
 	if errno == 0 {
+		if f.slot != nil {
+			hookProt := f.isHook.Load() && f.slot.getVCSPolicy() == config.VCSAllow
+			out.Mode = f.slot.maskMode(out.Mode, hookProt)
+		}
 		f.activeIDMap().applyAttr(&out.Attr)
 	}
 	return errno
 }
 
-func (n *FilteredNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+func (n *filteredNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	_ = ctx
 	fd, _, errno := n.openNodeOPath()
 	if errno != 0 {
@@ -1152,7 +1642,7 @@ func (n *FilteredNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.
 	return 0
 }
 
-func (n *FilteredNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+func (n *filteredNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if isInvalidComponent(name) {
 		return nil, syscall.EINVAL
 	}
@@ -1176,11 +1666,14 @@ func (n *FilteredNode) Lookup(ctx context.Context, name string, out *fuse.EntryO
 	}
 	out.Attr.FromStat(&st)
 	n.applyAttrMask(&out.Attr, joinRelPath(parentRel, name))
-	return n.newChildInode(ctx, name, &st, &btime), 0
+	return n.newChildInode(ctx, &st, &btime), 0
 }
 
-func (n *FilteredNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+func (n *filteredNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	_ = ctx
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	rel, errno := n.validatedRelPath()
 	if errno != 0 {
 		return nil, 0, errno
@@ -1194,32 +1687,22 @@ func (n *FilteredNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, u
 			return nil, 0, syscall.EPERM
 		}
 	}
-	openFlags := int(flags&^(syscall.O_APPEND|fuse.FMODE_EXEC)) | unix.O_NOFOLLOW
-	if n.isReadOnly() {
-		openFlags = (openFlags &^ (syscall.O_WRONLY | syscall.O_RDWR | syscall.O_APPEND | syscall.O_TRUNC | os.O_CREATE)) | syscall.O_RDONLY
+	fd, st, openErr := openRegularViaOPath(n.root, rel, flags, n.isReadOnly(), false)
+	if openErr != 0 {
+		return nil, 0, openErr
 	}
-	fd, err := n.root.openat2(rel, openFlags, 0)
-	if err != nil {
-		return nil, 0, fs.ToErrno(err)
-	}
-	var st syscall.Stat_t
-	if err := syscall.Fstat(fd, &st); err != nil {
-		_ = unix.Close(fd)
-		return nil, 0, fs.ToErrno(err)
-	}
-	if (st.Mode & syscall.S_IFMT) != syscall.S_IFREG {
-		_ = unix.Close(fd)
-		return nil, 0, syscall.EPERM
-	}
-	sf, regErrno := newRegisteredSafeFile(fd, n.slot, writable, n.root.euid, n.root.egid)
+	sf, regErrno := newRegisteredSafeFile(fd, &st, n.slot, rel, writable, n.root.euid, n.root.egid)
 	if regErrno != 0 {
 		return nil, 0, regErrno
 	}
 	return sf, 0, 0
 }
 
-func (n *FilteredNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	parentRel, errno := n.checkWritableChild(name, false)
+func (n *filteredNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
+	parentRel, errno := n.checkWritableChild(name, true)
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
@@ -1229,33 +1712,95 @@ func (n *FilteredNode) Create(ctx context.Context, name string, flags uint32, mo
 	}
 	defer unix.Close(dirFD)
 
-	openFlags := int(flags&^syscall.O_APPEND) | os.O_CREATE | unix.O_NOFOLLOW
 	cleanMode := sanitizeCreateMode(mode)
-	fd, err := openat2FromDir(dirFD, name, openFlags, cleanMode)
-	if err != nil {
-		return nil, nil, 0, fs.ToErrno(err)
+	baseFlags := sanitizeOpenFlags(flags, false)
+	if baseFlags&(syscall.O_WRONLY|syscall.O_RDWR) == 0 {
+		baseFlags |= syscall.O_WRONLY
 	}
+
+	fd := -1
 	var st syscall.Stat_t
 	var btime syscall.Timespec
-	if err := statAtNoFollow(fd, "", &st, &btime); err != nil {
-		_ = unix.Close(fd)
-		return nil, nil, 0, fs.ToErrno(err)
+	createdNew := false
+
+	for attempt := 0; attempt < 2; attempt++ {
+		exclFlags := baseFlags | os.O_CREATE | syscall.O_EXCL | unix.O_NOFOLLOW
+		newFD, cErr := openat2FromDir(dirFD, name, exclFlags, cleanMode)
+		if cErr == nil {
+			fd = newFD
+			createdNew = true
+			if sErr := statAtNoFollow(fd, "", &st, &btime); sErr != nil {
+				_ = unix.Close(fd)
+				_ = unix.Unlinkat(dirFD, name, 0)
+				return nil, nil, 0, fs.ToErrno(sErr)
+			}
+			break
+		}
+		if !errors.Is(cErr, syscall.EEXIST) || flags&uint32(syscall.O_EXCL) != 0 {
+			return nil, nil, 0, fs.ToErrno(cErr)
+		}
+
+		// Target exists and caller omitted O_EXCL. Inspect via O_PATH|O_NOFOLLOW first
+		// so pre-existing FIFOs and device nodes never open or block.
+		pathFD, pErr := openat2FromDir(dirFD, name, unix.O_PATH|unix.O_NOFOLLOW, 0)
+		if pErr != nil {
+			if errors.Is(pErr, syscall.ENOENT) && attempt == 0 {
+				continue
+			}
+			return nil, nil, 0, fs.ToErrno(pErr)
+		}
+		var existSt syscall.Stat_t
+		if sErr := statAtNoFollow(pathFD, "", &existSt, &btime); sErr != nil {
+			_ = unix.Close(pathFD)
+			return nil, nil, 0, fs.ToErrno(sErr)
+		}
+		fileType := existSt.Mode & syscall.S_IFMT
+		if fileType == syscall.S_IFDIR {
+			_ = unix.Close(pathFD)
+			return nil, nil, 0, syscall.EISDIR
+		}
+		if fileType != syscall.S_IFREG {
+			_ = unix.Close(pathFD)
+			return nil, nil, 0, syscall.EPERM
+		}
+		reopenFD, rErr := unix.Open(fmt.Sprintf("/proc/self/fd/%d", pathFD), baseFlags|unix.O_CLOEXEC, 0)
+		_ = unix.Close(pathFD)
+		if rErr != nil {
+			return nil, nil, 0, fs.ToErrno(rErr)
+		}
+		if sErr := statAtNoFollow(reopenFD, "", &st, &btime); sErr != nil {
+			_ = unix.Close(reopenFD)
+			return nil, nil, 0, fs.ToErrno(sErr)
+		}
+		if (st.Mode&syscall.S_IFMT) != syscall.S_IFREG || st.Dev != existSt.Dev || st.Ino != existSt.Ino {
+			_ = unix.Close(reopenFD)
+			return nil, nil, 0, syscall.EPERM
+		}
+		fd = reopenFD
+		break
 	}
-	if (st.Mode & syscall.S_IFMT) != syscall.S_IFREG {
-		_ = unix.Close(fd)
-		return nil, nil, 0, syscall.EPERM
+	if fd < 0 {
+		return nil, nil, 0, syscall.EEXIST
 	}
-	sf, regErrno := newRegisteredSafeFile(fd, n.slot, true, n.root.euid, n.root.egid)
+
+	childRel := joinRelPath(parentRel, name)
+	sf, regErrno := newRegisteredSafeFile(fd, &st, n.slot, childRel, true, n.root.euid, n.root.egid)
 	if regErrno != 0 {
+		if createdNew {
+			_ = unix.Unlinkat(dirFD, name, 0)
+		}
 		return nil, nil, 0, regErrno
 	}
 	out.FromStat(&st)
-	n.applyAttrMask(&out.Attr, joinRelPath(parentRel, name))
-	ch := n.newChildInode(ctx, name, &st, &btime)
+	n.applyAttrMask(&out.Attr, childRel)
+	ch := n.newChildInode(ctx, &st, &btime)
 	return ch, sf, 0, 0
 }
 
-func (n *FilteredNode) Tmpfile(ctx context.Context, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+func (n *filteredNode) Tmpfile(ctx context.Context, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	rel, errno := n.checkMutationOnSelf()
 	if errno != 0 {
 		return nil, nil, 0, errno
@@ -1267,7 +1812,7 @@ func (n *FilteredNode) Tmpfile(ctx context.Context, flags uint32, mode uint32, o
 	defer unix.Close(dirFD)
 
 	cleanMode := sanitizeCreateMode(mode)
-	openFlags := int(flags&^syscall.O_APPEND) | unix.O_TMPFILE | unix.O_CLOEXEC
+	openFlags := sanitizeOpenFlags(flags, false) | unix.O_TMPFILE | unix.O_CLOEXEC
 	fd, err := unix.Openat(dirFD, ".", openFlags, cleanMode)
 	if err != nil {
 		return nil, nil, 0, fs.ToErrno(err)
@@ -1278,18 +1823,21 @@ func (n *FilteredNode) Tmpfile(ctx context.Context, flags uint32, mode uint32, o
 		_ = unix.Close(fd)
 		return nil, nil, 0, fs.ToErrno(err)
 	}
-	sf, regErrno := newRegisteredSafeFile(fd, n.slot, true, n.root.euid, n.root.egid)
+	sf, regErrno := newRegisteredSafeFile(fd, &st, n.slot, rel, true, n.root.euid, n.root.egid)
 	if regErrno != 0 {
 		return nil, nil, 0, regErrno
 	}
 	out.FromStat(&st)
 	n.applyAttrMask(&out.Attr, rel)
-	ch := n.newChildInode(ctx, "", &st, &btime)
+	ch := n.newChildInode(ctx, &st, &btime)
 	return ch, sf, 0, 0
 }
 
-func (n *FilteredNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	parentRel, errno := n.checkWritableChild(name, false)
+func (n *filteredNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
+	parentRel, errno := n.checkWritableChild(name, true)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1310,11 +1858,14 @@ func (n *FilteredNode) Mkdir(ctx context.Context, name string, mode uint32, out 
 	}
 	out.Attr.FromStat(&st)
 	n.applyAttrMask(&out.Attr, joinRelPath(parentRel, name))
-	return n.newChildInode(ctx, name, &st, &btime), 0
+	return n.newChildInode(ctx, &st, &btime), 0
 }
 
-func (n *FilteredNode) Mknod(ctx context.Context, name string, mode uint32, _ uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	parentRel, errno := n.checkWritableChild(name, false)
+func (n *filteredNode) Mknod(ctx context.Context, name string, mode uint32, _ uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
+	parentRel, errno := n.checkWritableChild(name, true)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1339,15 +1890,18 @@ func (n *FilteredNode) Mknod(ctx context.Context, name string, mode uint32, _ ui
 	}
 	out.Attr.FromStat(&st)
 	n.applyAttrMask(&out.Attr, joinRelPath(parentRel, name))
-	return n.newChildInode(ctx, name, &st, &btime), 0
+	return n.newChildInode(ctx, &st, &btime), 0
 }
 
-func (n *FilteredNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	parentRel, errno := n.checkWritableChild(name, false)
+func (n *filteredNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
+	parentRel, errno := n.checkWritableChild(name, true)
 	if errno != 0 {
 		return nil, errno
 	}
-	if errno := ValidateSymlinkTargetForPolicy(parentRel, name, target, n.hidden, n.vcsPolicy()); errno != 0 {
+	if errno := validateSymlinkTargetForPolicy(parentRel, name, target, n.hidden, n.vcsPolicy()); errno != 0 {
 		return nil, errno
 	}
 	dirFD, err := n.root.openat2(parentRel, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
@@ -1367,21 +1921,36 @@ func (n *FilteredNode) Symlink(ctx context.Context, target, name string, out *fu
 	}
 	out.Attr.FromStat(&st)
 	n.activeIDMap().applyAttr(&out.Attr)
-	return n.newChildInode(ctx, name, &st, &btime), 0
+	return n.newChildInode(ctx, &st, &btime), 0
 }
 
-func (n *FilteredNode) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	parentRel, errno := n.checkWritableChild(name, false)
-	if errno != 0 {
-		return nil, errno
-	}
-	src, ok := target.(*FilteredNode)
+func crossesVCSOrHookBoundary(fromRel, toRel string, hidden map[string]struct{}) bool {
+	return isVCSAdminPath(fromRel, hidden) != isVCSAdminPath(toRel, hidden) ||
+		isProtectedVCSHookRelPath(fromRel) != isProtectedVCSHookRelPath(toRel)
+}
+
+func (n *filteredNode) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	src, ok := target.(*filteredNode)
 	if !ok || src.root == nil || src.root != n.root || src.slot != n.slot {
 		return nil, syscall.EXDEV
 	}
-	if _, srcMutErr := src.checkMutationOnSelf(); srcMutErr != 0 {
+
+	n.slot.lockRename()
+	defer n.slot.unlockRename()
+
+	parentRel, errno := n.checkWritableChild(name, true)
+	if errno != 0 {
+		return nil, errno
+	}
+	srcRel, srcMutErr := src.checkMutationOnSelf()
+	if srcMutErr != 0 {
 		return nil, srcMutErr
 	}
+	dstRel := joinRelPath(parentRel, name)
+	if crossesVCSOrHookBoundary(srcRel, dstRel, n.hidden) {
+		return nil, syscall.EPERM
+	}
+
 	srcParentFD, _, srcBase, errno := src.openParentAndName()
 	if errno != 0 {
 		return nil, errno
@@ -1403,8 +1972,14 @@ func (n *FilteredNode) Link(ctx context.Context, target fs.InodeEmbedder, name s
 	}
 	defer unix.Close(dstDirFD)
 
+	if n.slot != nil {
+		n.slot.promoteOpenHandlesForRename(uint64(srcSt.Dev), srcSt.Ino, dstRel)
+	}
 	if err := unix.Linkat(srcParentFD, srcBase, dstDirFD, name, 0); err != nil {
 		return nil, fs.ToErrno(err)
+	}
+	if n.slot != nil {
+		n.slot.promoteOpenHandlesForRename(uint64(srcSt.Dev), srcSt.Ino, dstRel)
 	}
 	var st syscall.Stat_t
 	var btime syscall.Timespec
@@ -1413,11 +1988,11 @@ func (n *FilteredNode) Link(ctx context.Context, target fs.InodeEmbedder, name s
 		return nil, fs.ToErrno(err)
 	}
 	out.Attr.FromStat(&st)
-	n.applyAttrMask(&out.Attr, joinRelPath(parentRel, name))
-	return n.newChildInode(ctx, name, &st, &btime), 0
+	n.applyAttrMask(&out.Attr, dstRel)
+	return n.newChildInode(ctx, &st, &btime), 0
 }
 
-func (n *FilteredNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+func (n *filteredNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	_ = ctx
 	parentFD, parentRel, baseName, errno := n.openParentAndName()
 	if errno != 0 {
@@ -1425,23 +2000,17 @@ func (n *FilteredNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	}
 	defer unix.Close(parentFD)
 
-	for size := 256; ; size *= 2 {
-		buf := make([]byte, size)
-		sz, err := unix.Readlinkat(parentFD, baseName, buf)
-		if err != nil {
-			return nil, fs.ToErrno(err)
-		}
-		if sz < len(buf) {
-			target := string(buf[:sz])
-			if vErr := ValidateSymlinkTargetForPolicy(parentRel, baseName, target, n.hidden, n.vcsPolicy()); vErr != 0 {
-				return nil, syscall.EPERM
-			}
-			return buf[:sz], 0
-		}
+	raw, rlErrno := readlinkAtBounded(parentFD, baseName)
+	if rlErrno != 0 {
+		return nil, rlErrno
 	}
+	if vErr := validateSymlinkTargetForPolicy(parentRel, baseName, string(raw), n.hidden, n.vcsPolicy()); vErr != 0 {
+		return nil, syscall.EPERM
+	}
+	return raw, 0
 }
 
-func (n *FilteredNode) Rmdir(ctx context.Context, name string) syscall.Errno {
+func (n *filteredNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	_ = ctx
 	parentRel, errno := n.checkWritableChild(name, true)
 	if errno != 0 {
@@ -1455,7 +2024,7 @@ func (n *FilteredNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	return fs.ToErrno(unix.Unlinkat(dirFD, name, unix.AT_REMOVEDIR))
 }
 
-func (n *FilteredNode) Unlink(ctx context.Context, name string) syscall.Errno {
+func (n *filteredNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	_ = ctx
 	parentRel, errno := n.checkWritableChild(name, true)
 	if errno != 0 {
@@ -1469,16 +2038,153 @@ func (n *FilteredNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	return fs.ToErrno(unix.Unlinkat(dirFD, name, 0))
 }
 
-func (n *FilteredNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	_ = ctx
-	if _, errno := n.checkWritableChild(name, true); errno != 0 {
-		return errno
+func validateMovedEntryOrSubtree(parentFD int, entryName, fromParentRel, fromName, toParentRel, toName string, st *syscall.Stat_t, hidden map[string]struct{}, policy config.VCSPolicy) ([]movedHandleTarget, syscall.Errno) {
+	fromRel := joinRelPath(fromParentRel, fromName)
+	toRel := joinRelPath(toParentRel, toName)
+	modeType := st.Mode & syscall.S_IFMT
+
+	if modeType == syscall.S_IFLNK {
+		raw, rlErr := readlinkAtBounded(parentFD, entryName)
+		if rlErr != 0 {
+			return nil, syscall.EPERM
+		}
+		if vErr := validateSymlinkTargetForPolicy(toParentRel, toName, string(raw), hidden, policy); vErr != 0 {
+			return nil, syscall.EPERM
+		}
+		return nil, 0
 	}
-	dst, ok := newParent.(*FilteredNode)
+
+	if modeType == syscall.S_IFREG && st.Nlink != 1 && crossesVCSOrHookBoundary(fromRel, toRel, hidden) {
+		return nil, syscall.EPERM
+	}
+
+	targets := []movedHandleTarget{{
+		dev:    uint64(st.Dev),
+		ino:    st.Ino,
+		dstRel: toRel,
+	}}
+	if modeType != syscall.S_IFDIR {
+		return targets, 0
+	}
+
+	subFD, err := openat2FromDir(parentFD, entryName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	defer unix.Close(subFD)
+
+	visited := 0
+	if wErr := walkMovedDir(subFD, fromRel, toRel, 1, &visited, hidden, policy, &targets); wErr != 0 {
+		return nil, wErr
+	}
+	return targets, 0
+}
+
+func walkMovedDir(dirFD int, curFromRel, curToRel string, depth int, visited *int, hidden map[string]struct{}, policy config.VCSPolicy, targets *[]movedHandleTarget) syscall.Errno {
+	if depth > maxRenameWalkDepth {
+		return syscall.EPERM
+	}
+	dupFD, err := unix.Dup(dirFD)
+	if err != nil {
+		return fs.ToErrno(err)
+	}
+	unix.CloseOnExec(dupFD)
+	dirFile := os.NewFile(uintptr(dupFD), "")
+	names, rErr := dirFile.Readdirnames(-1)
+	_ = dirFile.Close()
+	if rErr != nil {
+		return fs.ToErrno(rErr)
+	}
+
+	for _, childName := range names {
+		if childName == "" || childName == "." || childName == ".." {
+			continue
+		}
+		*visited++
+		if *visited > maxRenameWalkEntries {
+			return syscall.EPERM
+		}
+		if policy == config.VCSMask && isHiddenEntry(childName, hidden) {
+			continue
+		}
+
+		childFromRel := joinRelPath(curFromRel, childName)
+		childToRel := joinRelPath(curToRel, childName)
+		if policy == config.VCSAllow {
+			if isTopLevelVCSAdminDir(childName) {
+				return syscall.EPERM
+			}
+			if isProtectedVCSHookRelPath(childFromRel) || isProtectedVCSHookRelPath(childToRel) {
+				return syscall.EPERM
+			}
+		}
+
+		var childSt syscall.Stat_t
+		var childBtime syscall.Timespec
+		if err := statAtNoFollow(dirFD, childName, &childSt, &childBtime); err != nil {
+			return fs.ToErrno(err)
+		}
+		childType := childSt.Mode & syscall.S_IFMT
+		if childType == syscall.S_IFLNK {
+			raw, rlErr := readlinkAtBounded(dirFD, childName)
+			if rlErr != 0 {
+				return syscall.EPERM
+			}
+			if vErr := validateSymlinkTargetForPolicy(curToRel, childName, string(raw), hidden, policy); vErr != 0 {
+				return syscall.EPERM
+			}
+			continue
+		}
+		if childType == syscall.S_IFREG && childSt.Nlink != 1 && crossesVCSOrHookBoundary(childFromRel, childToRel, hidden) {
+			return syscall.EPERM
+		}
+		*targets = append(*targets, movedHandleTarget{
+			dev:    uint64(childSt.Dev),
+			ino:    childSt.Ino,
+			dstRel: childToRel,
+		})
+		if childType == syscall.S_IFDIR {
+			childDirFD, oErr := openat2FromDir(dirFD, childName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+			if oErr != nil {
+				return fs.ToErrno(oErr)
+			}
+			wErrno := walkMovedDir(childDirFD, childFromRel, childToRel, depth+1, visited, hidden, policy, targets)
+			_ = unix.Close(childDirFD)
+			if wErrno != 0 {
+				return wErrno
+			}
+		}
+	}
+	return 0
+}
+
+func (n *filteredNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	_ = ctx
+	if flags&unix.RENAME_WHITEOUT != 0 {
+		return syscall.EPERM
+	}
+	allowedFlags := uint32(unix.RENAME_NOREPLACE | unix.RENAME_EXCHANGE)
+	if flags&^allowedFlags != 0 {
+		return syscall.EINVAL
+	}
+	if flags&unix.RENAME_NOREPLACE != 0 && flags&unix.RENAME_EXCHANGE != 0 {
+		return syscall.EINVAL
+	}
+
+	dst, ok := newParent.(*filteredNode)
 	if !ok || dst.root == nil || dst.root != n.root || dst.slot != n.slot {
 		return syscall.EXDEV
 	}
-	if _, errno := dst.checkWritableChild(newName, true); errno != 0 {
+
+	n.slot.lockRename()
+	defer n.slot.unlockRename()
+
+	srcParentRel, errno := n.checkWritableChild(name, true)
+	if errno != 0 {
+		return errno
+	}
+	dstParentRel, errno := dst.checkWritableChild(newName, true)
+	if errno != 0 {
 		return errno
 	}
 
@@ -1507,10 +2213,57 @@ func (n *FilteredNode) Rename(ctx context.Context, name string, newParent fs.Ino
 	if !dst.isRoot && dst.Inode.StableAttr().Ino != dst.stableAttr(&st, nil).Ino {
 		return syscall.EBUSY
 	}
-	return fs.ToErrno(unix.Renameat2(fd1, name, fd2, newName, uint(flags)))
+
+	policy := n.vcsPolicy()
+	var srcSt syscall.Stat_t
+	var srcBtime syscall.Timespec
+	if err := statAtNoFollow(fd1, name, &srcSt, &srcBtime); err != nil {
+		return fs.ToErrno(err)
+	}
+	srcTargets, vErr := validateMovedEntryOrSubtree(fd1, name, srcParentRel, name, dstParentRel, newName, &srcSt, n.hidden, policy)
+	if vErr != 0 {
+		return vErr
+	}
+
+	var dstSt syscall.Stat_t
+	var dstBtime syscall.Timespec
+	hasDst := false
+	if err := statAtNoFollow(fd2, newName, &dstSt, &dstBtime); err == nil {
+		hasDst = true
+	} else if flags&unix.RENAME_EXCHANGE != 0 || !errors.Is(err, syscall.ENOENT) {
+		return fs.ToErrno(err)
+	}
+
+	var dstTargets []movedHandleTarget
+	if flags&unix.RENAME_EXCHANGE != 0 {
+		var exErr syscall.Errno
+		dstTargets, exErr = validateMovedEntryOrSubtree(fd2, newName, dstParentRel, newName, srcParentRel, name, &dstSt, dst.hidden, policy)
+		if exErr != 0 {
+			return exErr
+		}
+	}
+
+	if n.slot != nil {
+		n.slot.promoteOpenHandles(srcTargets)
+		if flags&unix.RENAME_EXCHANGE != 0 && hasDst {
+			n.slot.promoteOpenHandles(dstTargets)
+		}
+	}
+
+	if err := unix.Renameat2(fd1, name, fd2, newName, uint(flags)); err != nil {
+		return fs.ToErrno(err)
+	}
+
+	if n.slot != nil {
+		n.slot.promoteOpenHandles(srcTargets)
+		if flags&unix.RENAME_EXCHANGE != 0 && hasDst {
+			n.slot.promoteOpenHandles(dstTargets)
+		}
+	}
+	return 0
 }
 
-func (n *FilteredNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+func (n *filteredNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	if f != nil {
 		if fga, ok := f.(fs.FileGetattrer); ok {
 			return fga.Getattr(ctx, out)
@@ -1530,7 +2283,7 @@ func (n *FilteredNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.A
 	return 0
 }
 
-func (n *FilteredNode) Statx(ctx context.Context, f fs.FileHandle, flags uint32, mask uint32, out *fuse.StatxOut) syscall.Errno {
+func (n *filteredNode) Statx(ctx context.Context, f fs.FileHandle, flags uint32, mask uint32, out *fuse.StatxOut) syscall.Errno {
 	if f != nil {
 		if fga, ok := f.(fs.FileStatxer); ok {
 			errno := fga.Statx(ctx, flags, mask, out)
@@ -1561,7 +2314,7 @@ func (n *FilteredNode) Statx(ctx context.Context, f fs.FileHandle, flags uint32,
 	return 0
 }
 
-func (n *FilteredNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+func (n *filteredNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	if n.root == nil {
 		return syscall.EIO
 	}
@@ -1588,61 +2341,13 @@ func (n *FilteredNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Se
 	if err := syscall.Fstat(fd, &st); err != nil {
 		return fs.ToErrno(err)
 	}
-
-	if (st.Mode & syscall.S_IFMT) == syscall.S_IFLNK {
-		if _, ok := in.GetMode(); ok {
-			return syscall.EOPNOTSUPP
-		}
-		if _, ok := in.GetSize(); ok {
-			return syscall.EINVAL
-		}
-		mtime, mok := in.GetMTime()
-		atime, aok := in.GetATime()
-		if mok || aok {
-			parentFD, _, baseName, pErr := n.openParentAndName()
-			if pErr != 0 {
-				return pErr
-			}
-			defer unix.Close(parentFD)
-			ts, tErr := buildTimespecs(atime, aok, mtime, mok)
-			if tErr != 0 {
-				return tErr
-			}
-			if err := unix.UtimesNanoAt(parentFD, baseName, ts, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-				return fs.ToErrno(err)
-			}
-			if err := syscall.Fstat(fd, &st); err != nil {
-				return fs.ToErrno(err)
-			}
-		}
-		out.FromStat(&st)
-		n.activeIDMap().applyAttr(&out.Attr)
-		return 0
+	fileType := st.Mode & syscall.S_IFMT
+	if fileType != syscall.S_IFREG && fileType != syscall.S_IFDIR {
+		return syscall.EPERM
 	}
 
-	// Operate on the pinned O_PATH descriptor through /proc/self/fd/<fd>.
-	// This avoids path re-traversal races and works on mode 0000 regular files.
-	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
-	if m, ok := in.GetMode(); ok {
-		if err := syscall.Chmod(procPath, sanitizeCreateMode(m)); err != nil {
-			return fs.ToErrno(err)
-		}
-	}
-	if sz, ok := in.GetSize(); ok {
-		if err := syscall.Truncate(procPath, int64(sz)); err != nil {
-			return fs.ToErrno(err)
-		}
-	}
-	mtime, mok := in.GetMTime()
-	atime, aok := in.GetATime()
-	if mok || aok {
-		ts, tErr := buildTimespecs(atime, aok, mtime, mok)
-		if tErr != 0 {
-			return tErr
-		}
-		if err := unix.UtimesNanoAt(unix.AT_FDCWD, procPath, ts, 0); err != nil {
-			return fs.ToErrno(err)
-		}
+	if errno := applyProcFDSetattr(fd, in, fileType == syscall.S_IFDIR); errno != 0 {
+		return errno
 	}
 	if err := syscall.Fstat(fd, &st); err != nil {
 		return fs.ToErrno(err)
@@ -1671,9 +2376,9 @@ func buildTimespecs(atime time.Time, aok bool, mtime time.Time, mok bool) ([]uni
 	return []unix.Timespec{ta, tm}, 0
 }
 
-func (n *FilteredNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+func (n *filteredNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
 	_ = ctx
-	if IsProtectedXattr(attr) {
+	if isProtectedXattr(attr) {
 		return 0, unix.ENODATA
 	}
 	fd, _, errno := n.openNodeOPath()
@@ -1686,14 +2391,21 @@ func (n *FilteredNode) Getxattr(ctx context.Context, attr string, dest []byte) (
 	if err := syscall.Fstat(fd, &st); err != nil {
 		return 0, fs.ToErrno(err)
 	}
-	if (st.Mode & syscall.S_IFMT) == syscall.S_IFLNK {
+	fileType := st.Mode & syscall.S_IFMT
+	if fileType == syscall.S_IFLNK {
 		return 0, unix.ENODATA
+	}
+	if fileType != syscall.S_IFREG && fileType != syscall.S_IFDIR {
+		return 0, syscall.EPERM
 	}
 	sz, err := unix.Getxattr(fmt.Sprintf("/proc/self/fd/%d", fd), attr, dest)
-	return uint32(sz), fs.ToErrno(err)
+	if err != nil {
+		return 0, fs.ToErrno(err)
+	}
+	return uint32(sz), 0
 }
 
-func (n *FilteredNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+func (n *filteredNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
 	_ = ctx
 	fd, _, errno := n.openNodeOPath()
 	if errno != 0 {
@@ -1705,50 +2417,22 @@ func (n *FilteredNode) Listxattr(ctx context.Context, dest []byte) (uint32, sysc
 	if err := syscall.Fstat(fd, &st); err != nil {
 		return 0, fs.ToErrno(err)
 	}
-	if (st.Mode & syscall.S_IFMT) == syscall.S_IFLNK {
+	fileType := st.Mode & syscall.S_IFMT
+	if fileType == syscall.S_IFLNK {
 		return 0, 0
 	}
-	// Operate on the pinned O_PATH descriptor through /proc/self/fd/<fd>.
-	// This avoids path re-traversal races and works on mode 0000 regular files.
-	procPath := fmt.Sprintf("/proc/self/fd/%d", fd)
-	sz, err := unix.Listxattr(procPath, nil)
-	if err != nil {
-		return 0, fs.ToErrno(err)
+	if fileType != syscall.S_IFREG && fileType != syscall.S_IFDIR {
+		return 0, syscall.EPERM
 	}
-	if sz <= 0 {
-		return 0, 0
-	}
-	raw := make([]byte, sz)
-	nRead, err := unix.Listxattr(procPath, raw)
-	if err != nil {
-		return 0, fs.ToErrno(err)
-	}
-	var filtered []byte
-	for _, entry := range bytes.Split(raw[:nRead], []byte{0}) {
-		if len(entry) == 0 {
-			continue
-		}
-		if !IsProtectedXattr(string(entry)) {
-			filtered = append(filtered, entry...)
-			filtered = append(filtered, 0)
-		}
-	}
-	if len(dest) == 0 {
-		return uint32(len(filtered)), 0
-	}
-	if len(dest) < len(filtered) {
-		return uint32(len(filtered)), syscall.ERANGE
-	}
-	copy(dest, filtered)
-	return uint32(len(filtered)), 0
+	return listFilteredXattrs(fd, dest)
 }
 
-func (n *FilteredNode) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+func (n *filteredNode) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
 	_ = ctx
 	if _, mutErr := n.checkMutationOnSelf(); mutErr != 0 {
 		return mutErr
 	}
-	if IsProtectedXattr(attr) {
+	if isProtectedXattr(attr) {
 		return syscall.EPERM
 	}
 	fd, _, errno := n.openNodeOPath()
@@ -1761,19 +2445,20 @@ func (n *FilteredNode) Setxattr(ctx context.Context, attr string, data []byte, f
 	if err := syscall.Fstat(fd, &st); err != nil {
 		return fs.ToErrno(err)
 	}
-	if (st.Mode & syscall.S_IFMT) == syscall.S_IFLNK {
+	fileType := st.Mode & syscall.S_IFMT
+	if fileType != syscall.S_IFREG && fileType != syscall.S_IFDIR {
 		return syscall.EPERM
 	}
 	err := unix.Setxattr(fmt.Sprintf("/proc/self/fd/%d", fd), attr, data, int(flags))
 	return fs.ToErrno(err)
 }
 
-func (n *FilteredNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
+func (n *filteredNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	_ = ctx
 	if _, mutErr := n.checkMutationOnSelf(); mutErr != 0 {
 		return mutErr
 	}
-	if IsProtectedXattr(attr) {
+	if isProtectedXattr(attr) {
 		return syscall.EPERM
 	}
 	fd, _, errno := n.openNodeOPath()
@@ -1786,14 +2471,15 @@ func (n *FilteredNode) Removexattr(ctx context.Context, attr string) syscall.Err
 	if err := syscall.Fstat(fd, &st); err != nil {
 		return fs.ToErrno(err)
 	}
-	if (st.Mode & syscall.S_IFMT) == syscall.S_IFLNK {
+	fileType := st.Mode & syscall.S_IFMT
+	if fileType != syscall.S_IFREG && fileType != syscall.S_IFDIR {
 		return syscall.EPERM
 	}
 	err := unix.Removexattr(fmt.Sprintf("/proc/self/fd/%d", fd), attr)
 	return fs.ToErrno(err)
 }
 
-func (n *FilteredNode) CopyFileRange(ctx context.Context, fhIn fs.FileHandle, offIn uint64, out *fs.Inode, fhOut fs.FileHandle, offOut uint64, length uint64, flags uint64) (uint32, syscall.Errno) {
+func (n *filteredNode) CopyFileRange(ctx context.Context, fhIn fs.FileHandle, offIn uint64, out *fs.Inode, fhOut fs.FileHandle, offOut uint64, length uint64, flags uint64) (uint32, syscall.Errno) {
 	sfIn, ok := fhIn.(*safeFile)
 	if !ok {
 		return 0, unix.ENOTSUP
@@ -1802,89 +2488,199 @@ func (n *FilteredNode) CopyFileRange(ctx context.Context, fhIn fs.FileHandle, of
 	if !ok {
 		return 0, unix.ENOTSUP
 	}
-	if dstNode, ok := out.Operations().(*FilteredNode); ok {
+	if dstNode, ok := out.Operations().(*filteredNode); ok {
 		if _, mutErr := dstNode.checkMutationOnSelf(); mutErr != 0 {
 			return 0, mutErr
 		}
 	}
-	sfIn.mu.RLock()
-	defer sfIn.mu.RUnlock()
-	if sfIn.revokedErr != 0 {
-		return 0, sfIn.revokedErr
-	}
-	if sfIn.raw == nil {
-		return 0, syscall.EBADF
-	}
-	if sfOut != sfIn {
+
+	// Lock safeFile instances in ascending monotonic ID order to avoid AB-BA deadlocks.
+	if sfIn == sfOut {
+		sfIn.mu.RLock()
+		defer sfIn.mu.RUnlock()
+	} else if sfIn.id < sfOut.id {
+		sfIn.mu.RLock()
+		defer sfIn.mu.RUnlock()
 		sfOut.mu.RLock()
 		defer sfOut.mu.RUnlock()
+	} else {
+		sfOut.mu.RLock()
+		defer sfOut.mu.RUnlock()
+		sfIn.mu.RLock()
+		defer sfIn.mu.RUnlock()
 	}
-	if sfOut.revokedErr != 0 {
-		return 0, sfOut.revokedErr
+
+	if errno := sfIn.checkAccessLocked(false); errno != 0 {
+		return 0, errno
 	}
-	if sfOut.slot != nil && sfOut.slot.isReadOnly() {
-		return 0, syscall.EROFS
-	}
-	if sfOut.raw == nil {
-		return 0, syscall.EBADF
+	if errno := sfOut.checkAccessLocked(true); errno != 0 {
+		return 0, errno
 	}
 	return n.LoopbackNode.CopyFileRange(ctx, sfIn.raw, offIn, out, sfOut.raw, offOut, length, flags)
 }
 
-func (n *FilteredNode) activeHiddenMap() map[string]struct{} {
+func (n *filteredNode) activeHiddenMap() map[string]struct{} {
 	if n.vcsPolicy() != config.VCSMask {
 		return nil
 	}
 	return n.hidden
 }
 
-func (n *FilteredNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
-	_ = ctx
-	dirFD, errno := n.openDirFD()
+func (n *filteredNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	fh, _, errno := n.OpendirHandle(ctx, 0)
 	if errno != 0 {
 		return nil, errno
 	}
-	ds, errno := fs.NewLoopbackDirStreamFd(dirFD)
-	if errno != 0 {
-		_ = unix.Close(dirFD)
-		return nil, errno
-	}
-	return &filteredStream{inner: ds, hidden: n.activeHiddenMap()}, 0
+	return &registeredDirStream{ctx: ctx, dir: fh.(*filteredDir)}, 0
 }
 
-// OpendirHandle intercepts directory opens on all nodes in the filtered tree.
-// It opens the directory with openat2 and forwards Releasedir, Seekdir, and
-// Fsyncdir while omitting raw ioctl forwarding.
-func (n *FilteredNode) OpendirHandle(ctx context.Context, _ uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	_ = ctx
+// OpendirHandle intercepts directory opens across the filtered tree.
+// It opens directories with openat2, registers handles for revocation, and omits ioctl.
+func (n *filteredNode) OpendirHandle(ctx context.Context, _ uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
+	if n.isRevoked() {
+		return nil, 0, syscall.ESTALE
+	}
+	rel, errno := n.validatedRelPath()
+	if errno != 0 {
+		return nil, 0, errno
+	}
 	dirFD, errno := n.openDirFD()
 	if errno != 0 {
 		return nil, 0, errno
+	}
+	var dirSt syscall.Stat_t
+	if err := syscall.Fstat(dirFD, &dirSt); err != nil {
+		_ = unix.Close(dirFD)
+		return nil, 0, fs.ToErrno(err)
 	}
 	ds, errno := fs.NewLoopbackDirStreamFd(dirFD)
 	if errno != 0 {
 		_ = unix.Close(dirFD)
 		return nil, 0, errno
 	}
-	if rd, ok := ds.(fs.FileReaddirenter); ok {
-		return &filteredDir{inner: rd, raw: ds, hidden: n.activeHiddenMap()}, 0, 0
+	rd, _ := ds.(fs.FileReaddirenter)
+	var hidden map[string]struct{}
+	if n.slot != nil {
+		hidden = n.slot.hidden
+	} else {
+		hidden = n.hidden
 	}
-	return ds, 0, 0
+	isVCS := isVCSAdminPath(rel, hidden)
+	fd, regErrno := newRegisteredFilteredDir(ds, rd, n.slot, rel, uint64(dirSt.Dev), dirSt.Ino, isVCS, n.activeHiddenMap())
+	if regErrno != 0 {
+		if r, ok := ds.(fs.FileReleasedirer); ok {
+			r.Releasedir(ctx, 0)
+		}
+		return nil, 0, regErrno
+	}
+	return fd, 0, 0
 }
 
 type filteredDir struct {
-	inner  fs.FileReaddirenter
-	raw    fs.FileHandle
-	hidden map[string]struct{}
+	mu         sync.RWMutex
+	slot       *shareSlot
+	relPath    string
+	dev        uint64
+	ino        uint64
+	isVCS      atomic.Bool
+	inner      fs.FileReaddirenter
+	raw        fs.FileHandle
+	hidden     map[string]struct{}
+	revokedErr syscall.Errno
+}
+
+func newRegisteredFilteredDir(raw fs.FileHandle, inner fs.FileReaddirenter, slot *shareSlot, relPath string, dev, ino uint64, isVCS bool, hidden map[string]struct{}) (*filteredDir, syscall.Errno) {
+	fd := &filteredDir{
+		slot:    slot,
+		relPath: relPath,
+		dev:     dev,
+		ino:     ino,
+		inner:   inner,
+		raw:     raw,
+		hidden:  hidden,
+	}
+	fd.isVCS.Store(isVCS)
+	if slot != nil {
+		if errno := slot.registerDir(fd); errno != 0 {
+			fd.revokedErr = errno
+			return nil, errno
+		}
+	}
+	return fd, 0
+}
+
+func (d *filteredDir) revoke(errno syscall.Errno) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if errno == 0 {
+		errno = syscall.ESTALE
+	}
+	if d.revokedErr == 0 {
+		d.revokedErr = errno
+	}
+	raw := d.raw
+	d.raw = nil
+	d.inner = nil
+	if r, ok := raw.(fs.FileReleasedirer); ok {
+		r.Releasedir(context.Background(), 0)
+	}
+}
+
+func (d *filteredDir) isEntryHidden(name string) bool {
+	if d.slot != nil {
+		if d.slot.getVCSPolicy() != config.VCSMask {
+			return false
+		}
+		if d.slot.hidden != nil {
+			return isHiddenEntry(name, d.slot.hidden)
+		}
+	}
+	if d.hidden != nil {
+		return isHiddenEntry(name, d.hidden)
+	}
+	return false
 }
 
 func (d *filteredDir) Readdirent(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if d.revokedErr != 0 {
+		return nil, d.revokedErr
+	}
+	if d.slot != nil {
+		if d.slot.isRevoked() || (d.isVCS.Load() && d.slot.getVCSPolicy() == config.VCSMask) {
+			return nil, syscall.ESTALE
+		}
+	}
+	if d.inner == nil && d.raw == nil {
+		return nil, syscall.EBADF
+	}
+
 	for {
-		de, errno := d.inner.Readdirent(ctx)
+		var de *fuse.DirEntry
+		var errno syscall.Errno
+		if d.inner != nil {
+			de, errno = d.inner.Readdirent(ctx)
+		} else if s, ok := d.raw.(fs.DirStream); ok {
+			if !s.HasNext() {
+				return nil, 0
+			}
+			entry, sErr := s.Next()
+			if sErr != 0 {
+				return nil, sErr
+			}
+			de = &entry
+		} else {
+			return nil, syscall.EBADF
+		}
 		if errno != 0 || de == nil {
 			return de, errno
 		}
-		if d.hidden != nil && isHiddenEntry(de.Name, d.hidden) {
+		if d.isEntryHidden(de.Name) {
 			continue
 		}
 		return de, 0
@@ -1892,12 +2688,28 @@ func (d *filteredDir) Readdirent(ctx context.Context) (*fuse.DirEntry, syscall.E
 }
 
 func (d *filteredDir) Releasedir(ctx context.Context, releaseFlags uint32) {
-	if r, ok := d.raw.(fs.FileReleasedirer); ok {
+	if d.slot != nil {
+		d.slot.unregisterDir(d)
+	}
+	d.mu.Lock()
+	raw := d.raw
+	d.raw = nil
+	d.inner = nil
+	d.mu.Unlock()
+	if r, ok := raw.(fs.FileReleasedirer); ok {
 		r.Releasedir(ctx, releaseFlags)
 	}
 }
 
 func (d *filteredDir) Seekdir(ctx context.Context, off uint64) syscall.Errno {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.revokedErr != 0 {
+		return d.revokedErr
+	}
+	if d.slot != nil && (d.slot.isRevoked() || (d.isVCS.Load() && d.slot.getVCSPolicy() == config.VCSMask)) {
+		return syscall.ESTALE
+	}
 	if s, ok := d.raw.(fs.FileSeekdirer); ok {
 		return s.Seekdir(ctx, off)
 	}
@@ -1905,62 +2717,70 @@ func (d *filteredDir) Seekdir(ctx context.Context, off uint64) syscall.Errno {
 }
 
 func (d *filteredDir) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.revokedErr != 0 {
+		return d.revokedErr
+	}
+	if d.slot != nil && (d.slot.isRevoked() || (d.isVCS.Load() && d.slot.getVCSPolicy() == config.VCSMask)) {
+		return syscall.ESTALE
+	}
 	if f, ok := d.raw.(fs.FileFsyncdirer); ok {
 		return f.Fsyncdir(ctx, flags)
 	}
 	return syscall.ENOTSUP
 }
 
-type filteredStream struct {
-	inner  fs.DirStream
-	hidden map[string]struct{}
+type registeredDirStream struct {
+	ctx    context.Context
+	dir    *filteredDir
 	peeked *fuse.DirEntry
 	peekEr syscall.Errno
 	hasPk  bool
 }
 
-func (f *filteredStream) advance() {
-	for f.inner.HasNext() {
-		de, errno := f.inner.Next()
-		if errno != 0 {
-			f.peekEr = errno
-			f.hasPk = true
-			return
-		}
-		if f.hidden != nil && isHiddenEntry(de.Name, f.hidden) {
-			continue
-		}
-		f.peeked = &de
-		f.peekEr = 0
-		f.hasPk = true
+func (s *registeredDirStream) advance() {
+	de, errno := s.dir.Readdirent(s.ctx)
+	if errno != 0 {
+		s.peeked = nil
+		s.peekEr = errno
+		s.hasPk = true
 		return
 	}
-	f.hasPk = false
-}
-
-func (f *filteredStream) HasNext() bool {
-	if !f.hasPk {
-		f.advance()
+	if de == nil {
+		s.hasPk = false
+		return
 	}
-	return f.hasPk
+	s.peeked = de
+	s.peekEr = 0
+	s.hasPk = true
 }
 
-func (f *filteredStream) Next() (fuse.DirEntry, syscall.Errno) {
-	if !f.hasPk {
-		f.advance()
+func (s *registeredDirStream) HasNext() bool {
+	if !s.hasPk {
+		s.advance()
 	}
-	f.hasPk = false
-	if f.peekEr != 0 || f.peeked == nil {
-		return fuse.DirEntry{}, f.peekEr
+	return s.hasPk
+}
+
+func (s *registeredDirStream) Next() (fuse.DirEntry, syscall.Errno) {
+	if !s.hasPk {
+		s.advance()
 	}
-	return *f.peeked, 0
+	s.hasPk = false
+	if s.peekEr != 0 || s.peeked == nil {
+		return fuse.DirEntry{}, s.peekEr
+	}
+	return *s.peeked, 0
 }
 
-func (f *filteredStream) Close() {
-	f.inner.Close()
+func (s *registeredDirStream) Close() {
+	if s.dir != nil {
+		s.dir.Releasedir(s.ctx, 0)
+	}
 }
 
-func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t, slot *shareSlot) *FilteredNode {
+func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t, slot *shareSlot) *filteredNode {
 	var idMap guestIDMap
 	if slot != nil {
 		idMap = slot.idMap
@@ -1970,7 +2790,7 @@ func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t
 		Dev:  uint64(st.Dev),
 	}
 	rootData.NewNode = func(rd *fs.LoopbackRoot, _ *fs.Inode, _ string, _ *syscall.Stat_t) fs.InodeEmbedder {
-		return &FilteredNode{
+		return &filteredNode{
 			LoopbackNode: &fs.LoopbackNode{RootData: rd},
 			root:         pr,
 			slot:         slot,
@@ -1978,7 +2798,7 @@ func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t
 			idMap:        idMap,
 		}
 	}
-	root := &FilteredNode{
+	root := &filteredNode{
 		LoopbackNode: &fs.LoopbackNode{RootData: rootData},
 		root:         pr,
 		slot:         slot,
@@ -1990,17 +2810,16 @@ func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t
 	return root
 }
 
-// Mount mounts a VCS-filtered loopback view of srcDir onto mntDir and returns
-// the running FUSE server. Call server.Unmount() and server.Wait() to stop it.
-func Mount(srcDir, mntDir string, hiddenEntries []string) (*fuse.Server, error) {
-	return MountWithIDMap(srcDir, mntDir, hiddenEntries, false, 0, 0)
+// mount mounts a VCS-filtered loopback view of srcDir onto mntDir.
+func mount(srcDir, mntDir string, hiddenEntries []string) (*fuse.Server, error) {
+	return mountWithIDMap(srcDir, mntDir, hiddenEntries, false, 0, 0)
 }
 
-// MountWithIDMap mounts a VCS-filtered loopback view of srcDir onto mntDir
-// while optionally presenting mapped guest UID and GID ownership values.
-func MountWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs bool, guestUID, guestGID uint32) (*fuse.Server, error) {
+// mountWithIDMap mounts a VCS-filtered loopback view of srcDir onto mntDir
+// with optional guest UID and GID mapping.
+func mountWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs bool, guestUID, guestGID uint32) (*fuse.Server, error) {
 	if srcDir == "" || mntDir == "" {
-		return nil, errors.New("both source and mount directories are required")
+		return nil, errors.New("source and mount directories must not be empty")
 	}
 	resolvedSrc, err := filepath.EvalSymlinks(srcDir)
 	if err != nil {
@@ -2012,6 +2831,8 @@ func MountWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs b
 	}
 	hidden := buildHiddenSet(hiddenEntries)
 	slot := newShareSlotWithIDMap(0, "", resolvedSrc, false, "", pr, hidden, false, config.VCSMask, newGuestIDMap(mapGuestIDs, guestUID, guestGID))
+	slot.initDev = uint64(st.Dev)
+	slot.initIno = st.Ino
 	root := buildRootFilteredNode(resolvedSrc, pr, st, slot)
 
 	sec := time.Second
@@ -2022,7 +2843,7 @@ func MountWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs b
 			FsName:      resolvedSrc,
 			Name:        "agboxfilter",
 			Options:     []string{"nosuid", "nodev"},
-			DirectMount: os.Geteuid() == 0,
+			DirectMount: pr.euid == 0,
 		},
 	}
 
@@ -2034,19 +2855,37 @@ func MountWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs b
 	return server, nil
 }
 
-// CheckHostSupport verifies that /dev/fuse, fusermount3 or fusermount, and an
-// end-to-end VCS filter mount succeed under parentDir.
+// CheckHostSupport checks /dev/fuse, fusermount3 or fusermount, and a live
+// VCS filter mount under parentDir.
 func CheckHostSupport(parentDir string) error {
+	return checkHostSupportWith(parentDir, os.Geteuid, exec.LookPath)
+}
+
+func checkHostSupportWith(parentDir string, geteuid func() int, lookPath func(string) (string, error)) error {
+	if parentDir == "" {
+		return errors.New("parent directory must not be empty")
+	}
+	info, err := os.Lstat(parentDir)
+	if err != nil {
+		return fmt.Errorf("probe parent dir: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlinked probe parent dir %q", parentDir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("probe parent dir %q is not a directory", parentDir)
+	}
+
 	f, err := os.OpenFile("/dev/fuse", os.O_RDWR, 0)
 	if err != nil {
-		return fmt.Errorf("/dev/fuse is not accessible: %w", err)
+		return fmt.Errorf("cannot open /dev/fuse: %w", err)
 	}
 	_ = f.Close()
 
-	if os.Geteuid() != 0 {
-		if _, err3 := exec.LookPath("fusermount3"); err3 != nil {
-			if _, err2 := exec.LookPath("fusermount"); err2 != nil {
-				return errors.New("fusermount3 is missing (install fuse3: sudo apt-get install -y fuse3)")
+	if geteuid() != 0 {
+		if _, err3 := lookPath("fusermount3"); err3 != nil {
+			if _, err2 := lookPath("fusermount"); err2 != nil {
+				return errors.New("fusermount3 is missing. Run: sudo apt-get install -y fuse3")
 			}
 		}
 	}
@@ -2055,8 +2894,11 @@ func CheckHostSupport(parentDir string) error {
 	if err != nil {
 		return fmt.Errorf("create FUSE probe dir: %w", err)
 	}
+	keepProbeRoot := false
 	defer func() {
-		_ = os.RemoveAll(probeRoot)
+		if !keepProbeRoot {
+			_ = os.RemoveAll(probeRoot)
+		}
 	}()
 
 	srcDir := filepath.Join(probeRoot, "src")
@@ -2068,37 +2910,41 @@ func CheckHostSupport(parentDir string) error {
 		return fmt.Errorf("create FUSE probe mountpoint: %w", err)
 	}
 
-	server, err := Mount(srcDir, mntDir, DefaultHiddenEntries)
+	server, err := mount(srcDir, mntDir, defaultHiddenEntries())
 	if err != nil {
 		return fmt.Errorf("FUSE smoke test failed: %w", err)
 	}
-	unmountErr := server.Unmount()
-	server.Wait()
-	if unmountErr != nil {
+	if unmountErr := server.Unmount(); unmountErr != nil {
+		if tdErr := mounttab.TeardownFilterDir(probeRoot, nil); tdErr != nil {
+			keepProbeRoot = true
+			return fmt.Errorf("FUSE probe unmount failed: %w", unmountErr)
+		}
+		server.Wait()
 		return fmt.Errorf("FUSE probe unmount failed: %w", unmountErr)
 	}
+	server.Wait()
 	return nil
 }
 
-// RunDaemon mounts srcDir onto mntDir and blocks until the filesystem is
-// unmounted or a termination signal (SIGINT, SIGTERM, SIGHUP) arrives.
-func RunDaemon(srcDir, mntDir string, hiddenEntries []string) error {
-	return RunDaemonWithIDMap(srcDir, mntDir, hiddenEntries, false, 0, 0)
-}
+// runDaemonWithIDMap mounts srcDir onto mntDir and blocks until unmount or signal.
+func runDaemonWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs bool, guestUID, guestGID uint32) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
 
-// RunDaemonWithIDMap mounts srcDir onto mntDir with optional guest UID/GID
-// presentation mapping and blocks until unmount or termination signal.
-func RunDaemonWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestIDs bool, guestUID, guestGID uint32) error {
-	server, err := MountWithIDMap(srcDir, mntDir, hiddenEntries, mapGuestIDs, guestUID, guestGID)
+	server, err := mountWithIDMap(srcDir, mntDir, hiddenEntries, mapGuestIDs, guestUID, guestGID)
 	if err != nil {
 		return err
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-sigCh
-		_ = server.Unmount()
+		select {
+		case <-sigCh:
+			_ = server.Unmount()
+		case <-done:
+		}
 	}()
 
 	server.Wait()
@@ -2106,25 +2952,34 @@ func RunDaemonWithIDMap(srcDir, mntDir string, hiddenEntries []string, mapGuestI
 }
 
 // RunMain parses CLI arguments for the internal `__filter` subcommand and runs
-// either the single-share FUSE daemon or the multiplexed Workspace Hub daemon.
+// either the single-share FUSE daemon or the Workspace Hub daemon.
 func RunMain(args []string) int {
 	fsFlags := flag.NewFlagSet(SubcommandName, flag.ContinueOnError)
-	hubMode := fsFlags.Bool("hub", false, "Run multiplexed Workspace Hub daemon")
+	fsFlags.SetOutput(io.Discard)
+	hubMode := fsFlags.Bool("hub", false, "Run the Workspace Hub daemon")
 	src := fsFlags.String("src", "", "Source directory to expose")
 	mnt := fsFlags.String("mnt", "", "Mountpoint directory")
 	sock := fsFlags.String("sock", "", "Control socket path for Workspace Hub")
-	specFD := fsFlags.Int("spec-fd", -1, "Open file descriptor containing initial Hub JSON spec")
-	specFile := fsFlags.String("spec", "", "Path to JSON file containing initial Hub spec")
-	mapGuestIDs := fsFlags.Bool("map-guest-ids", false, "Present mapped guest UID/GID ownership")
-	guestUID := fsFlags.Uint("guest-uid", 1000, "Mapped guest UID when -map-guest-ids is set")
-	guestGID := fsFlags.Uint("guest-gid", 1000, "Mapped guest GID when -map-guest-ids is set")
+	specFD := fsFlags.Int("spec-fd", -1, "File descriptor that holds the initial hub spec in JSON")
+	specFile := fsFlags.String("spec", "", "Path to JSON file that holds the initial hub spec")
+	mapGuestIDs := fsFlags.Bool("map-guest-ids", false, "Map guest UID and GID ownership")
+	guestUID := fsFlags.Uint("guest-uid", config.GuestUID, "Mapped guest UID when -map-guest-ids is set")
+	guestGID := fsFlags.Uint("guest-gid", config.GuestGID, "Mapped guest GID when -map-guest-ids is set")
 	if err := fsFlags.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "agbox %s: %v\n", SubcommandName, err)
 		return 2
 	}
+	if fsFlags.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "agbox %s: unexpected positional arguments\n", SubcommandName)
+		return 2
+	}
+	if *guestUID > math.MaxUint32 || *guestGID > math.MaxUint32 {
+		fmt.Fprintf(os.Stderr, "agbox %s: guest UID and GID must fit in uint32\n", SubcommandName)
+		return 2
+	}
 	if *hubMode {
-		if *mnt == "" || *sock == "" {
-			fmt.Fprintf(os.Stderr, "Usage: agbox %s -hub -mnt <dir> -sock <sock> [-spec-fd <fd>|-spec <file>]\n", SubcommandName)
+		if *mnt == "" || *sock == "" || (*specFD >= 0 && *specFile != "") {
+			fmt.Fprintf(os.Stderr, "usage: agbox %s -hub -mnt <dir> -sock <sock> [-spec-fd <fd>|-spec <file>]\n", SubcommandName)
 			return 2
 		}
 		if err := runHubDaemonFromFlags(*mnt, *sock, *specFD, *specFile); err != nil {
@@ -2134,10 +2989,10 @@ func RunMain(args []string) int {
 		return 0
 	}
 	if *src == "" || *mnt == "" {
-		fmt.Fprintf(os.Stderr, "Usage: agbox %s -src <dir> -mnt <dir>\n", SubcommandName)
+		fmt.Fprintf(os.Stderr, "usage: agbox %s -src <dir> -mnt <dir>\n", SubcommandName)
 		return 2
 	}
-	if err := RunDaemonWithIDMap(*src, *mnt, DefaultHiddenEntries, *mapGuestIDs, uint32(*guestUID), uint32(*guestGID)); err != nil {
+	if err := runDaemonWithIDMap(*src, *mnt, defaultHiddenEntries(), *mapGuestIDs, uint32(*guestUID), uint32(*guestGID)); err != nil {
 		fmt.Fprintf(os.Stderr, "agbox %s: %v\n", SubcommandName, err)
 		return 1
 	}
@@ -2145,75 +3000,177 @@ func RunMain(args []string) int {
 }
 
 // StartSubprocess starts `exePath __filter -src <srcDir> -mnt <mntDir>` as a
-// background child process. It writes the child PID to pidFile and waits until
-// mntDir appears in /proc/self/mountinfo.
-//
-// When dieWithParent is true, the kernel sends SIGTERM to the child if the
-// parent process exits. When dieWithParent is false, the child starts in a new
-// session so it continues after the CLI exits.
+// background child process, writes its PID to pidFile, and waits for the mount.
 func StartSubprocess(exePath, srcDir, mntDir, pidFile string, dieWithParent bool) (int, error) {
-	if err := ensureSafeMountDir(mntDir); err != nil {
+	if err := config.EnsurePrivateDir(mntDir); err != nil {
 		return 0, fmt.Errorf("prepare mountpoint %q: %w", mntDir, err)
 	}
-	if err := ensureSafeMountDir(filepath.Dir(pidFile)); err != nil {
+	if err := config.EnsurePrivateDir(filepath.Dir(pidFile)); err != nil {
 		return 0, fmt.Errorf("prepare pidfile directory: %w", err)
 	}
-	errPath := daemonStderrPath(pidFile)
+	args := []string{
+		SubcommandName,
+		"-src", srcDir,
+		"-mnt", mntDir,
+		"-map-guest-ids",
+		"-guest-uid", strconv.Itoa(config.GuestUID),
+		"-guest-gid", strconv.Itoa(config.GuestGID),
+	}
+	return launchFilterDaemon(daemonLaunchConfig{
+		exePath:       exePath,
+		args:          args,
+		mntDir:        mntDir,
+		pidFile:       pidFile,
+		dieWithParent: dieWithParent,
+		label:         "FUSE filter",
+		readyCheck: func() bool {
+			mounted, err := mounttab.IsPathMounted(mntDir)
+			return err == nil && mounted
+		},
+	})
+}
+
+type daemonLaunchConfig struct {
+	exePath       string
+	args          []string
+	mntDir        string
+	pidFile       string
+	pipePayload   []byte
+	dieWithParent bool
+	label         string
+	readyCheck    func() bool
+}
+
+func launchFilterDaemon(cfg daemonLaunchConfig) (int, error) {
+	errPath := daemonStderrPath(cfg.pidFile)
 	errFile, err := openDaemonStderrFile(errPath)
 	if err != nil {
 		return 0, err
 	}
 
-	cmd := exec.Command(exePath, SubcommandName, "-src", srcDir, "-mnt", mntDir, "-map-guest-ids", "-guest-uid", "1000", "-guest-gid", "1000")
+	var pipeR, pipeW *os.File
+	if cfg.pipePayload != nil {
+		pipeR, pipeW, err = os.Pipe()
+		if err != nil {
+			_ = errFile.Close()
+			return 0, fmt.Errorf("create %s pipe: %w", cfg.label, err)
+		}
+	}
+
+	cmd := exec.Command(cfg.exePath, cfg.args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = errFile
-	if dieWithParent {
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Pdeathsig: syscall.SIGTERM,
-		}
+	if pipeR != nil {
+		cmd.ExtraFiles = []*os.File{pipeR}
+	}
+	if cfg.dieWithParent {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
 	} else {
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Setsid: true,
-		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	}
 
 	startErr := cmd.Start()
+	if pipeR != nil {
+		_ = pipeR.Close()
+	}
 	_ = errFile.Close()
 	if startErr != nil {
-		return 0, fmt.Errorf("start FUSE filter subprocess: %w", startErr)
+		if pipeW != nil {
+			_ = pipeW.Close()
+		}
+		return 0, fmt.Errorf("start %s subprocess: %w", cfg.label, startErr)
 	}
 	pid := cmd.Process.Pid
 
-	// Wait for the child process in a goroutine so it does not become a zombie.
 	exited := make(chan error, 1)
 	go func() {
 		exited <- cmd.Wait()
 	}()
 
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
+	stopFailedChild := func(removePID bool) {
+		if removePID {
+			_ = os.Remove(cfg.pidFile)
+		}
 		_ = cmd.Process.Signal(syscall.SIGTERM)
-		return 0, fmt.Errorf("write FUSE pidfile %q: %w", pidFile, err)
+		select {
+		case <-exited:
+		case <-time.After(300 * time.Millisecond):
+			_ = cmd.Process.Kill()
+			select {
+			case <-exited:
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		if mounted, mErr := mounttab.IsPathMounted(cfg.mntDir); mErr == nil && mounted {
+			var ctl mounttab.OSController
+			_ = ctl.Unmount(cfg.mntDir, true)
+		}
 	}
 
-	// Poll /proc/self/mountinfo for up to 3 seconds (60 * 50ms) until the mount is active.
-	deadline := time.Now().Add(3 * time.Second)
+	if pipeW != nil {
+		_, writeErr := pipeW.Write(cfg.pipePayload)
+		_ = pipeW.Close()
+		if writeErr != nil {
+			stopFailedChild(false)
+			return 0, appendDaemonStderr(fmt.Errorf("write %s bootstrap pipe: %w", cfg.label, writeErr), errPath)
+		}
+	}
+
+	if err := writePIDFileNoFollow(cfg.pidFile, pid); err != nil {
+		stopFailedChild(false)
+		return 0, fmt.Errorf("write %s pidfile %q: %w", cfg.label, cfg.pidFile, err)
+	}
+
+	deadline := time.Now().Add(daemonStartupTimeout)
 	for time.Now().Before(deadline) {
-		mounted, err := mounttab.IsPathMounted(mntDir)
-		if err == nil && mounted {
+		if cfg.readyCheck() {
 			return pid, nil
 		}
 		select {
 		case waitErr := <-exited:
-			_ = os.Remove(pidFile)
-			return 0, appendDaemonStderr(fmt.Errorf("FUSE filter exited before mounting %q: %w", mntDir, waitErr), errPath)
+			_ = os.Remove(cfg.pidFile)
+			if mounted, mErr := mounttab.IsPathMounted(cfg.mntDir); mErr == nil && mounted {
+				var ctl mounttab.OSController
+				_ = ctl.Unmount(cfg.mntDir, true)
+			}
+			return 0, appendDaemonStderr(fmt.Errorf("%s exited before mounting %q: %w", cfg.label, cfg.mntDir, waitErr), errPath)
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
 
-	// Stop the child process if the mount timed out.
-	_ = cmd.Process.Signal(syscall.SIGTERM)
-	return 0, appendDaemonStderr(fmt.Errorf("timed out waiting for FUSE mount at %q", mntDir), errPath)
+	stopFailedChild(true)
+	return 0, appendDaemonStderr(fmt.Errorf("timed out waiting for %s mount at %q", cfg.label, cfg.mntDir), errPath)
+}
+
+func writePIDFileNoFollow(pidFile string, pid int) error {
+	if info, err := os.Lstat(pidFile); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("refusing non-regular pidfile path %q", pidFile)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	fd, err := unix.Open(pidFile, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := unix.Fchmod(fd, 0o600); err != nil {
+		_ = unix.Close(fd)
+		return err
+	}
+	payload := []byte(strconv.Itoa(pid) + "\n")
+	_, wErr := unix.Write(fd, payload)
+	cErr := unix.Close(fd)
+	if wErr != nil {
+		_ = os.Remove(pidFile)
+		return wErr
+	}
+	if cErr != nil {
+		_ = os.Remove(pidFile)
+		return cErr
+	}
+	return nil
 }
 
 func daemonStderrPath(pidFile string) string {
@@ -2224,7 +3181,7 @@ func daemonStderrPath(pidFile string) string {
 }
 
 func openDaemonStderrFile(errPath string) (*os.File, error) {
-	if err := ensureSafeMountDir(filepath.Dir(errPath)); err != nil {
+	if err := config.EnsurePrivateDir(filepath.Dir(errPath)); err != nil {
 		return nil, fmt.Errorf("prepare daemon log directory: %w", err)
 	}
 	if info, err := os.Lstat(errPath); err == nil {
@@ -2238,16 +3195,23 @@ func openDaemonStderrFile(errPath string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open daemon stderr log %q: %w", errPath, err)
 	}
-	_ = unix.Fchmod(fd, 0o600)
+	if err := unix.Fchmod(fd, 0o600); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("chmod daemon stderr log %q: %w", errPath, err)
+	}
 	return os.NewFile(uintptr(fd), errPath), nil
 }
 
 func appendDaemonStderr(prefixErr error, errPath string) error {
-	f, err := os.Open(errPath)
+	fd, err := unix.Open(errPath, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return prefixErr
 	}
+	f := os.NewFile(uintptr(fd), errPath)
 	defer f.Close()
+	if info, sErr := f.Stat(); sErr != nil || !info.Mode().IsRegular() {
+		return prefixErr
+	}
 	buf := make([]byte, 4096)
 	n, _ := f.Read(buf)
 	detail := strings.TrimSpace(string(buf[:n]))
@@ -2255,39 +3219,4 @@ func appendDaemonStderr(prefixErr error, errPath string) error {
 		return prefixErr
 	}
 	return fmt.Errorf("%w (%s)", prefixErr, detail)
-}
-
-func ensureSafeMountDir(dir string) error {
-	if info, err := os.Lstat(dir); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("refusing symlinked path %q", dir)
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("path %q is not a directory", dir)
-		}
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	info, err := os.Lstat(dir)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("refusing non-directory %q", dir)
-	}
-	return os.Chmod(dir, 0o700)
-}
-
-// UnmountAndClean unmounts all active FUSE mountpoints under filterRoot and
-// stops recorded filter daemons. It deletes filterRoot only after it verifies
-// in /proc/self/mountinfo that no mounts remain.
-func UnmountAndClean(filterRoot string) error {
-	if filterRoot == "" {
-		return nil
-	}
-	if _, err := os.Stat(filterRoot); os.IsNotExist(err) {
-		return nil
-	}
-	return mounttab.TeardownFilterDir(filterRoot, nil)
 }

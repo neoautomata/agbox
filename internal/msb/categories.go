@@ -6,8 +6,7 @@ import (
 	"strings"
 )
 
-// Category describes an installable group of packages and developer tools for
-// the base microVM.
+// Category describes an installable group of packages and tools for the base sandbox.
 type Category struct {
 	Name        string
 	Aliases     []string
@@ -16,17 +15,16 @@ type Category struct {
 	BuildScript func() string
 }
 
-// GuestDefaultPath is the PATH configured for the non-root guest user so tools
-// installed by pipx, rustup/cargo, and go install are available in all shells.
-const GuestDefaultPath = "/home/agent/.local/bin:/home/agent/.cargo/bin:/home/agent/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+// guestDefaultPath defines the PATH variable for the non-root guest user.
+// It includes directories used by pipx, cargo, and go install.
+const guestDefaultPath = "/home/agent/.local/bin:/home/agent/.cargo/bin:/home/agent/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-// Categories returns the ordered catalog of base-image provisioning categories.
-func Categories() []Category {
+func categories() []Category {
 	return []Category{
 		{
 			Name:    "core",
 			Aliases: []string{"base", "cli"},
-			Summary: "Core build chain, C headers, Python/pipx, shellcheck, mdformat, and CLI utilities",
+			Summary: "Build tools, C headers, Python and pipx, shellcheck, mdformat, and CLI utilities",
 			Details: []string{
 				"apt: build-essential, pkg-config, cmake, ninja-build, libffi-dev, libssl-dev, libsqlite3-dev, sqlite3",
 				"apt: ca-certificates, curl, wget, git, htop, ncdu, net-tools, iproute2, dnsutils, rsync, unzip, zip, vim",
@@ -39,9 +37,9 @@ func Categories() []Category {
 		{
 			Name:    "go",
 			Aliases: []string{"golang"},
-			Summary: "Go toolchain and developer tools (dlv, gopls, golangci-lint, staticcheck, govulncheck, goimports)",
+			Summary: "Go toolchain and tools (dlv, gopls, golangci-lint, staticcheck, govulncheck, goimports)",
 			Details: []string{
-				"toolchain: latest upstream Go in /usr/local/go (fallback: apt golang-go) + protobuf-compiler",
+				"toolchain: latest upstream Go in /usr/local/go (or apt golang-go) + protobuf-compiler",
 				"go install: dlv, gopls, golangci-lint, goimports, staticcheck, govulncheck",
 			},
 			BuildScript: scriptCategoryGo,
@@ -59,7 +57,7 @@ func Categories() []Category {
 		{
 			Name:    "esphome",
 			Aliases: []string{"esp"},
-			Summary: "ESPHome, PlatformIO, esptool, and ESP-IDF/USB hardware libraries",
+			Summary: "ESPHome, PlatformIO, esptool, and USB hardware libraries",
 			Details: []string{
 				"apt: libudev-dev, libusb-1.0-0-dev, udev, usbutils, cmake, ninja-build, gperf, ccache, dfu-util, picocom, minicom",
 				"pipx: esphome, esptool, platformio",
@@ -79,10 +77,10 @@ func Categories() []Category {
 		{
 			Name:    "chrome",
 			Aliases: []string{"browser", "chromium", "devtools"},
-			Summary: "Chrome/Chromium browser, WebDriver, fonts, and Xvfb for DevTools and UI testing",
+			Summary: "Chromium browser, WebDriver, fonts, and Xvfb for UI tests",
 			Details: []string{
 				"apt: chromium, chromium-driver, xvfb, fonts-liberation, fonts-noto-color-emoji, libnss3, libgbm1",
-				"config: microVM-ready flags (--no-sandbox --disable-dev-shm-usage) and google-chrome symlink",
+				"config: sandbox flags (--no-sandbox --disable-dev-shm-usage) and google-chrome symlink",
 			},
 			BuildScript: scriptCategoryChrome,
 		},
@@ -91,7 +89,7 @@ func Categories() []Category {
 			Aliases: []string{"static-site"},
 			Summary: "Hugo Extended static site generator",
 			Details: []string{
-				"binary: Hugo Extended (CGO/Sass enabled) installed to /usr/local/bin/hugo",
+				"binary: Hugo Extended (CGO and Sass enabled) in /usr/local/bin/hugo",
 			},
 			BuildScript: scriptCategoryHugo,
 		},
@@ -108,11 +106,10 @@ func Categories() []Category {
 	}
 }
 
-// ResolveCategories expands a list of category names (or comma-separated lists,
-// numeric indices, aliases, or "all") into a deduplicated slice of Category
-// structs in canonical installation order.
+// ResolveCategories expands category names, 1-based indices, aliases, or "all".
+// It returns deduplicated Category values in catalog order.
 func ResolveCategories(specs []string) ([]Category, error) {
-	catalog := Categories()
+	catalog := categories()
 	selected := make(map[string]bool, len(catalog))
 
 	for _, rawSpec := range specs {
@@ -127,7 +124,7 @@ func ResolveCategories(specs []string) ([]Category, error) {
 				}
 				continue
 			}
-			// Support 1-based numeric index selection (1..len(catalog)).
+			// Match a 1-based index from 1 through len(catalog).
 			if idx, err := strconv.Atoi(name); err == nil && idx >= 1 && idx <= len(catalog) {
 				selected[catalog[idx-1].Name] = true
 				continue
@@ -148,12 +145,12 @@ func ResolveCategories(specs []string) ([]Category, error) {
 				}
 			}
 			if !matched {
-				return nil, fmt.Errorf("unknown category %q (valid categories: %s, or all)", tok, CategoryNamesList())
+				return nil, fmt.Errorf("unknown category %q (valid: %s, or all)", tok, CategoryNamesList())
 			}
 		}
 	}
 
-	// Ensure prerequisite toolchains are included automatically.
+	// Add prerequisite toolchains.
 	if selected["embedded-rust"] {
 		selected["rust"] = true
 	}
@@ -170,9 +167,9 @@ func ResolveCategories(specs []string) ([]Category, error) {
 	return ordered, nil
 }
 
-// CategoryNamesList returns a comma-separated list of canonical category names.
+// CategoryNamesList returns a comma-separated list of category names.
 func CategoryNamesList() string {
-	cats := Categories()
+	cats := categories()
 	names := make([]string, len(cats))
 	for i, c := range cats {
 		names[i] = c.Name
@@ -180,11 +177,11 @@ func CategoryNamesList() string {
 	return strings.Join(names, ", ")
 }
 
-// FormatCategoriesTable returns a human-readable summary of all categories.
+// FormatCategoriesTable formats a summary of all categories.
 func FormatCategoriesTable() string {
 	var b strings.Builder
 	b.WriteString("Available base-image categories:\n\n")
-	for i, c := range Categories() {
+	for i, c := range categories() {
 		aliasStr := ""
 		if len(c.Aliases) > 0 {
 			aliasStr = fmt.Sprintf(" (aliases: %s)", strings.Join(c.Aliases, ", "))
@@ -194,12 +191,11 @@ func FormatCategoriesTable() string {
 			fmt.Fprintf(&b, "                    - %s\n", d)
 		}
 	}
-	b.WriteString("\nUse 'all' to install every category, or pass a comma-separated list (for example: --add core,go,rust,esphome,chrome,hugo,caddy).\n")
+	b.WriteString("\nPass 'all' to install every category. Or pass a comma-separated list such as --add core,go,rust.\n")
 	return b.String()
 }
 
-// MergeCategoryNames merges existing comma-separated category names with newly
-// installed categories in canonical catalog order.
+// MergeCategoryNames merges existing category names with added categories in catalog order.
 func MergeCategoryNames(existingCSV string, added []Category) string {
 	have := make(map[string]bool)
 	for _, tok := range strings.Split(existingCSV, ",") {
@@ -212,7 +208,7 @@ func MergeCategoryNames(existingCSV string, added []Category) string {
 		have[c.Name] = true
 	}
 	var out []string
-	for _, c := range Categories() {
+	for _, c := range categories() {
 		if have[c.Name] {
 			out = append(out, c.Name)
 		}
@@ -220,8 +216,7 @@ func MergeCategoryNames(existingCSV string, added []Category) string {
 	return strings.Join(out, ",")
 }
 
-// BuildCategoriesScript combines the installation scripts for the given
-// categories into a single idempotent bash script.
+// BuildCategoriesScript combines category install scripts into one bash script.
 func BuildCategoriesScript(cats []Category) string {
 	if len(cats) == 0 {
 		return ""
@@ -256,7 +251,7 @@ grep -q 'agbox-path.sh' /home/agent/.bashrc 2>/dev/null || \
   echo '[ -f /etc/profile.d/agbox-path.sh ] && . /etc/profile.d/agbox-path.sh' >> /home/agent/.bashrc
 grep -q 'agbox-path.sh' /home/agent/.profile 2>/dev/null || \
   echo '[ -f /etc/profile.d/agbox-path.sh ] && . /etc/profile.d/agbox-path.sh' >> /home/agent/.profile
-`, GuestDefaultPath)
+`, guestDefaultPath)
 }
 
 func scriptCategoryCore() string {
@@ -266,10 +261,10 @@ apt-get install -y -qq --no-install-recommends \
   libffi-dev libssl-dev libsqlite3-dev sqlite3 pkg-config cmake ninja-build \
   python3 python3-pip python3-setuptools python3-venv python3-wheel pipx \
   rsync unzip zip vim jq ripgrep fd-find shellcheck less procps psmisc lsof strace tree file openssh-client >/dev/null
-if [ -x /usr/bin/fdfind ] && [ ! -e /usr/local/bin/fd ]; then
-  ln -s /usr/bin/fdfind /usr/local/bin/fd
+if [ -x /usr/bin/fdfind ]; then
+  ln -sfn /usr/bin/fdfind /usr/local/bin/fd
 fi
-su - agent -c 'export PATH="/home/agent/.local/bin:$PATH" && pipx install --force mdformat && rm -rf /home/agent/.cache/pip'
+su - agent -c 'set -euo pipefail; export PATH="/home/agent/.local/bin:$PATH" && pipx install --force mdformat && rm -rf /home/agent/.cache/pip'
 if [ -x /home/agent/.local/bin/mdformat ]; then
   ln -sf /home/agent/.local/bin/mdformat /usr/local/bin/mdformat
 fi
@@ -281,16 +276,16 @@ func scriptCategoryGo() string {
 apt-get install -y -qq --no-install-recommends \
   build-essential ca-certificates curl git pkg-config protobuf-compiler >/dev/null
 
-# Install upstream Go toolchain in /usr/local/go if missing, with apt fallback.
+# Install the upstream Go toolchain in /usr/local/go if absent, or use apt golang-go.
 if [ ! -x /usr/local/go/bin/go ]; then
   echo '[agbox]   -> Downloading upstream Go toolchain...'
   arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-  go_ver="$(curl --proto '=https' --tlsv1.2 -fsSL 'https://go.dev/VERSION?m=text' 2>/dev/null | head -1 || true)"
-  if [ -n "${go_ver}" ]; then
-    if curl --proto '=https' --tlsv1.2 -fsSL "https://go.dev/dl/${go_ver}.linux-${arch}.tar.gz" -o /tmp/go.tgz; then
-      rm -rf /usr/local/go
-      tar -C /usr/local -xzf /tmp/go.tgz
+  go_ver="$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL 'https://go.dev/VERSION?m=text' 2>/dev/null | head -1 || true)"
+  if [[ "${go_ver}" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+|(rc|beta)[0-9]+)?$ ]] && [[ "${arch}" =~ ^[a-z0-9_]+$ ]]; then
+    if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "https://go.dev/dl/${go_ver}.linux-${arch}.tar.gz" -o /tmp/go.tgz && tar -C /usr/local -xzf /tmp/go.tgz; then
       rm -f /tmp/go.tgz
+    else
+      rm -rf /usr/local/go /tmp/go.tgz
     fi
   fi
   if [ ! -x /usr/local/go/bin/go ]; then
@@ -304,7 +299,7 @@ su - agent -c '
   export TMPDIR=/var/tmp
   mkdir -p /home/agent/go/bin
   echo "[agbox]   -> Installing golangci-lint..."
-  if ! curl --proto "=https" --tlsv1.2 -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /home/agent/go/bin; then
+  if ! curl --proto "=https" --proto-redir "=https" --tlsv1.2 -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b /home/agent/go/bin; then
     go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
   fi
   for pkg in \
@@ -332,7 +327,7 @@ su - agent -c '
   set -euo pipefail
   if [ ! -x /home/agent/.cargo/bin/rustup ]; then
     echo "[agbox]   -> Installing rustup stable toolchain..."
-    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    curl --proto "=https" --proto-redir "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
   fi
   . "/home/agent/.cargo/env"
   rustup update
@@ -372,8 +367,8 @@ func scriptCategoryEmbeddedRust() string {
   echo "[agbox]   -> Adding RISC-V Rust targets..."
   rustup target add riscv32imc-unknown-none-elf riscv32imac-unknown-none-elf
   if ! command -v cargo-binstall >/dev/null 2>&1; then
-    echo "[agbox]   -> Installing cargo-binstall for fast prebuilt binary downloads..."
-    curl -L --proto "=https" --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash || true
+    echo "[agbox]   -> Installing cargo-binstall for prebuilt binary downloads..."
+    curl -L --proto "=https" --proto-redir "=https" --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash || true
   fi
   if command -v cargo-binstall >/dev/null 2>&1; then
     echo "[agbox]   -> Installing espflash, cargo-espflash, and ldproxy via cargo-binstall..."
@@ -394,11 +389,9 @@ apt-get install -y -qq --no-install-recommends \
   libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 >/dev/null
 mkdir -p /etc/chromium.d
 echo 'export CHROMIUM_FLAGS="${CHROMIUM_FLAGS:-} --no-sandbox --disable-dev-shm-usage"' > /etc/chromium.d/agbox-flags
-if [ -x /usr/bin/chromium ] && [ ! -e /usr/local/bin/google-chrome ]; then
-  ln -s /usr/bin/chromium /usr/local/bin/google-chrome
-fi
-if [ -x /usr/bin/chromium ] && [ ! -e /usr/local/bin/chrome ]; then
-  ln -s /usr/bin/chromium /usr/local/bin/chrome
+if [ -x /usr/bin/chromium ]; then
+  ln -sfn /usr/bin/chromium /usr/local/bin/google-chrome
+  ln -sfn /usr/bin/chromium /usr/local/bin/chrome
 fi
 `
 }
@@ -409,8 +402,8 @@ apt-get install -y -qq --no-install-recommends \
   build-essential ca-certificates curl git >/dev/null
 
 arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-hugo_ver="$(curl --proto '=https' --tlsv1.2 -fsSL https://api.github.com/repos/gohugoio/hugo/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[^"]+"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/' || true)"
-if [ -n "${hugo_ver}" ] && curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/gohugoio/hugo/releases/download/v${hugo_ver}/hugo_extended_${hugo_ver}_linux-${arch}.tar.gz" -o /tmp/hugo.tgz; then
+hugo_ver="$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://api.github.com/repos/gohugoio/hugo/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[^"]+"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/' || true)"
+if [[ "${hugo_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]] && [[ "${arch}" =~ ^[a-z0-9_]+$ ]] && curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "https://github.com/gohugoio/hugo/releases/download/v${hugo_ver}/hugo_extended_${hugo_ver}_linux-${arch}.tar.gz" -o /tmp/hugo.tgz; then
   tar -C /usr/local/bin -xzf /tmp/hugo.tgz hugo
   chmod 0755 /usr/local/bin/hugo
   rm -f /tmp/hugo.tgz
