@@ -779,6 +779,31 @@ func TestParseSandboxAndSnapshotLists(t *testing.T) {
 	if got := ParseSandboxList("NAME   STATE\n\n"); len(got) != 0 {
 		t.Errorf("ParseSandboxList(header-only) = %v, want empty", got)
 	}
+	if got := ParseSandboxList("NAME          IMAGE                    STATUS     CREATED\n"); len(got) != 0 {
+		t.Errorf("ParseSandboxList(real header-only) = %v, want empty", got)
+	}
+
+	realLS := `
+NAME          IMAGE                     STATUS     CREATED
+agbox-blip    node:24-bookworm-slim     running    2026-11-14 14:59:39
+agbox-base    node:24-bookworm-slim     stopped    2026-11-14 14:49:18
+agbox-running my-running-image:latest   stopped    2026-11-14 14:50:00
+`
+	realSBs := ParseSandboxList(realLS)
+	if len(realSBs) != 3 {
+		t.Fatalf("len(realSBs) = %d, want 3", len(realSBs))
+	}
+	if sb, ok := FindSandbox(realSBs, "agbox-blip"); !ok || !sb.Running {
+		t.Errorf("agbox-blip in real msb ls = %+v, ok=%v", sb, ok)
+	}
+	if sb, ok := FindSandbox(realSBs, "agbox-base"); !ok || sb.Running {
+		t.Errorf("agbox-base in real msb ls = %+v, ok=%v", sb, ok)
+	}
+	if sb, ok := FindSandbox(realSBs, "agbox-running"); !ok || sb.Running {
+		t.Errorf("stopped sandbox named agbox-running marked running: %+v, ok=%v", sb, ok)
+	}
+
+	// Keep the legacy STATE header layout and the agbox-running-named stopped check.
 	lsOut := `
 NAME                   STATE     CPUS   MEMORY
 ----                   -----     ----   ------
@@ -803,6 +828,25 @@ agbox-run-1234         running   2      2048 MiB
 		t.Error("expected missing sandbox not to be found")
 	}
 
+	// Check ANSI escape stripping and fallback when no STATUS or STATE header exists.
+	fallbackLS := "NAME IMAGE INFO\nagbox-running node:24-bookworm-slim stopped\nagbox-ansi node:24-bookworm-slim \x1b[32mrunning\x1b[0m\n"
+	fallbackSBs := ParseSandboxList(fallbackLS)
+	if sb, ok := FindSandbox(fallbackSBs, "agbox-running"); !ok || sb.Running {
+		t.Errorf("fallback agbox-running = %+v, ok=%v", sb, ok)
+	}
+	if sb, ok := FindSandbox(fallbackSBs, "agbox-ansi"); !ok || !sb.Running {
+		t.Errorf("fallback agbox-ansi = %+v, ok=%v", sb, ok)
+	}
+
+	realSnapOut := `
+NAME        SCOPE   MIGRATION   IMAGE                    SIZE       CREATED               DIGEST
+agbox:v1    local   offline     node:24-bookworm-slim    1.12 GiB   2026-11-14 14:52:01   sha256:abcd1234
+agbox:v2    local   offline     node:24-bookworm-slim    1.15 GiB   2026-11-14 15:01:10   sha256:ef567890
+`
+	if gotRealSnaps := ParseSnapshotList(realSnapOut); !slices.Equal(gotRealSnaps, []string{"agbox:v1", "agbox:v2"}) {
+		t.Errorf("ParseSnapshotList(real layout) = %v", gotRealSnaps)
+	}
+
 	snapOut := `
 NAME        CREATED        SIZE
 agbox:v1    2 hours ago    512 MiB
@@ -818,10 +862,10 @@ other:v9    10 mins ago    100 MiB
 	}
 
 	volOut := `
-NAME                 KIND   SIZE
-----                 ----   ----
-agbox-profile-work   disk   10 GiB
-other-vol            dir    -
+NAME                 KIND   SIZE     CREATED
+----                 ----   ----     -------
+agbox-profile-work   disk   10 GiB   2026-11-14 15:10:00
+other-vol            dir    -        2026-11-14 15:11:00
 `
 	vols := ParseVolumeList(volOut)
 	if !slices.Equal(vols, []string{"agbox-profile-work", "other-vol"}) {

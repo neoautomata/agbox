@@ -32,6 +32,7 @@ The installer runs these steps:
 1. It downloads the `msb` installer over HTTPS (TLS 1.2 or newer) if `msb` is missing.
 1. It builds a static `agbox` binary and installs it atomically in `~/.local/bin` (`/usr/local/bin` for `root`).
 1. It installs the default sandbox rules (`AGBOX_ENV_RULES.md`) into `~/.local/share/agbox/rules`.
+1. It installs bash completion into `~/.local/share/bash-completion/completions/agbox` (`/usr/share/bash-completion/completions/agbox` for `root`). Pass `--skip-completion` to skip this step.
 1. It runs `agbox setup`. This command checks `/dev/kvm`, FUSE mounts, `msb doctor`, and an offline Alpine microVM.
 
 > [!TIP]
@@ -192,6 +193,7 @@ agbox/
 ├── cmd/agbox/         Entrypoint. Routes __filter to vcsfuse and other commands to cli.
 ├── internal/
 │   ├── cli/           Argument parsers and mode execution. Main is the only export.
+│   ├── complete/      Shell completion engine and bash script generator.
 │   ├── config/        Environment settings, state files, run metadata, snapshot numbers.
 │   ├── mounttab/      /proc/self/mountinfo parser and verified FUSE unmount.
 │   ├── msb/           Argument builders, network rules, categories, Runner interface.

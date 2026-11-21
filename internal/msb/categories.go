@@ -167,14 +167,19 @@ func ResolveCategories(specs []string) ([]Category, error) {
 	return ordered, nil
 }
 
-// CategoryNamesList returns a comma-separated list of category names.
-func CategoryNamesList() string {
+// CategoryNames returns the canonical category names in catalog order.
+func CategoryNames() []string {
 	cats := categories()
 	names := make([]string, len(cats))
 	for i, c := range cats {
 		names[i] = c.Name
 	}
-	return strings.Join(names, ", ")
+	return names
+}
+
+// CategoryNamesList returns a comma-separated list of category names.
+func CategoryNamesList() string {
+	return strings.Join(CategoryNames(), ", ")
 }
 
 // FormatCategoriesTable formats a summary of all categories.

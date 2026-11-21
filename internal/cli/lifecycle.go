@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -314,7 +316,7 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 		}
 	}
 
-	if meta.RemoteControl && meta.Mode != config.RunModeRemoteControl && (opts.Detach || a.IsTTY == nil || !a.IsTTY()) {
+	if meta.RemoteControl && (meta.Mode == "" || meta.Mode == config.RunModeTUI) && (opts.Detach || a.IsTTY == nil || !a.IsTTY()) {
 		meta.Mode = config.RunModeRemoteControl
 	}
 	if meta.Mode == config.RunModeTUI && (a.IsTTY == nil || !a.IsTTY()) {
@@ -707,18 +709,40 @@ func (a *appRuntime) remove(ctx context.Context, args []string) error {
 		if snapRes, sErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "ls"}}); sErr != nil {
 			a.warnf("Could not list snapshots during remove: %v", formatMSBError("msb snap ls", snapRes, sErr))
 		} else {
+			agboxSnaps, otherGroupSnaps := partitionGroupSnapshots(msb.ParseSnapshotList(snapRes.Stdout))
+			remaining := make([]string, 0, len(otherGroupSnaps)+len(agboxSnaps))
+			remaining = append(remaining, otherGroupSnaps...)
+			remaining = append(remaining, agboxSnaps...)
+
+			// msb rejects deleting the group head while another member exists in the group.
+			// Switch the head once to a surviving member or the oldest target, then retry.
 			removedSnaps := false
-			for _, snap := range msb.ParseSnapshotList(snapRes.Stdout) {
-				if !isAgboxSnapshotName(snap) {
+			snapRMFailed := false
+			for _, snap := range agboxSnaps {
+				rmRes, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "rm", "--force", snap}})
+				if rmErr != nil && isMSBCurrentHeadError(rmRes) {
+					nextHead := pickNextSnapshotHead(snap, otherGroupSnaps, remaining)
+					if nextHead != "" {
+						headRes, headErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "head", nextHead}})
+						if headErr != nil {
+							a.warnf("Could not switch snapshot head to %s before deleting %s: %v", nextHead, snap, formatMSBError("msb snap head", headRes, headErr))
+							snapRMFailed = true
+							continue
+						}
+						rmRes, rmErr = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "rm", "--force", snap}})
+					}
+				}
+				if rmErr != nil {
+					a.warnf("Could not delete snapshot %s: %v", snap, formatMSBError("msb snap rm", rmRes, rmErr))
+					snapRMFailed = true
 					continue
 				}
-				if rmRes, rmErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "rm", snap}}); rmErr != nil {
-					a.warnf("Could not delete snapshot %s: %v", snap, formatMSBError("msb snap rm", rmRes, rmErr))
-				} else {
-					removedSnaps = true
-				}
+				removedSnaps = true
+				remaining = slices.DeleteFunc(remaining, func(s string) bool { return s == snap })
 			}
-			if a.Env.MSBHome != "" {
+			// msb snap reindex does not prune missing SQLite rows.
+			// Delete the group directory only when every agbox snapshot removal succeeded and no user member remains.
+			if a.Env.MSBHome != "" && !snapRMFailed && len(otherGroupSnaps) == 0 {
 				snapGroupDir := filepath.Join(a.Env.MSBHome, "snapshots", config.SnapGroup)
 				if info, stErr := os.Lstat(snapGroupDir); stErr == nil {
 					if info.Mode()&os.ModeSymlink != 0 {
@@ -825,4 +849,76 @@ func isAgboxSnapshotName(snap string) bool {
 		return false
 	}
 	return isDigits(strings.TrimPrefix(snap, config.SnapGroup+":v"))
+}
+
+func agboxSnapshotVersion(snap string) (int, bool) {
+	if !isAgboxSnapshotName(snap) {
+		return 0, false
+	}
+	ver, err := strconv.Atoi(strings.TrimPrefix(snap, config.SnapGroup+":v"))
+	if err != nil {
+		return 0, false
+	}
+	return ver, true
+}
+
+func sortAgboxSnapshotsDesc(snaps []string) {
+	slices.SortFunc(snaps, func(a, b string) int {
+		va, oka := agboxSnapshotVersion(a)
+		vb, okb := agboxSnapshotVersion(b)
+		if oka && okb && va != vb {
+			return cmp.Compare(vb, va)
+		}
+		if oka != okb {
+			if oka {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(b, a)
+	})
+}
+
+func partitionGroupSnapshots(snaps []string) (agboxSnaps, otherGroupSnaps []string) {
+	seen := make(map[string]bool, len(snaps))
+	groupPrefix := config.SnapGroup + ":"
+	for _, raw := range snaps {
+		snap := strings.TrimSpace(raw)
+		if snap == "" || seen[snap] {
+			continue
+		}
+		seen[snap] = true
+		if !strings.HasPrefix(snap, groupPrefix) {
+			continue
+		}
+		if strings.TrimPrefix(snap, groupPrefix) == "" {
+			continue
+		}
+		if isAgboxSnapshotName(snap) {
+			agboxSnaps = append(agboxSnaps, snap)
+		} else {
+			otherGroupSnaps = append(otherGroupSnaps, snap)
+		}
+	}
+	sortAgboxSnapshotsDesc(agboxSnaps)
+	return agboxSnaps, otherGroupSnaps
+}
+
+func isMSBCurrentHeadError(res msb.CommandResult) bool {
+	combined := strings.ToLower(res.Stderr + "\n" + res.Stdout)
+	return strings.Contains(combined, "cannot remove current head")
+}
+
+func pickNextSnapshotHead(snap string, otherGroupSnaps, remaining []string) string {
+	for _, candidate := range otherGroupSnaps {
+		if candidate != "" && candidate != snap {
+			return candidate
+		}
+	}
+	for i := len(remaining) - 1; i >= 0; i-- {
+		if remaining[i] != "" && remaining[i] != snap {
+			return remaining[i]
+		}
+	}
+	return ""
 }

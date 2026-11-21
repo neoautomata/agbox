@@ -16,6 +16,9 @@ Modes:
   agbox version (or agbox --version)
       Print agbox version and exit.
 
+  agbox completion [--allow-root] bash
+      Print the bash completion script to stdout.
+
   agbox create-base [--force] [--allow-root] [--add <categories>] <opencode|antigravity|both>
       Create the base microVM and save snapshot agbox:vN.
 
@@ -201,5 +204,14 @@ func updateUsageText() string {
       Show cached agent versions and SHA-256 digests in $DATA_DIR/agents.
   agbox update [--allow-root] clear [antigravity|opencode|all]
       Delete cached agent updates and use base snapshot binaries on new runs.
+`
+}
+
+func completionUsageText() string {
+	return `Usage:
+  agbox completion [--allow-root] bash
+      Print the bash completion script to stdout.
+      Install in ~/.local/share/bash-completion/completions/agbox
+      or add 'eval "$(agbox completion bash)"' to ~/.bashrc.
 `
 }

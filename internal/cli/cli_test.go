@@ -411,6 +411,20 @@ func (noopMountCtl) SignalPID(_ int, _ syscall.Signal) error { return nil }
 func (noopMountCtl) Unmount(_ string, _ bool) error          { return nil }
 func (noopMountCtl) Sleep(_ time.Duration)                   {}
 
+func fakeMSBLS(entries ...string) string {
+	var b strings.Builder
+	b.WriteString("NAME          IMAGE                    STATUS     CREATED\n")
+	for _, entry := range entries {
+		fields := strings.Fields(entry)
+		if len(fields) == 2 {
+			fmt.Fprintf(&b, "%-13s %-24s %-10s 2026-11-14 14:59:39\n", fields[0], "node:24-bookworm-slim", fields[1])
+		} else if strings.TrimSpace(entry) != "" {
+			b.WriteString(entry + "\n")
+		}
+	}
+	return b.String()
+}
+
 func newTestApp(t *testing.T) (*appRuntime, *fakeMSBRunner, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	root := t.TempDir()
@@ -425,8 +439,8 @@ func newTestApp(t *testing.T) (*appRuntime, *fakeMSBRunner, *bytes.Buffer, *byte
 	}
 
 	runner := &fakeMSBRunner{
-		sandboxes: "NAME STATE\nagbox-base stopped\n",
-		snapshots: "NAME CREATED\nagbox:v1 1m\n",
+		sandboxes: fakeMSBLS("agbox-base stopped"),
+		snapshots: "NAME        SCOPE   MIGRATION   IMAGE                    SIZE       CREATED               DIGEST\nagbox:v1    local   offline     node:24-bookworm-slim    1.12 GiB   2026-11-14 14:52:01   sha256:abcd1234\n",
 	}
 	var stdout, stderr bytes.Buffer
 
@@ -611,7 +625,7 @@ func TestReapOrphanRunsAndTUIAndServeProbe(t *testing.T) {
 	_ = os.MkdirAll(detachedDir, 0o700)
 	_ = os.WriteFile(filepath.Join(detachedDir, "detached"), []byte("agbox-run-999992\n"), 0o600)
 
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-run-999991 running\nagbox-run-999992 running\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-run-999991 running", "agbox-run-999992 running")
 
 	app.reapOrphanRuns(ctx)
 	app.reapStaleFilterDirs(ctx)
@@ -933,7 +947,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 	runner.handler = nil
 
 	// 4. Duplicate --name must fail closed without removing the existing sandbox.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-existing running\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-existing running")
 	runner.calls = nil
 	if rc := app.dispatch(ctx, []string{"run", "--name", "existing", "--cmd", "id"}); rc == 0 {
 		t.Fatal("expected duplicate --name to fail")
@@ -945,7 +959,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 	}
 
 	// 5. Setup fails closed on CheckFUSE error or invalid DataDir, and passes --no-net to smoke test.
-	runner.sandboxes = "NAME STATE\n"
+	runner.sandboxes = fakeMSBLS()
 	runner.calls = nil
 	if rc := app.dispatch(ctx, []string{"setup"}); rc != 0 {
 		t.Fatalf("expected Setup to succeed, stderr=%s", stderr.String())
@@ -973,7 +987,7 @@ func TestSecureByDefaultAndFailClosedRun(t *testing.T) {
 	}
 
 	// 6. EditBase fails closed when guest user provisioning fails or msb stop fails.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
 			return msb.CommandResult{Stdout: runner.sandboxes}, nil
@@ -1011,7 +1025,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	}
 
 	// 1. Start a named detached Remote Control sandbox.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	if rc := app.dispatch(ctx, []string{"run", "--name", "work1", "-d", "--remote-control", projDir}); rc != 0 {
 		t.Fatalf("Run -d --remote-control failed: %s", stderr.String())
 	}
@@ -1021,7 +1035,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	}
 
 	// 2. Suspend agbox-work1.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-work1 running\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-work1 running")
 	runner.calls = nil
 	if rc := app.dispatch(ctx, []string{"suspend", "agbox-work1"}); rc != 0 {
 		t.Fatalf("Suspend failed: %s", stderr.String())
@@ -1043,7 +1057,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	}
 
 	// 3. Orphan reaper must preserve stopped sandboxes that have a suspended marker.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-work1 stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-work1 stopped")
 	otherApp := *app
 	otherApp.PID = 8888
 	// Rewrite OwnerPID in run.meta to a dead PID to verify suspended marker protects it.
@@ -1141,7 +1155,7 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 	}
 
 	// 7. Foreground TUI session suspended from another terminal skips msb rm -f in cleanup.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	suspendedDuringTUI := false
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
@@ -1151,11 +1165,11 @@ func TestSuspendResumeStopAndReaper(t *testing.T) {
 			return msb.CommandResult{Stdout: runner.snapshots}, nil
 		}
 		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-tui1 running\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-tui1 running")
 			return msb.CommandResult{}, nil
 		}
 		if len(req.Args) >= 2 && req.Args[0] == "stop" && req.Args[1] == "agbox-tui1" {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-tui1 stopped\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-tui1 stopped")
 			return msb.CommandResult{}, nil
 		}
 		if len(req.Args) >= 2 && req.Args[0] == "exec" && slices.Contains(req.Args, "-t") && !suspendedDuringTUI {
@@ -1217,9 +1231,10 @@ func TestInstallScriptRootOverride(t *testing.T) {
 	tmp := t.TempDir()
 	mockBin := filepath.Join(tmp, "mockbin")
 	installDir := filepath.Join(tmp, "install")
+	compDir := filepath.Join(tmp, "completions")
 	homeDir := filepath.Join(tmp, "roothome")
 	setupLog := filepath.Join(tmp, "setup.args")
-	for _, d := range []string{mockBin, installDir, homeDir} {
+	for _, d := range []string{mockBin, installDir, compDir, homeDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -1239,6 +1254,7 @@ func TestInstallScriptRootOverride(t *testing.T) {
 	baseEnv := append(os.Environ(),
 		"HOME="+homeDir,
 		"AGBOX_INSTALL_DIR="+installDir,
+		"AGBOX_COMPLETION_DIR="+compDir,
 		"AGBOX_ALLOW_ROOT=0",
 		"PATH="+mockBin+":"+os.Getenv("PATH"),
 	)
@@ -1264,6 +1280,20 @@ func TestInstallScriptRootOverride(t *testing.T) {
 	}
 	if strings.TrimSpace(string(gotSetupArgs)) != "setup --allow-root" {
 		t.Errorf("installed agbox invoked with %q, want %q", strings.TrimSpace(string(gotSetupArgs)), "setup --allow-root")
+	}
+	if _, err := os.Stat(filepath.Join(compDir, "agbox")); err != nil {
+		t.Errorf("expected bash completion file in %s: %v", compDir, err)
+	}
+
+	// 4b. --skip-completion omits installing the bash completion script.
+	skipCompDir := filepath.Join(tmp, "skip-completions")
+	cmdSkipComp := exec.Command("bash", scriptPath, "--allow-root", "--skip-setup", "--skip-completion")
+	cmdSkipComp.Env = append(baseEnv, "AGBOX_COMPLETION_DIR="+skipCompDir)
+	if out, err := cmdSkipComp.CombinedOutput(); err != nil {
+		t.Fatalf("install.sh --skip-completion failed: %v\nout=%s", err, string(out))
+	}
+	if _, err := os.Stat(filepath.Join(skipCompDir, "agbox")); !os.IsNotExist(err) {
+		t.Errorf("expected no completion file when --skip-completion is passed, stat err=%v", err)
 	}
 
 	// 5. Missing fusermount3 and fusermount fails closed.
@@ -1294,7 +1324,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 
 	// 1. CreateBase applies public-only network rules, enforces HTTPS+TLS1.2 for agy,
 	// and deletes partial agbox-base on provisioning failure.
-	runner.sandboxes = "NAME STATE\n"
+	runner.sandboxes = fakeMSBLS()
 	runner.snapshots = "NAME CREATED\n"
 	runner.calls = nil
 	if rc := app.dispatch(ctx, []string{"create-base", "antigravity"}); rc != 0 {
@@ -1343,7 +1373,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 	// Provisioning failure in CreateBase must delete partial agbox-base.
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
-			return msb.CommandResult{Stdout: "NAME STATE\n"}, nil
+			return msb.CommandResult{Stdout: fakeMSBLS()}, nil
 		}
 		if len(req.Args) >= 1 && req.Args[0] == "exec" {
 			return msb.CommandResult{ExitCode: 1}, errors.New("apt failed")
@@ -1374,7 +1404,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
@@ -1420,7 +1450,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 	}
 	symApp := *app
 	symApp.Env.DataDir = symData
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-sym1 running\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-sym1 running")
 	for _, modeArgs := range [][]string{
 		{"setup"},
 		{"create-base", "--force", "opencode"},
@@ -1443,7 +1473,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 		t.Fatal(err)
 	}
 	tamperRunDir := filepath.Join(app.Env.DataDir, "run", "tamp1")
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-tamp1 stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-tamp1 stopped")
 	tamperedCases := []config.RunMeta{
 		{
 			Sandbox:  "agbox-other",
@@ -1992,7 +2022,7 @@ func TestPersistModeAutoSuspendAndRepeatResume(t *testing.T) {
 	}
 
 	// 3. Repeat --persist run with different share path fails closed and keeps suspended marker.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-dev1 stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-dev1 stopped")
 	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "dev1", "opencode", projB}); rc == 0 {
 		t.Fatal("expected repeat --persist run with mismatched share path to fail")
 	}
@@ -2386,7 +2416,7 @@ func TestProfileModeDiskVolumeLockingAndCleanup(t *testing.T) {
 	if err := config.SaveRunMeta(filepath.Join(suspDir, "suspended"), suspMeta); err != nil {
 		t.Fatal(err)
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-psusp stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-psusp stopped")
 	stderr.Reset()
 	if rc := app.dispatch(ctx, []string{"profile", "rm", "workprof"}); rc == 0 {
 		t.Fatal("expected profile rm without --force to fail when suspended sandbox references profile")
@@ -2457,7 +2487,7 @@ func TestPersistenceSecurityChecksRootSymlinkAndTamperedMetadata(t *testing.T) {
 	}
 
 	// 3. Tampered suspended metadata with invalid Profile or ContinueSession rejected on Resume.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-tamp2 stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-tamp2 stopped")
 	tampDir := filepath.Join(app.Env.DataDir, "run", "tamp2")
 	for _, badMeta := range []config.RunMeta{
 		{
@@ -2628,7 +2658,7 @@ func TestRulesLifecycleRunResumeAndSecurity(t *testing.T) {
 	}
 
 	// 4. Resume re-runs setupGuestRules so host rule edits take effect, while `resume --no-rules` skips it.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rulesvm stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-rulesvm stopped")
 	runner.calls = nil
 	if rc := app.dispatch(ctx, []string{"resume", "agbox-rulesvm"}); rc != 0 {
 		t.Fatalf("resume agbox-rulesvm failed: %s", stderr.String())
@@ -3100,7 +3130,7 @@ func TestShareLiveAndSuspended(t *testing.T) {
 	}); rc != 0 {
 		t.Fatalf("run detached mixed shares failed: %s", stderr.String())
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-s1 running\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-s1 running")
 
 	// 2. `agbox share list` queries the live control socket and reports per-share permissions.
 	stdout.Reset()
@@ -3163,7 +3193,7 @@ func TestShareLiveAndSuspended(t *testing.T) {
 	if rc := app.dispatch(ctx, []string{"suspend", "agbox-s1"}); rc != 0 {
 		t.Fatalf("suspend agbox-s1 failed: %s", stderr.String())
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-s1 stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-s1 stopped")
 
 	if rc := app.dispatch(ctx, []string{"share", "add", "--rw", "agbox-s1", hotDir}); rc != 0 {
 		t.Fatalf("suspended share add failed: %s", stderr.String())
@@ -3174,7 +3204,7 @@ func TestShareLiveAndSuspended(t *testing.T) {
 	if rc := app.dispatch(ctx, []string{"resume", "-d", "agbox-s1"}); rc != 0 {
 		t.Fatalf("resume agbox-s1 after suspended share edits failed: %s", stderr.String())
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-s1 running\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-s1 running")
 	stdout.Reset()
 	if rc := app.dispatch(ctx, []string{"share", "list", "agbox-s1"}); rc != 0 {
 		t.Fatalf("share list after resume failed: %s", stderr.String())
@@ -3200,7 +3230,7 @@ func TestShareLiveAndSuspended(t *testing.T) {
 	if err := config.SaveRunMeta(filepath.Join(filterRunDir, "suspended"), filterMeta); err != nil {
 		t.Fatal(err)
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-perfilter1 stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-perfilter1 stopped")
 	usedShareFilter := false
 	app.StartFilter = func(_, mntDir, pidFile string, _ bool) (int, error) {
 		usedShareFilter = true
@@ -3324,11 +3354,11 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 	}
 
 	// 3. Suspend and resume agbox-blip and verify root exec flags repeat cleanly on resume.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-blip running\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-blip running")
 	if rc := app.dispatch(ctx, []string{"suspend", "agbox-blip"}); rc != 0 {
 		t.Fatalf("suspend agbox-blip failed: %s", stderr.String())
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-blip stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-blip stopped")
 	runner.calls = nil
 	if rc := app.dispatch(ctx, []string{"resume", "agbox-blip"}); rc != 0 {
 		t.Fatalf("resume agbox-blip failed: %s", stderr.String())
@@ -3352,7 +3382,7 @@ func TestPersistRemoteControlWithAuthSkillsRulesAndErrorReporting(t *testing.T) 
 	if rc := app.dispatch(ctx, []string{"stop", "agbox-blip"}); rc != 0 {
 		t.Fatalf("stop agbox-blip failed: %s", stderr.String())
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 
 	// 4. Real *exec.ExitError on snap restore and guest setup prints [agbox] ERROR and captured stderr.
 	exit7Err := exec.Command("sh", "-c", "exit 7").Run()
@@ -3494,8 +3524,8 @@ shift
 case "$cmd" in
   ls)
     if [ -n "${FAKE_MSB_RUNNING:-}" ]; then
-      echo "NAME STATE"
-      echo "$FAKE_MSB_RUNNING running"
+      echo "NAME          IMAGE                    STATUS     CREATED"
+      echo "$FAKE_MSB_RUNNING    node:24-bookworm-slim    running    2026-11-14 14:59:39"
     fi
     exit 0
     ;;
@@ -3647,7 +3677,7 @@ esac
 	}); err != nil {
 		t.Fatal(err)
 	}
-	recRunner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-cmdp stopped\n"
+	recRunner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-cmdp stopped")
 	recRunner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
 			return msb.CommandResult{Stdout: recRunner.sandboxes}, nil
@@ -3709,7 +3739,7 @@ func TestUpdateExecStreamingFlags(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	runner.snapshots = "agbox:v1 1m 100M\n"
 
 	var execCalls []msb.CommandRequest
@@ -3848,7 +3878,7 @@ func TestSignalCancellationSynchronousTeardownUnderRace(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	runner.snapshots = "agbox:v1 1m 100M\n"
 
 	if err := os.MkdirAll(filepath.Join(app.Env.MSBHome, "volumes", "agbox-profile-raceprof"), 0o700); err != nil {
@@ -3910,7 +3940,7 @@ func TestReapOrphanRunsFlushesProfileDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runner.sandboxes = fmt.Sprintf("NAME STATE\nagbox-base stopped\n%s running\n", sbName)
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", sbName+" running")
 	runner.calls = nil
 
 	app.reapOrphanRuns(context.Background())
@@ -3953,7 +3983,7 @@ func TestSuspendFlushesProfileDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runner.sandboxes = fmt.Sprintf("NAME STATE\nagbox-base stopped\n%s running\n", sbName)
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", sbName+" running")
 	runner.calls = nil
 
 	ctx := context.Background()
@@ -3990,7 +4020,7 @@ func TestStopFailureBoundaryPreservesState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runner.sandboxes = fmt.Sprintf("NAME STATE\nagbox-base stopped\n%s running\n", sbName)
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", sbName+" running")
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 2 && req.Args[0] == "rm" && req.Args[1] == "-f" {
 			return msb.CommandResult{ExitCode: 1, Stderr: "simulated backend destroy failure"}, errors.New("backend failure")
@@ -4368,7 +4398,7 @@ func TestSignalExitCode128PlusSignal(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	runner.snapshots = "agbox:v1 1m 100M\n"
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
@@ -4411,7 +4441,7 @@ func TestAuthAndRemoteControlExecStreamFlags(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+		runner.sandboxes = fakeMSBLS("agbox-base stopped")
 		runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
 		runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 			if len(req.Args) >= 1 && req.Args[0] == "ls" {
@@ -4462,7 +4492,7 @@ func TestAuthAndRemoteControlExecStreamFlags(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+		runner.sandboxes = fakeMSBLS("agbox-base stopped")
 		runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
 
 		projDir := filepath.Join(app.Env.HomeReal, "proj-rc-stream")
@@ -4518,7 +4548,7 @@ func TestCreateBaseAndEditBaseTeardownUnderCanceledContext(t *testing.T) {
 
 		runner.ctxHandler = func(callCtx context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
 			if len(req.Args) >= 1 && req.Args[0] == "ls" {
-				return msb.CommandResult{Stdout: "NAME STATE\n"}, nil
+				return msb.CommandResult{Stdout: fakeMSBLS()}, nil
 			}
 			if len(req.Args) >= 1 && req.Args[0] == "create" {
 				return msb.CommandResult{}, nil
@@ -4568,7 +4598,7 @@ func TestCreateBaseAndEditBaseTeardownUnderCanceledContext(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+		runner.sandboxes = fakeMSBLS("agbox-base stopped")
 		runner.snapshots = "NAME CREATED\nagbox:v1 1m\n"
 
 		parentCtx, cancelParent := context.WithCancel(context.Background())
@@ -4691,7 +4721,7 @@ func TestStopUnderCanceledContextFlushesProfile(t *testing.T) {
 	if err := config.SaveRunMeta(filepath.Join(runDir, "run.meta"), meta); err != nil {
 		t.Fatal(err)
 	}
-	runner.sandboxes = "NAME STATE\n" + sbName + " running\n"
+	runner.sandboxes = fakeMSBLS(sbName + " running")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -4725,7 +4755,7 @@ func TestStopUnderCanceledContextFlushesProfile(t *testing.T) {
 
 func TestRemoveFlushesRunningSandboxes(t *testing.T) {
 	app, runner, _, _ := newTestApp(t)
-	runner.sandboxes = "NAME STATE\nagbox-base running\nagbox-run-100 running\nagbox-run-200 stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base running", "agbox-run-100 running", "agbox-run-200 stopped")
 
 	if err := app.remove(context.Background(), []string{"--yes", "--allow-root"}); err != nil {
 		t.Fatalf("Remove failed: %v", err)
@@ -4796,7 +4826,7 @@ func TestResumeRollbackFlushesProfileDisk(t *testing.T) {
 
 	metaPath := filepath.Join(runDir, "run.meta")
 	volName := persist.FormatProfileVolumeName(meta.Profile)
-	runner.sandboxes = "NAME STATE\n" + sbName + " stopped\n"
+	runner.sandboxes = fakeMSBLS(sbName + " stopped")
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
 			return msb.CommandResult{Stdout: runner.sandboxes}, nil
@@ -5402,9 +5432,9 @@ func TestSecurityFixesProfileLockRefreshAndInitialRunMeta(t *testing.T) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
 			lsCount++
 			if lsCount == 1 {
-				return msb.CommandResult{Stdout: "NAME STATE\nagbox-base stopped\n"}, nil
+				return msb.CommandResult{Stdout: fakeMSBLS("agbox-base stopped")}, nil
 			}
-			return msb.CommandResult{Stdout: "NAME STATE\nagbox-base stopped\nagbox-other1 running\n"}, nil
+			return msb.CommandResult{Stdout: fakeMSBLS("agbox-base stopped", "agbox-other1 running")}, nil
 		}
 		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
 			return msb.CommandResult{Stdout: runner.snapshots}, nil
@@ -5620,7 +5650,7 @@ func TestShareUpgradeOnlyRollbackAndErrorWrapping(t *testing.T) {
 	corruptDir := filepath.Join(app.Env.DataDir, "run", "corrupt1")
 	_ = os.MkdirAll(corruptDir, 0o700)
 	_ = os.WriteFile(filepath.Join(corruptDir, "suspended"), []byte("{not-json"), 0o600)
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-corrupt1 stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-corrupt1 stopped")
 	sErr := app.share(ctx, []string{"list", "agbox-corrupt1"})
 	if sErr == nil || strings.Contains(sErr.Error(), "not suspended") {
 		t.Fatalf("expected wrapped suspended parse error, got %v", sErr)
@@ -5825,9 +5855,9 @@ func TestEditBaseNoSnapCategoriesRequireBaseAndResumeM6H9(t *testing.T) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
 			lsCalls++
 			if lsCalls == 1 {
-				return msb.CommandResult{Stdout: "NAME STATE\nagbox-base stopped\nagbox-resprof1 stopped\n"}, nil
+				return msb.CommandResult{Stdout: fakeMSBLS("agbox-base stopped", "agbox-resprof1 stopped")}, nil
 			}
-			return msb.CommandResult{Stdout: "NAME STATE\nagbox-base stopped\nagbox-resprof1 stopped\nagbox-otherp running\n"}, nil
+			return msb.CommandResult{Stdout: fakeMSBLS("agbox-base stopped", "agbox-resprof1 stopped", "agbox-otherp running")}, nil
 		}
 		return msb.CommandResult{}, nil
 	}
@@ -5851,7 +5881,7 @@ func TestEditBaseNoSnapCategoriesRequireBaseAndResumeM6H9(t *testing.T) {
 		NoRules:      true,
 		NoAgentCache: true,
 	})
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-remfail stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-remfail stopped")
 	runner.calls = nil
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
@@ -5907,7 +5937,7 @@ func TestPersistAndResumeSuspendOnCtrlCOrNonZeroExit(t *testing.T) {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
 		if len(req.Args) >= 1 && req.Args[0] == "ls" {
 			return msb.CommandResult{Stdout: runner.sandboxes}, nil
@@ -5916,11 +5946,11 @@ func TestPersistAndResumeSuspendOnCtrlCOrNonZeroExit(t *testing.T) {
 			return msb.CommandResult{Stdout: runner.snapshots}, nil
 		}
 		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl running\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-pctrl running")
 			return msb.CommandResult{}, nil
 		}
 		if slices.Equal(req.Args, []string{"stop", "agbox-pctrl"}) {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl stopped\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-pctrl stopped")
 			return msb.CommandResult{}, nil
 		}
 		if len(req.Args) >= 1 && req.Args[0] == "exec" && req.Interactive {
@@ -5965,11 +5995,11 @@ func TestPersistAndResumeSuspendOnCtrlCOrNonZeroExit(t *testing.T) {
 			return msb.CommandResult{Stdout: runner.sandboxes}, nil
 		}
 		if slices.Equal(req.Args, []string{"start", "agbox-pctrl"}) {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl running\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-pctrl running")
 			return msb.CommandResult{}, nil
 		}
 		if slices.Equal(req.Args, []string{"stop", "agbox-pctrl"}) {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl stopped\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-pctrl stopped")
 			return msb.CommandResult{}, nil
 		}
 		if len(req.Args) >= 1 && req.Args[0] == "exec" && req.Interactive {
@@ -5992,11 +6022,11 @@ func TestPersistAndResumeSuspendOnCtrlCOrNonZeroExit(t *testing.T) {
 			return msb.CommandResult{Stdout: runner.sandboxes}, nil
 		}
 		if slices.Equal(req.Args, []string{"start", "agbox-pctrl"}) {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl running\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-pctrl running")
 			return msb.CommandResult{}, nil
 		}
 		if slices.Equal(req.Args, []string{"stop", "agbox-pctrl"}) {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-pctrl stopped\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-pctrl stopped")
 			return msb.CommandResult{}, nil
 		}
 		return msb.CommandResult{}, nil
@@ -6038,18 +6068,18 @@ func TestDirectMountReadOnlySingleFileMaskAutoAndResume(t *testing.T) {
 		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
 			for i := 0; i+1 < len(req.Args); i++ {
 				if req.Args[i] == "--name" {
-					runner.sandboxes = "NAME STATE\nagbox-base stopped\n" + req.Args[i+1] + " running\n"
+					runner.sandboxes = fakeMSBLS("agbox-base stopped", req.Args[i+1]+" running")
 				}
 			}
 			return msb.CommandResult{}, nil
 		}
 		if len(req.Args) >= 2 && req.Args[0] == "stop" {
 			sbx := req.Args[len(req.Args)-1]
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\n" + sbx + " stopped\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", sbx+" stopped")
 			return msb.CommandResult{}, nil
 		}
 		if len(req.Args) >= 2 && req.Args[0] == "start" {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\n" + req.Args[1] + " running\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", req.Args[1]+" running")
 			return msb.CommandResult{}, nil
 		}
 		return msb.CommandResult{}, nil
@@ -6081,7 +6111,7 @@ func TestDirectMountReadOnlySingleFileMaskAutoAndResume(t *testing.T) {
 	}
 
 	// 2. `AGBOX_MASK_VCS=auto` fallback on `--ro` succeeds SaveRunMeta and resumes cleanly.
-	runner.sandboxes = "NAME STATE\nagbox-base stopped\n"
+	runner.sandboxes = fakeMSBLS("agbox-base stopped")
 	app.Env.MaskVCS = config.MaskAuto
 	origHub := app.StartHub
 	app.StartHub = func(_, _, _ string, _ []vcsfuse.HubShareConfig, _ bool) (int, error) {
@@ -6170,15 +6200,15 @@ func TestSingleRootWarningAcrossAuthUpdateAndPersistResume(t *testing.T) {
 			return msb.CommandResult{Stdout: runner.snapshots}, nil
 		}
 		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rootp running\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-rootp running")
 			return msb.CommandResult{}, nil
 		}
 		if slices.Equal(req.Args, []string{"stop", "agbox-rootp"}) {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rootp stopped\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-rootp stopped")
 			return msb.CommandResult{}, nil
 		}
 		if slices.Equal(req.Args, []string{"start", "agbox-rootp"}) {
-			runner.sandboxes = "NAME STATE\nagbox-base stopped\nagbox-rootp running\n"
+			runner.sandboxes = fakeMSBLS("agbox-base stopped", "agbox-rootp running")
 			return msb.CommandResult{}, nil
 		}
 		return msb.CommandResult{}, nil
@@ -6193,4 +6223,1019 @@ func TestSingleRootWarningAcrossAuthUpdateAndPersistResume(t *testing.T) {
 	if got := strings.Count(stderr.String(), "Root mode is active"); got != 1 {
 		t.Errorf("run --allow-root --persist resume emitted %d root warnings, want 1: %s", got, stderr.String())
 	}
+}
+
+func TestPersistRemoteControlCmdOverrideAndRestore(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+	app.IsTTY = func() bool { return false }
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "both",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	projDir := filepath.Join(app.Env.HomeReal, "rc-proj")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	stateByName := map[string]string{
+		"agbox-base": "stopped",
+	}
+	renderSandboxes := func() string {
+		var b strings.Builder
+		var rows []string
+		for _, name := range []string{"agbox-base", "agbox-rcbox", "agbox-rctui", "agbox-rcsrv"} {
+			if st, ok := stateByName[name]; ok {
+				rows = append(rows, name+" "+st)
+			}
+		}
+		b.WriteString(fakeMSBLS(rows...))
+		return b.String()
+	}
+
+	runner.handler = func(req msb.CommandRequest) (msb.CommandResult, error) {
+		if len(req.Args) >= 1 && req.Args[0] == "ls" {
+			return msb.CommandResult{Stdout: renderSandboxes()}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "ls" {
+			return msb.CommandResult{Stdout: runner.snapshots}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "snap" && req.Args[1] == "restore" {
+			for i := 0; i+1 < len(req.Args); i++ {
+				if req.Args[i] == "--name" {
+					stateByName[req.Args[i+1]] = "running"
+				}
+			}
+			return msb.CommandResult{}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "start" {
+			stateByName[req.Args[1]] = "running"
+			return msb.CommandResult{}, nil
+		}
+		if len(req.Args) >= 2 && req.Args[0] == "stop" {
+			stateByName[req.Args[len(req.Args)-1]] = "stopped"
+			return msb.CommandResult{}, nil
+		}
+		if len(req.Args) >= 1 && req.Args[0] == "exec" {
+			_, _, cmdStr := parseFakeExecCall(req.Args)
+			if strings.Contains(cmdStr, "RC_CMD_OK") {
+				if req.Stdout != nil {
+					_, _ = io.WriteString(req.Stdout, "RC_CMD_OK\n")
+				}
+				return msb.CommandResult{}, nil
+			}
+			if strings.Contains(cmdStr, "exit 9") {
+				return msb.CommandResult{ExitCode: 9}, errors.New("exit status 9")
+			}
+		}
+		return msb.CommandResult{}, nil
+	}
+
+	// 1. Start a detached persistent Remote Control sandbox and suspend it.
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "rcbox", "-d", "--remote-control", projDir}); rc != 0 {
+		t.Fatalf("initial run --persist -d --remote-control failed: %s", stderr.String())
+	}
+	rcDir := filepath.Join(app.Env.DataDir, "run", "rcbox")
+	if !hasMarker(filepath.Join(rcDir, "detached")) {
+		t.Fatal("expected detached marker after initial --remote-control start")
+	}
+	if rc := app.dispatch(ctx, []string{"suspend", "agbox-rcbox"}); rc != 0 {
+		t.Fatalf("suspend agbox-rcbox failed: %s", stderr.String())
+	}
+
+	// 2. Run --persist --cmd on the suspended Remote Control sandbox without a TTY.
+	runner.calls = nil
+	stdout.Reset()
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "rcbox", "--cmd", "echo RC_CMD_OK"}); rc != 0 {
+		t.Fatalf("run --persist --name rcbox --cmd failed (rc=%d): %s", rc, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "RC_CMD_OK") {
+		t.Fatalf("expected --cmd output RC_CMD_OK, got %q", stdout.String())
+	}
+	for _, c := range runner.calls {
+		_, _, cmdStr := parseFakeExecCall(c.Args)
+		if strings.Contains(cmdStr, "agy remote-control start") {
+			t.Fatalf("expected --cmd override not to start Remote Control, got %v", c.Args)
+		}
+	}
+	if hasMarker(filepath.Join(rcDir, "detached")) {
+		t.Fatal("expected --cmd override not to leave a detached marker")
+	}
+	if !hasMarker(filepath.Join(rcDir, "suspended")) {
+		t.Fatal("expected --cmd override on persistent sandbox to re-suspend on exit")
+	}
+	for _, metaFile := range []string{"suspended", "run.meta"} {
+		gotMeta, err := config.LoadRunMeta(filepath.Join(rcDir, metaFile))
+		if err != nil {
+			t.Fatalf("load %s after --cmd override: %v", metaFile, err)
+		}
+		if gotMeta.Mode != config.RunModeRemoteControl || !gotMeta.RemoteControl || gotMeta.Cmd != "" || gotMeta.Agent != "antigravity" {
+			t.Fatalf("%s did not restore Remote Control metadata: %+v", metaFile, gotMeta)
+		}
+	}
+
+	// 3. Plain agbox resume without a TTY starts Remote Control again.
+	runner.calls = nil
+	stdout.Reset()
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-rcbox"}); rc != 0 {
+		t.Fatalf("plain resume agbox-rcbox failed: %s", stderr.String())
+	}
+	sawRCResume := false
+	for _, c := range runner.calls {
+		_, _, cmdStr := parseFakeExecCall(c.Args)
+		if strings.Contains(cmdStr, "agy remote-control start --name 'agbox-rcbox'") {
+			sawRCResume = true
+		}
+	}
+	if !sawRCResume {
+		t.Fatal("expected plain resume after --cmd override to start Remote Control")
+	}
+	if !hasMarker(filepath.Join(rcDir, "detached")) {
+		t.Fatal("expected plain resume of Remote Control sandbox to detach")
+	}
+
+	// 4. Check a TUI Remote Control sandbox and a non-zero --cmd exit code.
+	rcTUIDir := filepath.Join(app.Env.DataDir, "run", "rctui")
+	if err := config.EnsurePrivateDir(rcTUIDir); err != nil {
+		t.Fatal(err)
+	}
+	tuiRCMeta := config.RunMeta{
+		Sandbox:       "agbox-rctui",
+		OwnerPID:      app.PID,
+		Agent:         "antigravity",
+		Mode:          config.RunModeTUI,
+		RemoteControl: true,
+		Persist:       true,
+		MaskMode:      config.MaskStrict,
+	}
+	if err := config.SaveRunMeta(filepath.Join(rcTUIDir, "suspended"), tuiRCMeta); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(rcTUIDir, "run.meta"), tuiRCMeta); err != nil {
+		t.Fatal(err)
+	}
+	stateByName["agbox-rctui"] = "stopped"
+
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "rctui", "--cmd", "exit 9", "opencode"}); rc != 9 {
+		t.Fatalf("expected non-zero --cmd exit code 9, got %d (stderr=%q)", rc, stderr.String())
+	}
+	for _, c := range runner.calls {
+		_, _, cmdStr := parseFakeExecCall(c.Args)
+		if strings.Contains(cmdStr, "agy remote-control start") {
+			t.Fatalf("expected failing --cmd override not to start Remote Control, got %v", c.Args)
+		}
+	}
+	for _, metaFile := range []string{"suspended", "run.meta"} {
+		gotMeta, err := config.LoadRunMeta(filepath.Join(rcTUIDir, metaFile))
+		if err != nil {
+			t.Fatalf("load %s after failing --cmd override: %v", metaFile, err)
+		}
+		if gotMeta.Mode != config.RunModeTUI || !gotMeta.RemoteControl || gotMeta.Cmd != "" || gotMeta.Agent != "antigravity" {
+			t.Fatalf("%s did not restore TUI Remote Control metadata: %+v", metaFile, gotMeta)
+		}
+	}
+
+	runner.calls = nil
+	if rc := app.dispatch(ctx, []string{"resume", "agbox-rctui"}); rc != 0 {
+		t.Fatalf("non-TTY resume agbox-rctui failed: %s", stderr.String())
+	}
+	sawTUIUpgrade := false
+	for _, c := range runner.calls {
+		_, _, cmdStr := parseFakeExecCall(c.Args)
+		if strings.Contains(cmdStr, "agy remote-control start --name 'agbox-rctui'") {
+			sawTUIUpgrade = true
+		}
+	}
+	if !sawTUIUpgrade {
+		t.Fatal("expected non-TTY resume of TUI Remote Control sandbox to start Remote Control")
+	}
+
+	// 5. Check --serve override clears RemoteControl when resuming a sandbox with a saved port.
+	app.WaitServeUI = func(context.Context, int, string) bool { return true }
+	rcSrvDir := filepath.Join(app.Env.DataDir, "run", "rcsrv")
+	if err := config.EnsurePrivateDir(rcSrvDir); err != nil {
+		t.Fatal(err)
+	}
+	rcSrvMeta := config.RunMeta{
+		Sandbox:       "agbox-rcsrv",
+		OwnerPID:      app.PID,
+		Agent:         "antigravity",
+		Mode:          config.RunModeRemoteControl,
+		RemoteControl: true,
+		Port:          4096,
+		Persist:       true,
+		MaskMode:      config.MaskStrict,
+	}
+	if err := config.SaveRunMeta(filepath.Join(rcSrvDir, "suspended"), rcSrvMeta); err != nil {
+		t.Fatal(err)
+	}
+	stateByName["agbox-rcsrv"] = "stopped"
+
+	runner.calls = nil
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "rcsrv", "-d", "--serve"}); rc != 0 {
+		t.Fatalf("run --persist -d --serve override failed: %s", stderr.String())
+	}
+	sawServe := false
+	for _, c := range runner.calls {
+		_, _, cmdStr := parseFakeExecCall(c.Args)
+		if strings.Contains(cmdStr, "agy remote-control start") {
+			t.Fatalf("expected --serve override not to start Remote Control, got %v", c.Args)
+		}
+		if strings.Contains(cmdStr, "opencode serve") {
+			sawServe = true
+		}
+	}
+	if !sawServe {
+		t.Fatal("expected --serve override to start opencode serve")
+	}
+	srvRunMeta, err := config.LoadRunMeta(filepath.Join(rcSrvDir, "run.meta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srvRunMeta.Mode != config.RunModeServe || srvRunMeta.RemoteControl || srvRunMeta.Agent != "opencode" {
+		t.Fatalf("unexpected run.meta after --serve override: %+v", srvRunMeta)
+	}
+
+	// 6. Check interactive agent switches clear incompatible Serve or Remote Control modes.
+	if rc := app.dispatch(ctx, []string{"suspend", "agbox-rcsrv"}); rc != 0 {
+		t.Fatalf("suspend agbox-rcsrv failed: %s", stderr.String())
+	}
+	app.IsTTY = func() bool { return true }
+	runner.calls = nil
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "rcsrv", "antigravity"}); rc != 0 {
+		t.Fatalf("run --persist antigravity TUI override failed: %s", stderr.String())
+	}
+	agySuspMeta, err := config.LoadRunMeta(filepath.Join(rcSrvDir, "suspended"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agySuspMeta.Mode != config.RunModeTUI || agySuspMeta.Agent != "antigravity" || agySuspMeta.RemoteControl {
+		t.Fatalf("unexpected suspended metadata after antigravity TUI switch: %+v", agySuspMeta)
+	}
+
+	if rc := app.dispatch(ctx, []string{"suspend", "agbox-rcbox"}); rc != 0 {
+		t.Fatalf("suspend agbox-rcbox before opencode switch failed: %s", stderr.String())
+	}
+	runner.calls = nil
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "rcbox", "opencode", projDir}); rc != 0 {
+		t.Fatalf("run --persist opencode TUI override failed: %s", stderr.String())
+	}
+	ocSuspMeta, err := config.LoadRunMeta(filepath.Join(rcDir, "suspended"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ocSuspMeta.Mode != config.RunModeTUI || ocSuspMeta.Agent != "opencode" || ocSuspMeta.RemoteControl {
+		t.Fatalf("unexpected suspended metadata after opencode TUI switch: %+v", ocSuspMeta)
+	}
+}
+
+func TestShareListRealMSBLSLayoutAndMissingRunMeta(t *testing.T) {
+	app, runner, stdout, stderr := newTestApp(t)
+	ctx := context.Background()
+
+	if err := config.SaveFile(app.Env.ConfigFile, config.State{
+		Agent:     "both",
+		Image:     "node:24-bookworm-slim",
+		Snapshot:  "agbox:v1",
+		SnapCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	projDir := filepath.Join(app.Env.HomeReal, "blip-proj")
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var activeLn net.Listener
+	var activeHub *vcsfuse.WorkspaceHub
+	t.Cleanup(func() {
+		if activeLn != nil {
+			_ = activeLn.Close()
+		}
+		if activeHub != nil {
+			activeHub.CloseAll()
+		}
+	})
+	app.StartHub = func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, _ bool) (int, error) {
+		if activeLn != nil {
+			_ = activeLn.Close()
+			activeLn = nil
+		}
+		if activeHub != nil {
+			activeHub.CloseAll()
+			activeHub = nil
+		}
+		if err := os.MkdirAll(mntDir, 0o700); err != nil {
+			return 0, err
+		}
+		h, err := vcsfuse.NewWorkspaceHubWithOptions(initial, vcsfuse.HubOptions{
+			HomeReal:         app.Env.HomeReal,
+			DataDir:          app.Env.DataDir,
+			MSBHome:          app.Env.MSBHome,
+			AllowOutsideHome: app.Env.AllowOutsideHome,
+			MapGuestIDs:      true,
+			GuestUID:         config.GuestUID,
+			GuestGID:         config.GuestGID,
+		})
+		if err != nil {
+			return 0, err
+		}
+		ln, err := vcsfuse.ServeControlSocket(sockPath, h)
+		if err != nil {
+			h.CloseAll()
+			return 0, err
+		}
+		activeHub = h
+		activeLn = ln
+		if err := os.WriteFile(pidFile, []byte("9998\n"), 0o600); err != nil {
+			return 0, err
+		}
+		return 9998, nil
+	}
+
+	// 1. Start agbox-blip and list shares with the real msb ls 4-column layout.
+	if rc := app.dispatch(ctx, []string{"run", "--persist", "--name", "blip", "-d", "--remote-control", projDir}); rc != 0 {
+		t.Fatalf("run --persist --name blip -d --remote-control failed: %s", stderr.String())
+	}
+	runner.sandboxes = strings.Join([]string{
+		"NAME          IMAGE                    STATUS     CREATED",
+		"agbox-blip    node:24-bookworm-slim    running    2026-11-14 14:59:39",
+		"agbox-base    node:24-bookworm-slim    stopped    2026-11-14 14:49:18",
+		"",
+	}, "\n")
+
+	stdout.Reset()
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"share", "list", "agbox-blip"}); rc != 0 {
+		t.Fatalf("share list agbox-blip on running sandbox failed (rc=%d): %s", rc, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "/workspace/blip-proj\tmode=rw\tvcs=mask") {
+		t.Fatalf("unexpected share list output for running agbox-blip: %q", stdout.String())
+	}
+
+	// 2. Delete run.meta on the running sandbox and check the missing-metadata error.
+	if err := os.Remove(filepath.Join(app.Env.DataDir, "run", "blip", "run.meta")); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := app.dispatch(ctx, []string{"share", "list", "agbox-blip"}); rc == 0 {
+		t.Fatal("expected share list on running sandbox without run.meta to fail")
+	}
+	wantErr := `sandbox "agbox-blip" has no agbox run metadata. Stop it and start it again with 'agbox run'`
+	if !strings.Contains(stderr.String(), wantErr) {
+		t.Fatalf("expected missing run.meta error %q, got %q", wantErr, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "stopped and not suspended") {
+		t.Fatalf("running sandbox misclassified as stopped: %q", stderr.String())
+	}
+}
+
+func TestSnapshotRemovalHelpers(t *testing.T) {
+	versionCases := []struct {
+		snap string
+		want int
+		ok   bool
+	}{
+		{snap: "agbox:v1", want: 1, ok: true},
+		{snap: "agbox:v10", want: 10, ok: true},
+		{snap: "agbox:v0", want: 0, ok: true},
+		{snap: "agbox:v02", want: 2, ok: true},
+		{snap: "agbox:v", want: 0, ok: false},
+		{snap: "agbox:custom", want: 0, ok: false},
+		{snap: "other:v1", want: 0, ok: false},
+		{snap: "agbox:v99999999999999999999999999999", want: 0, ok: false},
+		{snap: "", want: 0, ok: false},
+	}
+	for _, tc := range versionCases {
+		got, ok := agboxSnapshotVersion(tc.snap)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("agboxSnapshotVersion(%q) = (%d, %v), want (%d, %v)", tc.snap, got, ok, tc.want, tc.ok)
+		}
+	}
+
+	sortCases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{name: "empty", in: nil, want: nil},
+		{name: "single", in: []string{"agbox:v1"}, want: []string{"agbox:v1"}},
+		{
+			name: "numeric_descending",
+			in:   []string{"agbox:v1", "agbox:v2", "agbox:v10", "agbox:v3"},
+			want: []string{"agbox:v10", "agbox:v3", "agbox:v2", "agbox:v1"},
+		},
+		{
+			name: "multi_digit_versions",
+			in:   []string{"agbox:v2", "agbox:v20", "agbox:v100", "agbox:v9", "agbox:v1"},
+			want: []string{"agbox:v100", "agbox:v20", "agbox:v9", "agbox:v2", "agbox:v1"},
+		},
+		{
+			name: "leading_zero_tie_break",
+			in:   []string{"agbox:v02", "agbox:v2", "agbox:v1"},
+			want: []string{"agbox:v2", "agbox:v02", "agbox:v1"},
+		},
+		{
+			name: "invalid_tail_sorted_last",
+			in:   []string{"agbox:custom", "agbox:v2", "agbox:v10", "agbox:alpha"},
+			want: []string{"agbox:v10", "agbox:v2", "agbox:custom", "agbox:alpha"},
+		},
+	}
+	for _, tc := range sortCases {
+		got := slices.Clone(tc.in)
+		sortAgboxSnapshotsDesc(got)
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("sortAgboxSnapshotsDesc(%s): got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	partCases := []struct {
+		name      string
+		in        []string
+		wantAgbox []string
+		wantOther []string
+	}{
+		{name: "empty", in: nil, wantAgbox: nil, wantOther: nil},
+		{
+			name: "dedup_partition_and_numeric_sort",
+			in: []string{
+				"other:v1",
+				"agbox:v1",
+				"agbox:custom",
+				"agbox:v10",
+				"agbox:v2",
+				"agbox:v1",
+				"agbox:custom",
+				"agbox-extra:v9",
+				"agbox:",
+				"  agbox:v3  ",
+				"ubuntu:latest",
+			},
+			wantAgbox: []string{"agbox:v10", "agbox:v3", "agbox:v2", "agbox:v1"},
+			wantOther: []string{"agbox:custom"},
+		},
+		{
+			name:      "multiple_custom_members_keep_order",
+			in:        []string{"agbox:pin-a", "agbox:v2", "agbox:v", "agbox:pin-b", "agbox:v1"},
+			wantAgbox: []string{"agbox:v2", "agbox:v1"},
+			wantOther: []string{"agbox:pin-a", "agbox:v", "agbox:pin-b"},
+		},
+		{
+			name:      "unrelated_groups_only",
+			in:        []string{"other:v1", "other:v2"},
+			wantAgbox: nil,
+			wantOther: nil,
+		},
+	}
+	for _, tc := range partCases {
+		gotAgbox, gotOther := partitionGroupSnapshots(tc.in)
+		if !slices.Equal(gotAgbox, tc.wantAgbox) || !slices.Equal(gotOther, tc.wantOther) {
+			t.Errorf("partitionGroupSnapshots(%s) = (%v, %v), want (%v, %v)",
+				tc.name, gotAgbox, gotOther, tc.wantAgbox, tc.wantOther)
+		}
+	}
+
+	headErrCases := []struct {
+		res  msb.CommandResult
+		want bool
+	}{
+		{res: msb.CommandResult{Stderr: "error: cannot remove current head 'agbox:v2'"}, want: true},
+		{res: msb.CommandResult{Stderr: "ERROR: CANNOT REMOVE CURRENT HEAD agbox:v10"}, want: true},
+		{res: msb.CommandResult{Stdout: "Cannot Remove Current Head of group agbox"}, want: true},
+		{res: msb.CommandResult{Stderr: "snapshot has 1 indexed child snapshot(s)"}, want: false},
+		{res: msb.CommandResult{Stderr: "snapshot is locked by an active reader"}, want: false},
+		{res: msb.CommandResult{}, want: false},
+	}
+	for _, tc := range headErrCases {
+		if got := isMSBCurrentHeadError(tc.res); got != tc.want {
+			t.Errorf("isMSBCurrentHeadError(%+v) = %v, want %v", tc.res, got, tc.want)
+		}
+	}
+
+	nextHeadCases := []struct {
+		snap      string
+		other     []string
+		remaining []string
+		want      string
+	}{
+		{
+			snap:      "agbox:v2",
+			other:     []string{"agbox:custom", "agbox:second"},
+			remaining: []string{"agbox:custom", "agbox:second", "agbox:v2", "agbox:v1"},
+			want:      "agbox:custom",
+		},
+		{
+			snap:      "agbox:v10",
+			other:     nil,
+			remaining: []string{"agbox:v10", "agbox:v3", "agbox:v2", "agbox:v1"},
+			want:      "agbox:v1",
+		},
+		{
+			snap:      "agbox:v1",
+			other:     nil,
+			remaining: []string{"agbox:v3", "agbox:v1"},
+			want:      "agbox:v3",
+		},
+		{
+			snap:      "agbox:v1",
+			other:     nil,
+			remaining: []string{"agbox:v1"},
+			want:      "",
+		},
+	}
+	for _, tc := range nextHeadCases {
+		if got := pickNextSnapshotHead(tc.snap, tc.other, tc.remaining); got != tc.want {
+			t.Errorf("pickNextSnapshotHead(%q, %v, %v) = %q, want %q",
+				tc.snap, tc.other, tc.remaining, got, tc.want)
+		}
+	}
+}
+
+type fakeSnapRecord struct {
+	ref          string
+	group        string
+	member       string
+	parent       string
+	lockedErr    string
+	forceHeadErr bool
+}
+
+type fakeSnapGroup struct {
+	head    string
+	members []string
+}
+
+type fakeSnapshotStore struct {
+	msbHome         string
+	ordered         []fakeSnapRecord
+	groups          map[string]*fakeSnapGroup
+	failSnapHeadErr string
+	headTargets     []string
+	rmAttempts      []string
+	rmSucceeded     []string
+	reindexCalls    int
+}
+
+func newFakeSnapshotStore(t *testing.T, msbHome string, records []fakeSnapRecord, heads map[string]string, createOnDisk bool) *fakeSnapshotStore {
+	t.Helper()
+	st := &fakeSnapshotStore{
+		msbHome: msbHome,
+		groups:  make(map[string]*fakeSnapGroup),
+	}
+	for _, rec := range records {
+		parts := strings.SplitN(rec.ref, ":", 2)
+		if len(parts) != 2 {
+			t.Fatalf("invalid snapshot ref %q", rec.ref)
+		}
+		rec.group = parts[0]
+		rec.member = parts[1]
+		st.ordered = append(st.ordered, rec)
+		grp := st.groups[rec.group]
+		if grp == nil {
+			grp = &fakeSnapGroup{}
+			st.groups[rec.group] = grp
+		}
+		grp.members = append(grp.members, rec.ref)
+		if createOnDisk {
+			grpDir := filepath.Join(msbHome, "snapshots", rec.group)
+			if err := os.MkdirAll(grpDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(grpDir, "group.json"), []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(grpDir, rec.member+".snap"), []byte(rec.ref+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for grpName, head := range heads {
+		grp := st.groups[grpName]
+		if grp == nil {
+			t.Fatalf("head configured for unknown group %q", grpName)
+		}
+		grp.head = head
+	}
+	return st
+}
+
+func (s *fakeSnapshotStore) liveSnapshotsNewestFirst() []string {
+	var out []string
+	for i := len(s.ordered) - 1; i >= 0; i-- {
+		out = append(out, s.ordered[i].ref)
+	}
+	return out
+}
+
+func (s *fakeSnapshotStore) renderSnapLS() string {
+	var b strings.Builder
+	b.WriteString("NAME          SCOPE   MIGRATION   IMAGE                    SIZE       CREATED               DIGEST\n")
+	for _, ref := range s.liveSnapshotsNewestFirst() {
+		fmt.Fprintf(&b, "%-13s local   offline     node:24-bookworm-slim    1.12 GiB   2026-11-20 20:00:00   sha256:abcd1234\n", ref)
+	}
+	return b.String()
+}
+
+func (s *fakeSnapshotStore) childCount(parentRef string) int {
+	count := 0
+	for _, rec := range s.ordered {
+		if rec.parent == parentRef {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *fakeSnapshotStore) handle(req msb.CommandRequest) (msb.CommandResult, error) {
+	args := req.Args
+	if len(args) >= 1 && args[0] == "ls" {
+		return msb.CommandResult{Stdout: fakeMSBLS()}, nil
+	}
+	if len(args) >= 2 && args[0] == "volume" && args[1] == "ls" {
+		return msb.CommandResult{Stdout: "NAME\n"}, nil
+	}
+	if len(args) >= 2 && args[0] == "image" && args[1] == "prune" {
+		return msb.CommandResult{}, nil
+	}
+	if len(args) < 2 || args[0] != "snap" {
+		return msb.CommandResult{}, nil
+	}
+
+	switch args[1] {
+	case "ls":
+		return msb.CommandResult{Stdout: s.renderSnapLS()}, nil
+
+	case "head":
+		if len(args) != 3 {
+			return msb.CommandResult{Stderr: "usage: msb snap head <group>:<member>", ExitCode: 2}, errors.New("exit status 2")
+		}
+		target := args[2]
+		s.headTargets = append(s.headTargets, target)
+		if s.failSnapHeadErr != "" {
+			return msb.CommandResult{Stderr: s.failSnapHeadErr, ExitCode: 1}, errors.New("exit status 1")
+		}
+		parts := strings.SplitN(target, ":", 2)
+		if len(parts) != 2 {
+			return msb.CommandResult{Stderr: "invalid snapshot selector", ExitCode: 1}, errors.New("exit status 1")
+		}
+		grp := s.groups[parts[0]]
+		if grp == nil || !slices.Contains(grp.members, target) {
+			return msb.CommandResult{Stderr: "snapshot not found: " + target, ExitCode: 1}, errors.New("exit status 1")
+		}
+		grp.head = target
+		return msb.CommandResult{}, nil
+
+	case "rm":
+		force := false
+		target := ""
+		for _, tok := range args[2:] {
+			switch tok {
+			case "--force", "-f":
+				force = true
+			default:
+				if strings.HasPrefix(tok, "-") {
+					return msb.CommandResult{Stderr: "unknown flag " + tok, ExitCode: 2}, errors.New("exit status 2")
+				}
+				target = tok
+			}
+		}
+		s.rmAttempts = append(s.rmAttempts, fmt.Sprintf("force=%t:%s", force, target))
+
+		idx := slices.IndexFunc(s.ordered, func(r fakeSnapRecord) bool { return r.ref == target })
+		if idx < 0 {
+			return msb.CommandResult{Stderr: "snapshot not found: " + target, ExitCode: 1}, errors.New("exit status 1")
+		}
+		rec := s.ordered[idx]
+		grp := s.groups[rec.group]
+		if rec.lockedErr != "" {
+			return msb.CommandResult{Stderr: rec.lockedErr, ExitCode: 1}, errors.New("exit status 1")
+		}
+		if rec.forceHeadErr || (grp != nil && grp.head == target && len(grp.members) > 1) {
+			msg := fmt.Sprintf("error: cannot remove current head '%s': first select another snapshot with 'msb snapshot head %s:<snapshot>'", target, rec.group)
+			return msb.CommandResult{Stderr: msg, ExitCode: 1}, errors.New("exit status 1")
+		}
+		if children := s.childCount(target); children > 0 && !force {
+			msg := fmt.Sprintf("error: snapshot %s has %d indexed child snapshot(s): pass --force to remove anyway", target, children)
+			return msb.CommandResult{Stderr: msg, ExitCode: 1}, errors.New("exit status 1")
+		}
+
+		s.ordered = slices.Delete(s.ordered, idx, idx+1)
+		if grp != nil {
+			grp.members = slices.DeleteFunc(grp.members, func(m string) bool { return m == target })
+			if len(grp.members) == 0 {
+				grp.head = ""
+			}
+		}
+		snapFile := filepath.Join(s.msbHome, "snapshots", rec.group, rec.member+".snap")
+		if info, err := os.Lstat(filepath.Join(s.msbHome, "snapshots", rec.group)); err == nil && info.Mode()&os.ModeSymlink == 0 {
+			_ = os.Remove(snapFile)
+		}
+		s.rmSucceeded = append(s.rmSucceeded, target)
+		return msb.CommandResult{}, nil
+
+	case "reindex":
+		// Real msb snap reindex upserts on-disk snapshots and never prunes missing SQLite rows.
+		s.reindexCalls++
+		return msb.CommandResult{}, nil
+	}
+	return msb.CommandResult{}, nil
+}
+
+func TestRemoveStatefulSnapshotChainsAndFailClosed(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("single_snapshot_zero_head_switches", func(t *testing.T) {
+		app, runner, _, stderr := newTestApp(t)
+		store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+			{ref: "agbox:v1"},
+		}, map[string]string{"agbox": "agbox:v1"}, true)
+		runner.handler = store.handle
+
+		if err := app.remove(ctx, []string{"--yes"}); err != nil {
+			t.Fatalf("remove failed: %v", err)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("expected zero warnings, got %q", stderr.String())
+		}
+		if len(store.headTargets) != 0 {
+			t.Fatalf("expected 0 snap head calls for sole member, got %v", store.headTargets)
+		}
+		if !slices.Equal(store.rmAttempts, []string{"force=true:agbox:v1"}) {
+			t.Fatalf("unexpected snap rm attempts: %v", store.rmAttempts)
+		}
+		if len(store.liveSnapshotsNewestFirst()) != 0 {
+			t.Fatalf("expected all snapshots deleted, remaining: %v", store.liveSnapshotsNewestFirst())
+		}
+		if _, err := os.Lstat(filepath.Join(app.Env.MSBHome, "snapshots", config.SnapGroup)); !os.IsNotExist(err) {
+			t.Fatalf("expected snapshot group directory to be removed, stat err=%v", err)
+		}
+		if store.reindexCalls != 1 {
+			t.Fatalf("expected 1 snap reindex call, got %d", store.reindexCalls)
+		}
+	})
+
+	t.Run("two_chained_head_v2", func(t *testing.T) {
+		app, runner, _, stderr := newTestApp(t)
+		store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+			{ref: "agbox:v1"},
+			{ref: "agbox:v2", parent: "agbox:v1"},
+		}, map[string]string{"agbox": "agbox:v2"}, true)
+		runner.handler = store.handle
+
+		if err := app.remove(ctx, []string{"--yes"}); err != nil {
+			t.Fatalf("remove failed: %v", err)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("expected zero warnings, got %q", stderr.String())
+		}
+		if !slices.Equal(store.headTargets, []string{"agbox:v1"}) {
+			t.Fatalf("expected 1 snap head switch to agbox:v1, got %v", store.headTargets)
+		}
+		if !slices.Equal(store.rmSucceeded, []string{"agbox:v2", "agbox:v1"}) {
+			t.Fatalf("expected newest-first deletion [agbox:v2 agbox:v1], got %v", store.rmSucceeded)
+		}
+		if len(store.liveSnapshotsNewestFirst()) != 0 {
+			t.Fatalf("expected 0 remaining snapshots, got %v", store.liveSnapshotsNewestFirst())
+		}
+		if _, err := os.Lstat(filepath.Join(app.Env.MSBHome, "snapshots", config.SnapGroup)); !os.IsNotExist(err) {
+			t.Fatalf("expected snapshot group directory to be removed, stat err=%v", err)
+		}
+		if store.reindexCalls != 1 {
+			t.Fatalf("expected 1 snap reindex call, got %d", store.reindexCalls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name      string
+		head      string
+		wantHeads []string
+	}{
+		{name: "n_chained_head_v10", head: "agbox:v10", wantHeads: []string{"agbox:v1"}},
+		{name: "n_chained_head_v2", head: "agbox:v2", wantHeads: []string{"agbox:v1"}},
+		{name: "n_chained_head_v1", head: "agbox:v1", wantHeads: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, runner, _, stderr := newTestApp(t)
+			// Order records so lexicographic vs numeric sorting is tested (v10 > v3 > v2 > v1).
+			store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+				{ref: "agbox:v1"},
+				{ref: "agbox:v2", parent: "agbox:v1"},
+				{ref: "agbox:v10", parent: "agbox:v3"},
+				{ref: "agbox:v3", parent: "agbox:v2"},
+			}, map[string]string{"agbox": tc.head}, true)
+			runner.handler = store.handle
+
+			if err := app.remove(ctx, []string{"--yes"}); err != nil {
+				t.Fatalf("remove failed: %v", err)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("expected zero warnings, got %q", stderr.String())
+			}
+			if !slices.Equal(store.headTargets, tc.wantHeads) {
+				t.Fatalf("snap head targets = %v, want %v", store.headTargets, tc.wantHeads)
+			}
+			wantOrder := []string{"agbox:v10", "agbox:v3", "agbox:v2", "agbox:v1"}
+			if !slices.Equal(store.rmSucceeded, wantOrder) {
+				t.Fatalf("deleted order = %v, want %v", store.rmSucceeded, wantOrder)
+			}
+			if len(store.liveSnapshotsNewestFirst()) != 0 {
+				t.Fatalf("expected 0 remaining snapshots, got %v", store.liveSnapshotsNewestFirst())
+			}
+			if _, err := os.Lstat(filepath.Join(app.Env.MSBHome, "snapshots", config.SnapGroup)); !os.IsNotExist(err) {
+				t.Fatalf("expected snapshot group directory to be removed, stat err=%v", err)
+			}
+		})
+	}
+
+	t.Run("mixed_group_preserves_custom_and_group_dir", func(t *testing.T) {
+		app, runner, _, stderr := newTestApp(t)
+		// agbox:custom is a child of agbox:v2 so deleting agbox:v2 requires --force.
+		store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+			{ref: "agbox:v1"},
+			{ref: "agbox:v2", parent: "agbox:v1"},
+			{ref: "agbox:custom", parent: "agbox:v2"},
+		}, map[string]string{"agbox": "agbox:v2"}, true)
+		runner.handler = store.handle
+
+		if err := app.remove(ctx, []string{"--yes"}); err != nil {
+			t.Fatalf("remove failed: %v", err)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("expected zero warnings, got %q", stderr.String())
+		}
+		if !slices.Equal(store.headTargets, []string{"agbox:custom"}) {
+			t.Fatalf("expected head switch to agbox:custom, got %v", store.headTargets)
+		}
+		if !slices.Equal(store.rmSucceeded, []string{"agbox:v2", "agbox:v1"}) {
+			t.Fatalf("expected [agbox:v2 agbox:v1] deleted, got %v", store.rmSucceeded)
+		}
+		if !slices.Equal(store.liveSnapshotsNewestFirst(), []string{"agbox:custom"}) {
+			t.Fatalf("expected agbox:custom preserved in store, got %v", store.liveSnapshotsNewestFirst())
+		}
+		if store.groups["agbox"].head != "agbox:custom" {
+			t.Fatalf("expected group head agbox:custom, got %q", store.groups["agbox"].head)
+		}
+		customSnapPath := filepath.Join(app.Env.MSBHome, "snapshots", config.SnapGroup, "custom.snap")
+		if _, err := os.Stat(customSnapPath); err != nil {
+			t.Fatalf("expected %s to remain on disk: %v", customSnapPath, err)
+		}
+		if store.reindexCalls != 1 {
+			t.Fatalf("expected 1 snap reindex call, got %d", store.reindexCalls)
+		}
+	})
+
+	t.Run("unrelated_group_untouched", func(t *testing.T) {
+		app, runner, _, stderr := newTestApp(t)
+		// other:v1 has parent agbox:v1 so deleting agbox:v1 exercises --force across groups.
+		store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+			{ref: "agbox:v1"},
+			{ref: "agbox:v2", parent: "agbox:v1"},
+			{ref: "other:v1", parent: "agbox:v1"},
+			{ref: "other:v2", parent: "other:v1"},
+		}, map[string]string{
+			"agbox": "agbox:v2",
+			"other": "other:v2",
+		}, true)
+		runner.handler = store.handle
+
+		if err := app.remove(ctx, []string{"--yes"}); err != nil {
+			t.Fatalf("remove failed: %v", err)
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("expected zero warnings, got %q", stderr.String())
+		}
+		if !slices.Equal(store.rmSucceeded, []string{"agbox:v2", "agbox:v1"}) {
+			t.Fatalf("unexpected deleted snapshots: %v", store.rmSucceeded)
+		}
+		if !slices.Equal(store.liveSnapshotsNewestFirst(), []string{"other:v2", "other:v1"}) {
+			t.Fatalf("expected other group untouched, got %v", store.liveSnapshotsNewestFirst())
+		}
+		if _, err := os.Lstat(filepath.Join(app.Env.MSBHome, "snapshots", config.SnapGroup)); !os.IsNotExist(err) {
+			t.Fatalf("expected agbox snapshot dir removed, stat err=%v", err)
+		}
+		if _, err := os.Stat(filepath.Join(app.Env.MSBHome, "snapshots", "other", "v1.snap")); err != nil {
+			t.Fatalf("expected other group snapshot file untouched: %v", err)
+		}
+	})
+
+	t.Run("fail_closed_locked_snapshot_preserves_group_dir", func(t *testing.T) {
+		app, runner, _, stderr := newTestApp(t)
+		store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+			{ref: "agbox:v1", lockedErr: "snapshot agbox:v1 has an active reader lease"},
+			{ref: "agbox:v2", parent: "agbox:v1"},
+		}, map[string]string{"agbox": "agbox:v2"}, true)
+		runner.handler = store.handle
+
+		if err := app.remove(ctx, []string{"--yes"}); err != nil {
+			t.Fatalf("remove failed: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "Could not delete snapshot agbox:v1:") ||
+			!strings.Contains(stderr.String(), "active reader lease") {
+			t.Fatalf("expected warning with msb lease detail, got %q", stderr.String())
+		}
+		snapGroupDir := filepath.Join(app.Env.MSBHome, "snapshots", config.SnapGroup)
+		if _, err := os.Stat(filepath.Join(snapGroupDir, "v1.snap")); err != nil {
+			t.Fatalf("fail-closed violation: v1.snap deleted despite failed msb snap rm: %v", err)
+		}
+		if !slices.Equal(store.liveSnapshotsNewestFirst(), []string{"agbox:v1"}) {
+			t.Fatalf("expected agbox:v1 to remain indexed, got %v", store.liveSnapshotsNewestFirst())
+		}
+		if store.reindexCalls != 1 {
+			t.Fatalf("expected 1 snap reindex call because v2 was deleted, got %d", store.reindexCalls)
+		}
+	})
+
+	t.Run("fail_closed_head_switch_error_preserves_group_dir", func(t *testing.T) {
+		app, runner, _, stderr := newTestApp(t)
+		store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+			{ref: "agbox:v1"},
+			{ref: "agbox:v2", parent: "agbox:v1"},
+		}, map[string]string{"agbox": "agbox:v2"}, true)
+		store.failSnapHeadErr = "group lock contention on agbox"
+		runner.handler = store.handle
+
+		if err := app.remove(ctx, []string{"--yes"}); err != nil {
+			t.Fatalf("remove failed: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "Could not switch snapshot head to agbox:v1 before deleting agbox:v2:") ||
+			!strings.Contains(stderr.String(), "group lock contention on agbox") {
+			t.Fatalf("expected head-switch warning with msb detail, got %q", stderr.String())
+		}
+		snapGroupDir := filepath.Join(app.Env.MSBHome, "snapshots", config.SnapGroup)
+		if _, err := os.Stat(filepath.Join(snapGroupDir, "v2.snap")); err != nil {
+			t.Fatalf("fail-closed violation: v2.snap deleted despite failed msb snap head: %v", err)
+		}
+	})
+
+	t.Run("fail_closed_unlisted_head_member_skips_group_dir_and_reindex", func(t *testing.T) {
+		app, runner, _, stderr := newTestApp(t)
+		store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+			{ref: "agbox:v1", forceHeadErr: true},
+		}, map[string]string{"agbox": "agbox:v1"}, true)
+		runner.handler = store.handle
+
+		if err := app.remove(ctx, []string{"--yes"}); err != nil {
+			t.Fatalf("remove failed: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "Could not delete snapshot agbox:v1:") {
+			t.Fatalf("expected snapshot delete warning, got %q", stderr.String())
+		}
+		if len(store.headTargets) != 0 {
+			t.Fatalf("expected 0 snap head calls when no alternate member exists, got %v", store.headTargets)
+		}
+		if _, err := os.Stat(filepath.Join(app.Env.MSBHome, "snapshots", config.SnapGroup, "group.json")); err != nil {
+			t.Fatalf("expected group directory to remain intact: %v", err)
+		}
+		if store.reindexCalls != 0 {
+			t.Fatalf("expected 0 snap reindex calls when nothing was removed, got %d", store.reindexCalls)
+		}
+	})
+
+	t.Run("symlinked_group_dir_skipped_after_chained_removal", func(t *testing.T) {
+		app, runner, _, stderr := newTestApp(t)
+		store := newFakeSnapshotStore(t, app.Env.MSBHome, []fakeSnapRecord{
+			{ref: "agbox:v1"},
+			{ref: "agbox:v2", parent: "agbox:v1"},
+		}, map[string]string{"agbox": "agbox:v2"}, false)
+		runner.handler = store.handle
+
+		snapParent := filepath.Join(app.Env.MSBHome, "snapshots")
+		if err := os.MkdirAll(snapParent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		outsideSnap := t.TempDir()
+		keepFile := filepath.Join(outsideSnap, "keep.txt")
+		if err := os.WriteFile(keepFile, []byte("safe\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outsideSnap, filepath.Join(snapParent, config.SnapGroup)); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := app.remove(ctx, []string{"--yes"}); err != nil {
+			t.Fatalf("remove failed: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "Skipping symlinked snapshot directory") {
+			t.Fatalf("expected symlink skip warning, got %q", stderr.String())
+		}
+		if _, err := os.Stat(keepFile); err != nil {
+			t.Fatalf("remove deleted target inside symlinked snapshot dir: %v", err)
+		}
+		if len(store.liveSnapshotsNewestFirst()) != 0 {
+			t.Fatalf("expected chained snapshots removed, got %v", store.liveSnapshotsNewestFirst())
+		}
+	})
 }

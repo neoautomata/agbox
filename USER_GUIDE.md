@@ -28,11 +28,12 @@ The installer runs these steps:
 1. It builds a static `agbox` binary and installs it atomically. The default directory is `~/.local/bin` (`/usr/local/bin` for `root`, or `$AGBOX_INSTALL_DIR`).
 1. It refuses to replace a symlink or a directory at the target path.
 1. It installs `AGBOX_ENV_RULES.md` into `$DATA_DIR/rules`.
+1. It installs the bash completion script unless you pass `--skip-completion`. The default directory is `${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions` (`/usr/share/bash-completion/completions` for `root`, or `$AGBOX_COMPLETION_DIR`).
 1. It runs `agbox setup` unless you pass `--skip-setup`.
 1. It warns when the install directory is not on `PATH`.
 
 > [!TIP]
-> Pass `--skip-setup` on hosts without `/dev/kvm`, such as headless containers.
+> Pass `--skip-setup` on hosts without `/dev/kvm`, such as headless containers. To load bash completion directly in `~/.bashrc`, add `eval "$(agbox completion bash)"`.
 
 To check the host again at any time, run these commands:
 
@@ -527,6 +528,7 @@ Run `agbox <mode> --help` for the flags of each mode. Run `agbox --help` for the
 |---|---|
 | `agbox setup` | Checks `msb`, `/dev/kvm`, FUSE, and runs a sandbox smoke test. |
 | `agbox version` | Prints the version. `agbox --version` does the same. |
+| `agbox completion bash` | Prints the bash completion script to `stdout`. |
 | `agbox create-base [--force] [--add <categories>] <opencode\|antigravity\|both>` | Creates the base sandbox and saves `agbox:vN`. |
 | `agbox edit-base [--add <categories>] [--list] [--shell] [--cmd "shell"] [--no-snap]` | Changes the base sandbox. Saves `agbox:v<N+1>` unless you pass `--no-snap`. |
 | `agbox update [antigravity\|opencode\|both\|status\|clear]` | Caches checked agent binaries in `$DATA_DIR/agents`. |
@@ -588,6 +590,7 @@ Options also accept the `--name=NAME` form. A `--` argument ends option parsing.
 | `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config`, `auth`, `agents`, `skills`, `rules`, `profiles`, and `run/<id>`. |
 | `MSB_HOME` | `~/.microsandbox` | Host directory for `msb` runtime state, base snapshots, and profile volumes. |
 | `AGBOX_INSTALL_DIR` | `~/.local/bin` (`/usr/local/bin` for `root`) | Directory where `install.sh` installs the binary. |
+| `AGBOX_COMPLETION_DIR` | `~/.local/share/bash-completion/completions` (`/usr/share/bash-completion/completions` for `root`) | Directory where `install.sh` installs the bash completion script. |
 | `AGBOX_ALLOW_ROOT` | `0` | Set to `1` to let `install.sh` and `agbox` run as `root`. |
 | `AGBOX_CPUS` | `4` | Default vCPU count for `create-base` and `run`. |
 | `AGBOX_MEMORY` | `8G` | Default guest RAM size for `create-base` and `run`. |

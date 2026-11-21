@@ -1159,17 +1159,39 @@ type SandboxInfo struct {
 
 // ParseSandboxList parses the tabular output of msb ls.
 func ParseSandboxList(out string) []SandboxInfo {
+	clean := ansiCSIPattern.ReplaceAllString(out, "")
 	var result []SandboxInfo
-	for _, raw := range strings.Split(out, "\n") {
+	statusCol := -1
+	for _, raw := range strings.Split(clean, "\n") {
 		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "NAME") || strings.HasPrefix(line, "-") {
+		if line == "" || strings.HasPrefix(line, "-") {
 			continue
 		}
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
 		}
-		running := len(fields) > 1 && strings.EqualFold(fields[1], "running")
+		if strings.EqualFold(fields[0], "NAME") {
+			statusCol = -1
+			for i, h := range fields {
+				if strings.EqualFold(h, "STATUS") || strings.EqualFold(h, "STATE") {
+					statusCol = i
+					break
+				}
+			}
+			continue
+		}
+		var running bool
+		if statusCol > 0 {
+			running = len(fields) > statusCol && strings.EqualFold(fields[statusCol], "running")
+		} else {
+			for i := 1; i < len(fields); i++ {
+				if strings.EqualFold(fields[i], "running") {
+					running = true
+					break
+				}
+			}
+		}
 		result = append(result, SandboxInfo{
 			Name:    fields[0],
 			Running: running,
@@ -1191,14 +1213,21 @@ func FindSandbox(list []SandboxInfo, name string) (SandboxInfo, bool) {
 
 // ParseSnapshotList extracts snapshot references (<group>:<tag>) from msb snap ls.
 func ParseSnapshotList(out string) []string {
+	clean := ansiCSIPattern.ReplaceAllString(out, "")
 	var snaps []string
-	for _, raw := range strings.Split(out, "\n") {
+	for _, raw := range strings.Split(clean, "\n") {
 		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "NAME") || strings.HasPrefix(line, "SNAPSHOT") || strings.HasPrefix(line, "-") {
+		if line == "" || strings.HasPrefix(line, "-") {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) > 0 && strings.Contains(fields[0], ":") {
+		if len(fields) == 0 {
+			continue
+		}
+		if strings.EqualFold(fields[0], "NAME") || strings.EqualFold(fields[0], "SNAPSHOT") {
+			continue
+		}
+		if strings.Contains(fields[0], ":") {
 			snaps = append(snaps, fields[0])
 		}
 	}
@@ -1349,16 +1378,21 @@ func BuildVolumeCreateDiskArgs(name, size string) ([]string, error) {
 
 // ParseVolumeList extracts named volume identifiers from msb volume ls.
 func ParseVolumeList(out string) []string {
+	clean := ansiCSIPattern.ReplaceAllString(out, "")
 	var vols []string
-	for _, raw := range strings.Split(out, "\n") {
+	for _, raw := range strings.Split(clean, "\n") {
 		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "NAME") || strings.HasPrefix(line, "VOLUME") || strings.HasPrefix(line, "-") {
+		if line == "" || strings.HasPrefix(line, "-") {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) > 0 {
-			vols = appendUnique(vols, fields[0])
+		if len(fields) == 0 {
+			continue
 		}
+		if strings.EqualFold(fields[0], "NAME") || strings.EqualFold(fields[0], "VOLUME") {
+			continue
+		}
+		vols = appendUnique(vols, fields[0])
 	}
 	return vols
 }

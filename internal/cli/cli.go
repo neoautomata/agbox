@@ -25,6 +25,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"agbox/internal/complete"
 	"agbox/internal/config"
 	"agbox/internal/mounttab"
 	"agbox/internal/msb"
@@ -514,6 +515,14 @@ func (a *appRuntime) dispatchParsed(ctx context.Context, globalOpts globalOpts) 
 	case "version":
 		fmt.Fprintf(a.Stdout, "agbox %s\n", version)
 		return 0
+	case "completion":
+		err = a.completion(rest)
+		if errors.Is(err, errHelp) {
+			fmt.Fprint(a.Stdout, completionUsageText())
+			return 0
+		}
+	case complete.SubcommandName:
+		return a.runHiddenComplete(globalOpts.Rest)
 	case "setup":
 		err = a.setup(ctx, rest)
 	case "create-base":
@@ -573,7 +582,7 @@ func (a *appRuntime) dispatchParsed(ctx context.Context, globalOpts globalOpts) 
 	case "status":
 		err = a.status(ctx, rest)
 	default:
-		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup version create-base edit-base update auth skills rules profile share run suspend resume stop remove status)\n", mode)
+		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup version completion create-base edit-base update auth skills rules profile share run suspend resume stop remove status)\n", mode)
 		return 1
 	}
 
@@ -603,6 +612,15 @@ func (a *appRuntime) dispatchParsed(ctx context.Context, globalOpts globalOpts) 
 
 // Main initializes a production appRuntime and dispatches args.
 func Main(args []string) int {
+	if len(args) > 0 && args[0] == complete.SubcommandName {
+		env, _ := config.LoadEnv()
+		app := &appRuntime{
+			Env:    env,
+			Stdout: os.Stdout,
+			Stderr: os.Stderr,
+		}
+		return app.runHiddenComplete(args[1:])
+	}
 	globalOpts, err := parseGlobalArgs(args)
 	if err != nil {
 		if errors.Is(err, errHelp) {

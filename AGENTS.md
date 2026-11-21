@@ -11,13 +11,14 @@ This file defines the architecture, the Safe-by-Default security rules, the upst
 | Path | Responsibility |
 |---|---|
 | `cmd/agbox` | Entrypoint. Routes `__filter` to `vcsfuse` and all other commands to `cli.Main`. |
+| `internal/complete` | Pure shell completion engine and bash completion script generator. |
 | `internal/config` | Environment parsing, private state directories (`0700`, `0600`), snapshot numbers, and `run.meta` files. |
 | `internal/pathsec` | Path canonicalization, `$HOME` containment, blocklists, share modifiers, alias checks, and disjointness checks. |
 | `internal/vcsfuse` | Loopback FUSE filter and the `/workspace` Workspace Hub. It owns `openat2` confinement, VCS and hook protection, guest `1000:1000` ownership mapping, descriptor revocation, and the `ws.sock` control server. |
 | `internal/mounttab` | `/proc/self/mountinfo` parsing, `/proc/<pid>/cmdline` checks before signals, and mount-verified directory cleanup. |
 | `internal/msb` | `msb` argument builders, default-deny network rules, volume helpers, guest scripts, categories, and the `Runner` interface. |
 | `internal/persist` | Credential capture, the agent cache, skills, rules, and `flock`-guarded profile volumes. |
-| `internal/cli` | Argument parsers, mode dispatch, and orchestration. `cli.Main` is the only export. Files: `cli.go`, `parse.go`, `usage.go`, `base.go`, `run.go`, `lifecycle.go`, `persist_modes.go`, `share_mode.go`, `update_mode.go`. |
+| `internal/cli` | Argument parsers, mode dispatch, and orchestration. `cli.Main` is the only export. Files: `cli.go`, `parse.go`, `usage.go`, `base.go`, `run.go`, `lifecycle.go`, `persist_modes.go`, `share_mode.go`, `update_mode.go`, `completion_mode.go`. |
 | `install.sh` | Idempotent prerequisite check, static build, and atomic install. |
 | `AGBOX_ENV_RULES.md` | Default guest rules. `install.sh` and `agbox setup` install them into `$DATA_DIR/rules`. |
 | `test.sh` | End-to-end verification harness. |
@@ -144,6 +145,7 @@ Changes in `internal/msb`, `internal/cli`, or `internal/vcsfuse` must respect th
 - **`stat-virt` modes.** `msb snap restore -v` defaults to `stat-virt=strict`. It probes mount roots with `setxattr` and fails with `EROFS` on `/workspace`. Mount `/workspace` with `:rw,stat-virt=off` and no `uid=` or `gid=`. Mount read-only caches with `:ro,stat-virt=relaxed,uid=1000,gid=1000`.
 - **Disk volumes.** `msb snap restore -v` forces `VolumeKind::Directory`. It rejects `--kind disk` volumes such as `agbox-profile-<name>`. Attach profile disks with `--mount-disk <disk.raw>:<guest>:rw,format=raw,fstype=ext4`.
 - **Guest flush.** Run `msb stop -t 10` before `msb rm -f` (`destroySandbox`) when a sandbox has a profile disk. This flushes guest pages and the journal to `disk.raw`. `agbox stop` writes a `deleting` marker in `$DATA_DIR/run/<id>`. Other sessions then skip the duplicate teardown. `destroySandbox` treats `sandbox not found` as success.
+- **Snapshots.** `msb snap rm` refuses to delete the current head while other members exist in the snapshot group. It also refuses to delete a parent with child snapshots unless you pass `--force`. `msb snap reindex` never prunes missing rows from SQLite. `agbox remove` deletes `agbox:v*` snapshots newest-first with `--force`. On a current-head error, it switches the head with `msb snap head <member>` and retries. It deletes `$MSB_HOME/snapshots/agbox` only after `msb snap rm` succeeds for every `agbox:v*` snapshot and zero other members remain.
 - **Firewall order.** Keep `--net-default deny`. Put `allow@dns` before `deny@host`. Put all deny groups and CIDRs before `allow@public`. Wrap IPv6 CIDRs in square brackets.
 - **No nesting.** An agent inside an `agbox` sandbox has no `/dev/kvm`. A minimal container may also lack `fusermount`. Inside such a sandbox, run `./test.sh --skip-vm`. Use `sudo ./test.sh --allow-root --skip-vm` when direct FUSE mounts need root. Run the KVM checks on the host.
 

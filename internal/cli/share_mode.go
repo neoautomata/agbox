@@ -70,6 +70,9 @@ func (a *appRuntime) share(ctx context.Context, args []string) error {
 	if sb.Running {
 		meta, err = config.LoadRunMeta(runMetaPath)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("sandbox %q has no agbox run metadata. Stop it and start it again with 'agbox run'", opts.Sandbox)
+			}
 			return fmt.Errorf("load run metadata for %q: %w", opts.Sandbox, err)
 		}
 		metaPath = runMetaPath

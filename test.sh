@@ -698,6 +698,10 @@ canonical_agbox_mounts() {
 capture_state() {
   local dir="$1"
   mkdir -p "${dir}"
+  canonical_msb_sandboxes "${ORIG_MSB_HOME}" "${dir}/msb_sandboxes.txt"
+  canonical_msb_snaps "${ORIG_MSB_HOME}" "${dir}/msb_snaps.txt"
+  canonical_msb_volumes "${ORIG_MSB_HOME}" "${dir}/msb_volumes.txt"
+  canonical_agbox_mounts "${dir}/agbox_mounts.txt"
   fingerprint_dir "${ORIG_DATA_DIR}" "${dir}/data_dir.fp"
   if [[ -n "${ORIG_INSTALL_BIN}" && ( -e "${ORIG_INSTALL_BIN}" || -L "${ORIG_INSTALL_BIN}" ) ]]; then
     fingerprint_dir "${ORIG_INSTALL_BIN}" "${dir}/install_bin.fp"
@@ -706,13 +710,18 @@ capture_state() {
   fi
   if [[ -n "${ORIG_MSB_HOME}" && ( -e "${ORIG_MSB_HOME}" || -L "${ORIG_MSB_HOME}" ) ]]; then
     fingerprint_dir "${ORIG_MSB_HOME}" "${dir}/msb_home.fp"
+    : > "${dir}/msb_home_bins.fp"
+    local sub=""
+    for sub in bin lib; do
+      if [[ -e "${ORIG_MSB_HOME}/${sub}" || -L "${ORIG_MSB_HOME}/${sub}" ]]; then
+        fingerprint_dir "${ORIG_MSB_HOME}/${sub}" "${dir}/msb_home_${sub}.fp"
+        cat "${dir}/msb_home_${sub}.fp" >> "${dir}/msb_home_bins.fp"
+      fi
+    done
   else
     printf 'ABSENT\n' > "${dir}/msb_home.fp"
+    printf 'ABSENT\n' > "${dir}/msb_home_bins.fp"
   fi
-  canonical_msb_sandboxes "${ORIG_MSB_HOME}" "${dir}/msb_sandboxes.txt"
-  canonical_msb_snaps "${ORIG_MSB_HOME}" "${dir}/msb_snaps.txt"
-  canonical_msb_volumes "${ORIG_MSB_HOME}" "${dir}/msb_volumes.txt"
-  canonical_agbox_mounts "${dir}/agbox_mounts.txt"
 }
 
 write_helpers() {
@@ -1406,7 +1415,7 @@ check_05_cli_help_and_categories() {
   local help_out=""
   help_out="$(with_timeout 15 agbox_exec "${TEST_BIN}" --help)"
   assert_contains "${help_out}" "Usage: agbox" "global --help"
-  for sub in setup create-base edit-base update auth skills rules profile share run suspend resume stop remove status; do
+  for sub in setup completion create-base edit-base update auth skills rules profile share run suspend resume stop remove status; do
     help_out="$(with_timeout 15 agbox_exec "${TEST_BIN}" "${sub}" --help)"
     assert_contains "${help_out}" "Usage:" "${sub} --help"
     assert_contains "${help_out}" "agbox ${sub}" "${sub} --help command line"
@@ -1429,10 +1438,55 @@ check_05_cli_help_and_categories() {
   [[ "${rc}" -ne 0 ]] || { echo "Expected --bogus-flag to fail" >&2; return 1; }
   assert_contains "${err_out}" "[agbox] ERROR:" "--bogus-flag stderr"
 
-  # Check install.sh --help includes --skip-setup.
+  # Check install.sh --help includes --skip-setup and --skip-completion.
   local inst_help=""
   inst_help="$("${REPO_DIR}/install.sh" --help)"
   assert_contains "${inst_help}" "--skip-setup" "install.sh --help contains --skip-setup"
+  assert_contains "${inst_help}" "--skip-completion" "install.sh --help contains --skip-completion"
+
+  # Check agbox completion bash output, syntax, and runtime COMPREPLY behavior.
+  local comp_script="${TEST_ROOT}/agbox.bash"
+  with_timeout 15 agbox_exec "${TEST_BIN}" completion bash > "${comp_script}"
+  bash -n "${comp_script}"
+  local comp_data="${TEST_ROOT}/comp-data"
+  mkdir -p "${comp_data}/rules" "${comp_data}/profiles/devbox" "${comp_data}/run/myvm"
+  chmod 0700 "${comp_data}" "${comp_data}/rules" "${comp_data}/profiles" "${comp_data}/profiles/devbox" "${comp_data}/run" "${comp_data}/run/myvm"
+  printf '# rule\n' > "${comp_data}/rules/sample-rule.md"
+  printf '{"name":"devbox","volume":"agbox-profile-devbox","size":"10G"}\n' > "${comp_data}/profiles/devbox/profile.json"
+  printf '{"sandbox":"agbox-myvm"}\n' > "${comp_data}/run/myvm/run.meta"
+  chmod 0600 "${comp_data}/rules/sample-rule.md" "${comp_data}/profiles/devbox/profile.json" "${comp_data}/run/myvm/run.meta"
+  local comp_check=""
+  comp_check="$(
+    AGBOX_DATA_DIR="${comp_data}" bash -c '
+      set -euo pipefail
+      source "$1"
+      COMP_WORDS=("$2" "co")
+      COMP_CWORD=1
+      _agbox_completions
+      printf "mode=%s\n" "${COMPREPLY[*]}"
+      COMP_WORDS=("$2" "create-base" "--add" "core,g")
+      COMP_CWORD=3
+      _agbox_completions
+      printf "cat=%s\n" "${COMPREPLY[*]}"
+      COMP_WORDS=("$2" "run" "--profile" "d")
+      COMP_CWORD=3
+      _agbox_completions
+      printf "prof=%s\n" "${COMPREPLY[*]}"
+      COMP_WORDS=("$2" "rules" "show" "s")
+      COMP_CWORD=3
+      _agbox_completions
+      printf "rule=%s\n" "${COMPREPLY[*]}"
+      COMP_WORDS=("$2" "suspend" "agbox-")
+      COMP_CWORD=2
+      _agbox_completions
+      printf "sbx=%s\n" "${COMPREPLY[*]}"
+    ' _ "${comp_script}" "${TEST_BIN}"
+  )"
+  assert_contains "${comp_check}" "mode=completion" "bash completion mode"
+  assert_contains "${comp_check}" "cat=core,go" "bash completion category csv"
+  assert_contains "${comp_check}" "prof=devbox" "bash completion profile"
+  assert_contains "${comp_check}" "rule=sample-rule" "bash completion rule"
+  assert_contains "${comp_check}" "sbx=agbox-myvm" "bash completion sandbox"
 
   # Check agbox --version and agbox version.
   local ver_out=""
@@ -1454,10 +1508,22 @@ check_06_security_validation_and_tamper_checks() {
   mkdir -p "${sec_data}" "${TEST_ROOT}/sec-src"
   chmod 0700 "${sec_data}" "${TEST_ROOT}/sec-src"
 
+  off_outside=""
+  outside_tmp=""
+  cleanup_06() {
+    if [[ -n "${off_outside:-}" && -e "${off_outside}" ]]; then
+      rm -rf "${off_outside}" 2>/dev/null || true
+    fi
+    if [[ -n "${outside_tmp:-}" && -e "${outside_tmp}" ]]; then
+      rm -rf "${outside_tmp}" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_06 EXIT
+
   if [[ "${EUID_VAL}" -eq 0 ]]; then
     local root_err=""
     local root_rc=0
-    root_err="$(env -u AGBOX_ALLOW_ROOT AGBOX_ALLOW_ROOT=0 AGBOX_DATA_DIR="${sec_data}" "${TEST_BIN}" status 2>&1)" || root_rc=$?
+    root_err="$(AGBOX_ALLOW_ROOT=0 AGBOX_DATA_DIR="${sec_data}" with_timeout 15 "${TEST_BIN}" status 2>&1)" || root_rc=$?
     [[ "${root_rc}" -ne 0 ]] || { echo "Expected root run without --allow-root to fail" >&2; return 1; }
     assert_contains "${root_err}" "do not run as root" "root rejection stderr"
   fi
@@ -1568,6 +1634,29 @@ EOF
   assert_contains "${err_out}" "multiple hard links" "offline multi-hardlink writable file rejection"
   rm -rf "${off_hl}" "${off_peer}" "${off_spec}" "${off_mnt}"
 
+  # Check offline rejection of a share outside $HOME via __filter -hub.
+  off_outside="$(mktemp -d /tmp/agbox-sec-off-outside-XXXXXX)"
+  local off_out_spec="${TEST_ROOT}/sec-src/off-out-spec.json"
+  local off_out_mnt="${TEST_ROOT}/sec-src/off-out-mnt"
+  mkdir -p "${off_out_mnt}"
+  chmod 0700 "${off_out_mnt}"
+  cat > "${off_out_spec}" <<EOF
+{
+  "home_real": "${HOME_REAL}",
+  "data_dir": "${sec_data}",
+  "allow_outside_home": false,
+  "shares": [
+    {"guest_name": "out", "host_path": "${off_outside}", "is_file": false, "read_only": false, "vcs_policy": "mask"}
+  ]
+}
+EOF
+  rc=0
+  err_out="$(AGBOX_ALLOW_OUTSIDE_HOME=0 with_timeout 15 "${TEST_BIN}" __filter -hub -mnt "${off_out_mnt}" -sock "${TEST_ROOT}/sec-src/off-out.sock" -spec "${off_out_spec}" 2>&1)" || rc=$?
+  rm -rf "${off_outside}" "${off_out_spec}" "${off_out_mnt}"
+  off_outside=""
+  [[ "${rc}" -ne 0 ]] || { echo 'Expected share outside $HOME to fail offline' >&2; return 1; }
+  assert_contains "${err_out}" 'outside $HOME' 'offline outside-$HOME rejection'
+
   local sec_home="${TEST_ROOT}/sec-home"
   local sec_msb="${TEST_ROOT}/sec-msb"
   local sec_fake_bin="${TEST_ROOT}/sec-fake-bin"
@@ -1640,13 +1729,14 @@ EOF
     done
 
     # Check that pathsec rejects shares outside $HOME without AGBOX_ALLOW_OUTSIDE_HOME=1.
-    local outside_tmp=""
     outside_tmp="$(mktemp -d /tmp/agbox-sec-outside-XXXXXX)"
+    local outside_path="${outside_tmp}"
     rc=0
-    err_out="$(env -u AGBOX_ALLOW_OUTSIDE_HOME AGBOX_ALLOW_OUTSIDE_HOME=0 HOME="${sec_home}" MSB_HOME="${sec_msb}" PATH="${sec_fake_bin}:${PATH}" AGBOX_DATA_DIR="${sec_data}" with_timeout 15 agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${outside_tmp}" 2>&1)" || rc=$?
-    [[ "${rc}" -ne 0 ]] || { echo "Expected outside-$HOME share rejection for ${outside_tmp}" >&2; return 1; }
-    assert_contains "${err_out}" "outside $HOME" "outside-$HOME rejection"
+    err_out="$(AGBOX_ALLOW_OUTSIDE_HOME=0 HOME="${sec_home}" MSB_HOME="${sec_msb}" PATH="${sec_fake_bin}:${PATH}" AGBOX_DATA_DIR="${sec_data}" with_timeout 15 agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${outside_tmp}" 2>&1)" || rc=$?
     rm -rf "${outside_tmp}"
+    outside_tmp=""
+    [[ "${rc}" -ne 0 ]] || { echo 'Expected outside-$HOME share rejection for '"${outside_path}" >&2; return 1; }
+    assert_contains "${err_out}" 'outside $HOME' 'outside-$HOME rejection'
 
     # Check that pathsec rejects overlapping or nested host shares.
     mkdir -p "${sec_home}/proj/sub"
@@ -1666,8 +1756,12 @@ EOF
     [[ "${rc}" -ne 0 ]] || { echo "Expected writable multi-hardlink share to fail" >&2; return 1; }
     assert_contains "${err_out}" "multiple hard links" "multi-hardlink writable file rejection"
 
-    HOME="${sec_home}" MSB_HOME="${sec_msb}" PATH="${sec_fake_bin}:${PATH}" AGBOX_DATA_DIR="${sec_data}" \
-      with_timeout 15 agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${single_hl}:ro" >/dev/null
+    local sec_fm_bin=""
+    sec_fm_bin="$(resolve_fusermount_bin 2>/dev/null || true)"
+    if [[ -r /dev/fuse && -w /dev/fuse ]] && [[ "${EUID_VAL}" -eq 0 || -n "${sec_fm_bin}" ]]; then
+      HOME="${sec_home}" MSB_HOME="${sec_msb}" PATH="${sec_fake_bin}:${PATH}" AGBOX_DATA_DIR="${sec_data}" \
+        with_timeout 15 agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${single_hl}:ro" >/dev/null
+    fi
     rm -f "${single_hl}" "${single_peer}"
 
     # Check that the network builder rejects unbracketed IPv6 rules and conflicting --net none or --net all combinations.
@@ -1692,6 +1786,7 @@ EOF
     (
       cd "${REPO_DIR}"
       with_timeout 30 go_exec test -count=1 -run TestTranslateNetSpecAndBuildNetArgs ./internal/msb >/dev/null
+      with_timeout 30 go_exec test -count=1 ./internal/pathsec >/dev/null
     )
     echo "/dev/kvm not accessible. Checked network rule and share validations via offline hub and Go tests."
   fi
@@ -1875,6 +1970,14 @@ check_07_msb_error_diagnostics_not_swallowed() {
   mkdir -p "${fake_bin}" "${TEST_ROOT}/sec-data"
   chmod 0700 "${fake_bin}" "${TEST_ROOT}/sec-data"
 
+  out_share=""
+  cleanup_07() {
+    if [[ -n "${out_share:-}" && -e "${out_share}" ]]; then
+      rm -rf "${out_share}" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_07 EXIT
+
   cat > "${fake_bin}/msb" <<'EOF'
 #!/usr/bin/env bash
 echo "simulated msb backend failure detail" >&2
@@ -1917,6 +2020,213 @@ EOF
   assert_contains "${err_out}" "simulated msb backend failure detail" "remove --yes warning msb detail"
   mkdir -p "${TEST_ROOT}/sec-data"
   chmod 0700 "${TEST_ROOT}/sec-data"
+
+  # Check remove --yes and status against a stateful fake msb with chained snapshots.
+  local ok_fake_bin="${TEST_ROOT}/fake-msb-ok-bin"
+  local ok_data="${TEST_ROOT}/clean-status-data"
+  local ok_msb="${TEST_ROOT}/clean-status-msb"
+  rm -rf "${ok_fake_bin}" "${ok_data}" "${ok_msb}"
+  mkdir -p "${ok_fake_bin}" "${ok_data}/rules" "${ok_msb}/snapshots/agbox" "${ok_msb}/snapshots/other" "${ok_msb}/state"
+  chmod 0700 "${ok_fake_bin}" "${ok_data}" "${ok_data}/rules" "${ok_msb}" "${ok_msb}/snapshots" "${ok_msb}/snapshots/agbox" "${ok_msb}/snapshots/other" "${ok_msb}/state"
+  printf '# rule\n' > "${ok_data}/rules/r.md"
+  chmod 0600 "${ok_data}/rules/r.md"
+  printf '{"head":"v2"}\n' > "${ok_msb}/snapshots/agbox/group.json"
+  printf '{"head":"v1"}\n' > "${ok_msb}/snapshots/other/group.json"
+  chmod 0600 "${ok_msb}/snapshots/agbox/group.json" "${ok_msb}/snapshots/other/group.json"
+  printf 'agbox:v2\n' > "${ok_msb}/state/head_agbox"
+  printf 'other:v1\n' > "${ok_msb}/state/head_other"
+  printf 'parent=agbox:v1\n' > "${ok_msb}/state/agbox_v2"
+  printf 'child_count=1\n' > "${ok_msb}/state/agbox_v1"
+  printf 'group=other\n' > "${ok_msb}/state/other_v1"
+  chmod 0600 "${ok_msb}/state/head_agbox" "${ok_msb}/state/head_other" "${ok_msb}/state/agbox_v2" "${ok_msb}/state/agbox_v1" "${ok_msb}/state/other_v1"
+  cat > "${ok_fake_bin}/msb" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sub="${1:-}"
+shift || true
+state_dir="${MSB_HOME}/state"
+case "${sub}" in
+  ls)
+    printf 'NAME          IMAGE                    STATUS     CREATED\n'
+    exit 0
+    ;;
+  snap)
+    ssub="${1:-}"
+    shift || true
+    case "${ssub}" in
+      ls)
+        printf 'NAME  SCOPE  MIGRATION  IMAGE  SIZE  CREATED  DIGEST\n'
+        for s in agbox:v2 agbox:v1 other:v1; do
+          if [[ -e "${state_dir}/${s//:/_}" ]]; then
+            printf '%s  group  compatible  ubuntu  100M  1m  sha256:00\n' "${s}"
+          fi
+        done
+        exit 0
+        ;;
+      head)
+        target="${1:-}"
+        if [[ -z "${target}" || "${target}" != *:* || ! -e "${state_dir}/${target//:/_}" ]]; then
+          printf 'error: snapshot not found: %s\n' "${target}" >&2
+          exit 1
+        fi
+        grp="${target%%:*}"
+        member="${target#*:}"
+        printf '%s\n' "${target}" > "${state_dir}/head_${grp}"
+        if [[ -d "${MSB_HOME}/snapshots/${grp}" ]]; then
+          printf '{"head":"%s"}\n' "${member}" > "${MSB_HOME}/snapshots/${grp}/group.json"
+        fi
+        printf 'head %s\n' "${target}" >> "${state_dir}/calls.log"
+        exit 0
+        ;;
+      rm)
+        force=0
+        target=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --force|-f)
+              force=1
+              shift
+              ;;
+            -*)
+              printf 'error: unknown flag: %s\n' "$1" >&2
+              exit 2
+              ;;
+            *)
+              target="$1"
+              shift
+              ;;
+          esac
+        done
+        if [[ -z "${target}" || "${target}" != *:* || ! -e "${state_dir}/${target//:/_}" ]]; then
+          printf 'error: snapshot not found: %s\n' "${target}" >&2
+          exit 1
+        fi
+        grp="${target%%:*}"
+        grp_members=0
+        for s in agbox:v2 agbox:v1 other:v1; do
+          if [[ "${s%%:*}" == "${grp}" && -e "${state_dir}/${s//:/_}" ]]; then
+            grp_members=$((grp_members + 1))
+          fi
+        done
+        cur_head=""
+        if [[ -f "${state_dir}/head_${grp}" ]]; then
+          cur_head="$(<"${state_dir}/head_${grp}")"
+        fi
+        if [[ "${target}" == "${cur_head}" && "${grp_members}" -gt 1 ]]; then
+          printf "error: invalid config: cannot remove current head '%s' while other snapshots remain in group '%s'\n" "${target}" "${grp}" >&2
+          exit 1
+        fi
+        if [[ "${target}" == "agbox:v1" && -e "${state_dir}/agbox_v2" && "${force}" -eq 0 ]]; then
+          printf 'error: snapshot %s has 1 indexed child snapshot(s): pass --force to remove anyway\n' "${target}" >&2
+          exit 1
+        fi
+        rm -f "${state_dir}/${target//:/_}"
+        if [[ "${target}" == "agbox:v2" && -f "${state_dir}/agbox_v1" ]]; then
+          printf 'child_count=0\n' > "${state_dir}/agbox_v1"
+        fi
+        if [[ "${target}" == "${cur_head}" ]]; then
+          rm -f "${state_dir}/head_${grp}"
+        fi
+        printf 'rm force=%d %s\n' "${force}" "${target}" >> "${state_dir}/calls.log"
+        exit 0
+        ;;
+      reindex)
+        printf 'reindex\n' >> "${state_dir}/calls.log"
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
+  volume)
+    if [[ "${1:-}" == "ls" ]]; then
+      printf 'NAME  KIND  SIZE\n'
+    fi
+    exit 0
+    ;;
+  image)
+    exit 0
+    ;;
+  df)
+    cat <<'DFEOF'
+TYPE        COUNT   IN USE   LOGICAL SIZE   RECLAIMABLE
+images      1       0        74.59 MB       74.59 MB (100%)
+sandboxes   0       0        0 B            0 B
+snapshots   0       -        0 B            -
+volumes     0       -        0 B            -
+DFEOF
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod 0755 "${ok_fake_bin}/msb"
+
+  # Check that the fake msb enforces current-head and child-snapshot rules.
+  local fake_msb_err=""
+  rc=0
+  fake_msb_err="$(MSB_HOME="${ok_msb}" with_timeout 15 "${ok_fake_bin}/msb" snap rm --force agbox:v2 2>&1)" || rc=$?
+  if [[ "${rc}" -ne 1 ]]; then
+    printf 'Expected fake msb snap rm --force agbox:v2 to exit 1, got %d\nOutput:\n%s\n' "${rc}" "${fake_msb_err}" >&2
+    return 1
+  fi
+  assert_contains "${fake_msb_err}" "error: invalid config: cannot remove current head" "fake msb current head error"
+
+  rc=0
+  fake_msb_err="$(MSB_HOME="${ok_msb}" with_timeout 15 "${ok_fake_bin}/msb" snap rm agbox:v1 2>&1)" || rc=$?
+  if [[ "${rc}" -ne 1 ]]; then
+    printf 'Expected fake msb snap rm agbox:v1 without --force to exit 1, got %d\nOutput:\n%s\n' "${rc}" "${fake_msb_err}" >&2
+    return 1
+  fi
+  assert_contains "${fake_msb_err}" "has 1 indexed child snapshot(s): pass --force to remove anyway" "fake msb child snapshot error"
+
+  local rm_out=""
+  local rm_warn_out=""
+  PATH="${ok_fake_bin}:${PATH}" MSB_HOME="${ok_msb}" AGBOX_DATA_DIR="${ok_data}" \
+    run_capture rm_out with_timeout 30 agbox_exec "${TEST_BIN}" remove --yes
+  if [[ "${EUID_VAL}" -eq 0 ]]; then
+    rm_warn_out="$(grep -Fv '[agbox] WARN: Root mode is active ' <<< "${rm_out}" || true)"
+  else
+    rm_warn_out="${rm_out}"
+  fi
+  assert_not_contains "${rm_warn_out}" "[agbox] WARN:" "clean remove --yes warnings"
+  if [[ -e "${ok_data}" ]]; then
+    echo "Expected remove --yes to delete ${ok_data}" >&2
+    return 1
+  fi
+  if [[ -e "${ok_msb}/state/agbox_v1" || -e "${ok_msb}/state/agbox_v2" ]]; then
+    echo "Expected remove --yes to delete agbox:v1 and agbox:v2 from state" >&2
+    return 1
+  fi
+  if [[ -e "${ok_msb}/snapshots/agbox" ]]; then
+    echo "Expected remove --yes to delete ${ok_msb}/snapshots/agbox" >&2
+    return 1
+  fi
+  if [[ ! -e "${ok_msb}/state/other_v1" || ! -f "${ok_msb}/snapshots/other/group.json" ]]; then
+    echo "Expected remove --yes to keep other:v1 untouched" >&2
+    return 1
+  fi
+  local snap_calls=""
+  snap_calls="$(<"${ok_msb}/state/calls.log")"
+  assert_contains "${snap_calls}" "head agbox:v1" "remove --yes switched head to agbox:v1"
+
+  local clean_st=""
+  PATH="${ok_fake_bin}:${PATH}" MSB_HOME="${ok_msb}" AGBOX_DATA_DIR="${ok_data}" \
+    run_capture clean_st with_timeout 30 agbox_exec "${TEST_BIN}" status
+  assert_contains "${clean_st}" "base_snapshot: not configured" "clean status base_snapshot not configured"
+  assert_contains "${clean_st}" "other:v1" "clean status preserves other:v1"
+  assert_not_contains "${clean_st}" "agbox:v" "clean status has no agbox snapshots"
+  assert_contains "${clean_st}" "== storage ==" "clean status storage header"
+  assert_contains "${clean_st}" "TYPE        COUNT   IN USE   LOGICAL SIZE   RECLAIMABLE" "clean status msb df header"
+  assert_contains "${clean_st}" "volumes     0       -        0 B            -" "clean status msb df volumes row"
+  if [[ -e "${ok_data}" ]]; then
+    echo "Expected agbox status not to create ${ok_data}" >&2
+    return 1
+  fi
+  rm -rf "${ok_fake_bin}" "${ok_msb}"
 
   if [[ -r /dev/kvm && -w /dev/kvm ]]; then
     local cmd_fake_bin="${TEST_ROOT}/fake-msb-cmd-bin"
@@ -2073,7 +2383,7 @@ EOF
     local cmd_stderr="${TEST_ROOT}/fake-cmd.stderr"
     PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" \
       FAKE_MSB_SNAP_LOG="${cmd_snap_log}" FAKE_MSB_STOP_LOG="${cmd_stop_log}" \
-      agbox_exec "${TEST_BIN}" run --no-net --profile fakeprof --cmd "echo hi" </dev/null >"${cmd_stdout}" 2>"${cmd_stderr}"
+      with_timeout 30 agbox_exec "${TEST_BIN}" run --no-net --profile fakeprof --cmd "echo hi" </dev/null >"${cmd_stdout}" 2>"${cmd_stderr}"
     assert_contains "$(cat "${cmd_stdout}")" "FAKE_CMD_STDOUT_OK" "fake msb --cmd stdout"
     assert_not_contains "$(cat "${cmd_stdout}")" "FAKE_CMD_STDERR_OK" "fake msb --cmd stdout excludes stderr"
     assert_contains "$(cat "${cmd_stderr}")" "FAKE_CMD_STDERR_OK" "fake msb --cmd stderr"
@@ -2098,7 +2408,7 @@ EOF
       chmod 0700 "${cmd_ws}"
       : > "${cmd_snap_log}"
       PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" FAKE_MSB_SNAP_LOG="${cmd_snap_log}" \
-        agbox_exec "${TEST_BIN}" run --no-net --cmd "echo hi" "${cmd_ws}" </dev/null >/dev/null
+        with_timeout 30 agbox_exec "${TEST_BIN}" run --no-net --cmd "echo hi" "${cmd_ws}" </dev/null >/dev/null
       snap_log="$(cat "${cmd_snap_log}")"
       assert_contains "${snap_log}" ":/workspace:rw,stat-virt=off" "fake msb workspace hub rw stat-virt=off"
       assert_not_contains "${snap_log}" "stat-virt=off,uid=" "fake msb workspace hub omits uid with stat-virt=off"
@@ -2110,7 +2420,7 @@ EOF
     mkdir -p "${nest_child}"
     rc=0
     err_out="$(PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" \
-      agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${nest_parent}" "${nest_child}" 2>&1)" || rc=$?
+      with_timeout 30 agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${nest_parent}" "${nest_child}" 2>&1)" || rc=$?
     [[ "${rc}" -ne 0 ]] || { echo "Expected overlapping shares to fail" >&2; return 1; }
     assert_contains "${err_out}" "overlapping share paths" "overlapping share paths rejection"
     rm -rf "${nest_parent}"
@@ -2122,24 +2432,30 @@ EOF
     ln "${single_hl}" "${single_peer}"
     rc=0
     err_out="$(PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" \
-      agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${single_hl}" 2>&1)" || rc=$?
+      with_timeout 30 agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${single_hl}" 2>&1)" || rc=$?
     [[ "${rc}" -ne 0 ]] || { echo "Expected writable multi-hardlink share to fail" >&2; return 1; }
     assert_contains "${err_out}" "multiple hard links" "multi-hardlink writable file rejection"
 
-    PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" \
-      agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${single_hl}:ro" >/dev/null
+    if [[ -r /dev/fuse && -w /dev/fuse ]] && [[ "${EUID_VAL}" -eq 0 || -n "${fm_bin}" ]]; then
+      PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" \
+        with_timeout 30 agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${single_hl}:ro" >/dev/null
+    fi
     rm -f "${single_hl}" "${single_peer}"
 
     # Check that pathsec accepts shares outside $HOME when AGBOX_ALLOW_OUTSIDE_HOME=1.
-    local out_share=""
-    out_share="$(mktemp -d /tmp/agbox-outshare-XXXXXX)"
-    PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" AGBOX_ALLOW_OUTSIDE_HOME=1 \
-      agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${out_share}" >/dev/null
-    rm -rf "${out_share}"
+    if [[ -r /dev/fuse && -w /dev/fuse ]] && [[ "${EUID_VAL}" -eq 0 || -n "${fm_bin}" ]]; then
+      out_share="$(mktemp -d /tmp/agbox-outshare-XXXXXX)"
+      rc=0
+      PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" AGBOX_ALLOW_OUTSIDE_HOME=1 \
+        with_timeout 30 agbox_exec "${TEST_BIN}" run --no-net --cmd "true" "${out_share}" >/dev/null || rc=$?
+      rm -rf "${out_share}"
+      out_share=""
+      [[ "${rc}" -eq 0 ]] || return "${rc}"
+    fi
 
     local pipe_out=""
     PATH="${cmd_fake_bin}:${PATH}" MSB_HOME="${cmd_msb}" AGBOX_DATA_DIR="${cmd_data}" run_capture pipe_out \
-      agbox_exec "${TEST_BIN}" run --no-net --cmd "cat" <<< 'piped-hello'
+      with_timeout_stdin 30 agbox_exec "${TEST_BIN}" run --no-net --cmd "cat" <<< 'piped-hello'
     assert_contains "${pipe_out}" "FAKE_CMD_PIPED:piped-hello" "fake msb --cmd piped stdin"
   else
     echo "/dev/kvm not accessible. Skipping CLI fake-msb --cmd streaming subcheck (covered by Go unit test)."
@@ -2171,7 +2487,7 @@ check_08_fuse_workspace_hub() {
     return 1
   fi
 
-  local fbase="${TEST_ROOT}/fuse-test"
+  fbase="${TEST_ROOT}/fuse-test"
   local src_masked="${fbase}/src/masked"
   local src_vcs="${fbase}/src/vcs"
   local src_hooks="${fbase}/src/vcshooks"
@@ -2226,15 +2542,17 @@ check_08_fuse_workspace_hub() {
 }
 EOF
 
-  local hub_pid=""
+  hub_pid=""
   cleanup_fuse_check() {
-    if [[ -n "${hub_pid}" ]]; then
+    if [[ -n "${hub_pid:-}" ]]; then
       kill -TERM "${hub_pid}" 2>/dev/null || true
       wait "${hub_pid}" 2>/dev/null || true
     fi
-    unmount_tree "${fbase}"
+    if [[ -n "${fbase:-}" ]]; then
+      unmount_tree "${fbase}"
+    fi
   }
-  trap cleanup_fuse_check RETURN
+  trap cleanup_fuse_check EXIT
 
   "${TEST_BIN}" __filter -hub -mnt "${mnt}" -sock "${sock}" -spec "${spec}" >"${hub_log}" 2>&1 </dev/null &
   hub_pid=$!
@@ -2724,9 +3042,9 @@ check_10_disruptive_clean_pre() {
   DISRUPTIVE_SETUP_DONE=1
   MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 120 agbox_exec "${TEST_BIN}" remove --yes
   local st_out=""
-  MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" run_capture st_out agbox_exec "${TEST_BIN}" status
+  MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" run_capture st_out with_timeout 30 agbox_exec "${TEST_BIN}" status
   printf '%s\n' "${st_out}"
-  assert_contains "${st_out}" "(none - run create-base)" "status after pre-clean remove"
+  assert_contains "${st_out}" "base_snapshot: not configured" "status after pre-clean remove"
 }
 
 check_11_disruptive_install_sh() {
@@ -2920,29 +3238,31 @@ check_21_persistence_auth_skills_rules_agents_profile() {
   prepare_shared_test_dirs
   local proj="${TEST_ROOT}/proj1"
   local sdir="${TEST_ROOT}/p-src"
-  local prof="${SUITE_ID}-p1"
+  prof="${SUITE_ID}-p1"
   rm -rf "${sdir}"
   mkdir -p "${sdir}/e2e-skill"
 
-  local had_env_rules=0
+  had_env_rules=0
   if [[ -f "${RUNTIME_DATA_DIR}/rules/AGBOX_ENV_RULES.md" ]]; then
     had_env_rules=1
   fi
 
   cleanup_21() {
-    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" skills rm e2e-skill >/dev/null 2>&1 || true
-    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" rules rm --all >/dev/null 2>&1 || true
-    if [[ "${had_env_rules}" -eq 1 && -f "${REPO_DIR}/AGBOX_ENV_RULES.md" ]]; then
-      AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" rules add --force "${REPO_DIR}/AGBOX_ENV_RULES.md" >/dev/null 2>&1 || true
+    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" skills rm e2e-skill >/dev/null 2>&1 || true
+    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" rules rm --all >/dev/null 2>&1 || true
+    if [[ "${had_env_rules:-0}" -eq 1 && -f "${REPO_DIR}/AGBOX_ENV_RULES.md" ]]; then
+      AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" rules add --force "${REPO_DIR}/AGBOX_ENV_RULES.md" >/dev/null 2>&1 || true
     fi
-    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" auth logout all >/dev/null 2>&1 || true
-    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" update clear all >/dev/null 2>&1 || true
-    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" profile rm --force "${prof}" >/dev/null 2>&1 || true
+    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" auth logout all >/dev/null 2>&1 || true
+    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" update clear all >/dev/null 2>&1 || true
+    if [[ -n "${prof:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" profile rm --force "${prof}" >/dev/null 2>&1 || true
+    fi
   }
-  trap cleanup_21 RETURN
+  trap cleanup_21 EXIT
 
   printf '# E2E Skill\nUse deterministic checks.\n' > "${sdir}/e2e-skill/SKILL.md"
-  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" skills add --force "${sdir}/e2e-skill" >/dev/null
+  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" skills add --force "${sdir}/e2e-skill" >/dev/null
 
   printf '# Always Rule\nNever skip verification.\n' > "${sdir}/always.md"
   cat > "${sdir}/cond.md" <<'EOF'
@@ -2952,8 +3272,8 @@ description: Conditional e2e rule
 ---
 Apply when checking persistence.
 EOF
-  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" rules add --force "${sdir}/always.md" >/dev/null
-  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" rules add --force "${sdir}/cond.md" >/dev/null
+  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" rules add --force "${sdir}/always.md" >/dev/null
+  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" rules add --force "${sdir}/cond.md" >/dev/null
 
   seed_test_auth "${RUNTIME_DATA_DIR}"
   install_stub_agy_cache "${RUNTIME_DATA_DIR}"
@@ -3023,35 +3343,39 @@ check_22_persist_remote_control_shares_suspend_resume() {
   local proj="${TEST_ROOT}/proj1"
   local extra="${TEST_ROOT}/extra1"
   local sdir="${TEST_ROOT}/rc-src"
-  local sbx_name="${SUITE_ID}-blip"
-  local sbx="agbox-${sbx_name}"
-  local fail_name="${SUITE_ID}-rcfail"
-  local fail_sbx="agbox-${fail_name}"
+  sbx_name="${SUITE_ID}-blip"
+  sbx="agbox-${sbx_name}"
+  fail_name="${SUITE_ID}-rcfail"
+  fail_sbx="agbox-${fail_name}"
   rm -rf "${sdir}"
   mkdir -p "${sdir}/e2e-rc-skill"
 
-  local had_env_rules=0
+  had_env_rules=0
   if [[ -f "${RUNTIME_DATA_DIR}/rules/AGBOX_ENV_RULES.md" ]]; then
     had_env_rules=1
   fi
 
   cleanup_22() {
-    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" stop "${sbx}" >/dev/null 2>&1 || true
-    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" stop "${fail_sbx}" >/dev/null 2>&1 || true
-    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" skills rm e2e-rc-skill >/dev/null 2>&1 || true
-    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" rules rm --all >/dev/null 2>&1 || true
-    if [[ "${had_env_rules}" -eq 1 && -f "${REPO_DIR}/AGBOX_ENV_RULES.md" ]]; then
-      AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" rules add --force "${REPO_DIR}/AGBOX_ENV_RULES.md" >/dev/null 2>&1 || true
+    if [[ -n "${sbx:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${sbx}" >/dev/null 2>&1 || true
     fi
-    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" auth logout all >/dev/null 2>&1 || true
-    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" update clear all >/dev/null 2>&1 || true
+    if [[ -n "${fail_sbx:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${fail_sbx}" >/dev/null 2>&1 || true
+    fi
+    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" skills rm e2e-rc-skill >/dev/null 2>&1 || true
+    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" rules rm --all >/dev/null 2>&1 || true
+    if [[ "${had_env_rules:-0}" -eq 1 && -f "${REPO_DIR}/AGBOX_ENV_RULES.md" ]]; then
+      AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" rules add --force "${REPO_DIR}/AGBOX_ENV_RULES.md" >/dev/null 2>&1 || true
+    fi
+    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" auth logout all >/dev/null 2>&1 || true
+    AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" update clear all >/dev/null 2>&1 || true
   }
-  trap cleanup_22 RETURN
+  trap cleanup_22 EXIT
 
   printf '# RC Skill\nSkill active.\n' > "${sdir}/e2e-rc-skill/SKILL.md"
-  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" skills add --force "${sdir}/e2e-rc-skill" >/dev/null
+  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" skills add --force "${sdir}/e2e-rc-skill" >/dev/null
   printf '# RC Rule\nRule active.\n' > "${sdir}/rc-rule.md"
-  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" rules add --force "${sdir}/rc-rule.md" >/dev/null
+  AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" rules add --force "${sdir}/rc-rule.md" >/dev/null
   seed_test_auth "${RUNTIME_DATA_DIR}"
   install_stub_agy_cache "${RUNTIME_DATA_DIR}"
 
@@ -3226,18 +3550,20 @@ echo "BLOCKED_RANGES_OK"
 check_31_share_open_fd_revocation() {
   prepare_shared_test_dirs
   local proj="${TEST_ROOT}/proj1"
-  local sbx_name="${SUITE_ID}-fd"
-  local sbx="agbox-${sbx_name}"
-  local bg_pid=""
+  sbx_name="${SUITE_ID}-fd"
+  sbx="agbox-${sbx_name}"
+  bg_pid=""
 
   cleanup_31() {
-    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" stop "${sbx}" >/dev/null 2>&1 || true
-    if [[ -n "${bg_pid}" ]]; then
+    if [[ -n "${sbx:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${sbx}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${bg_pid:-}" ]]; then
       kill "${bg_pid}" 2>/dev/null || true
       wait "${bg_pid}" 2>/dev/null || true
     fi
   }
-  trap cleanup_31 RETURN
+  trap cleanup_31 EXIT
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" \
     agbox_exec "${ACTIVE_BIN}" run --no-net --persist --name "${sbx_name}" --share "${proj}:rw" --cmd "sleep 300" >"${TEST_ROOT}/fd-run.log" 2>&1 </dev/null &
@@ -3288,7 +3614,7 @@ check_31_share_open_fd_revocation() {
   local fd_rc=""
   i=0
   while [[ "${i}" -lt 30 ]]; do
-    fd_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- cat /tmp/fd-rc </dev/null 2>/dev/null || true)"
+    fd_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --stream --no-stdin -u agent "${sbx}" -- cat /tmp/fd-rc </dev/null 2>/dev/null || true)"
     if [[ -n "${fd_rc}" ]]; then
       break
     fi
@@ -3320,8 +3646,8 @@ check_31_share_open_fd_revocation() {
   local fd_cfg_rc=""
   i=0
   while [[ "${i}" -lt 30 ]]; do
-    fd_vcs_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- cat /tmp/fd-vcs-rc </dev/null 2>/dev/null || true)"
-    fd_cfg_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- cat /tmp/fd-cfg-rc </dev/null 2>/dev/null || true)"
+    fd_vcs_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --stream --no-stdin -u agent "${sbx}" -- cat /tmp/fd-vcs-rc </dev/null 2>/dev/null || true)"
+    fd_cfg_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --stream --no-stdin -u agent "${sbx}" -- cat /tmp/fd-cfg-rc </dev/null 2>/dev/null || true)"
     if [[ -n "${fd_vcs_rc}" && -n "${fd_cfg_rc}" ]]; then
       break
     fi
@@ -3349,7 +3675,7 @@ check_31_share_open_fd_revocation() {
   local fd2_rc=""
   i=0
   while [[ "${i}" -lt 30 ]]; do
-    fd2_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --no-stdin -u agent "${sbx}" -- cat /tmp/fd2-rc </dev/null 2>/dev/null || true)"
+    fd2_rc="$(MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" exec --stream --no-stdin -u agent "${sbx}" -- cat /tmp/fd2-rc </dev/null 2>/dev/null || true)"
     if [[ -n "${fd2_rc}" ]]; then
       break
     fi
@@ -3364,23 +3690,29 @@ check_31_share_open_fd_revocation() {
 }
 
 check_32_profile_lock_and_orphan_reaping() {
-  local prof="${SUITE_ID}-lkp"
-  local sbx_name="${SUITE_ID}-lk"
-  local sbx="agbox-${sbx_name}"
-  local orph_id="${SUITE_ID}-orph"
-  local orph_sbx="agbox-${orph_id}"
-  local bg_pid=""
+  prof="${SUITE_ID}-lkp"
+  sbx_name="${SUITE_ID}-lk"
+  sbx="agbox-${sbx_name}"
+  orph_id="${SUITE_ID}-orph"
+  orph_sbx="agbox-${orph_id}"
+  bg_pid=""
 
   cleanup_32() {
-    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" stop "${sbx}" >/dev/null 2>&1 || true
-    MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" rm -f "${orph_sbx}" </dev/null >/dev/null 2>&1 || true
-    if [[ -n "${bg_pid}" ]]; then
+    if [[ -n "${sbx:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${sbx}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${orph_sbx:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" with_timeout 30 "${MSB_BIN_PATH}" rm -f "${orph_sbx}" </dev/null >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${bg_pid:-}" ]]; then
       kill "${bg_pid}" 2>/dev/null || true
       wait "${bg_pid}" 2>/dev/null || true
     fi
-    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" profile rm --force "${prof}" >/dev/null 2>&1 || true
+    if [[ -n "${prof:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" profile rm --force "${prof}" >/dev/null 2>&1 || true
+    fi
   }
-  trap cleanup_32 RETURN
+  trap cleanup_32 EXIT
 
   # Profile lock contention check.
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" profile create --size 128M "${prof}"
@@ -3451,14 +3783,16 @@ check_33_serve_detached_basic_auth_lifecycle() {
     skip_check "curl is not installed on host"
   fi
   prepare_shared_test_dirs
-  local sbx_name="${SUITE_ID}-wsrv"
-  local sbx="agbox-${sbx_name}"
+  sbx_name="${SUITE_ID}-wsrv"
+  sbx="agbox-${sbx_name}"
   local pass="pw-${SUITE_ID}"
 
   cleanup_33() {
-    MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" stop "${sbx}" >/dev/null 2>&1 || true
+    if [[ -n "${sbx:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${sbx}" >/dev/null 2>&1 || true
+    fi
   }
-  trap cleanup_33 RETURN
+  trap cleanup_33 EXIT
 
   local out=""
   OPENCODE_SERVER_PASSWORD="${pass}" MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
@@ -3470,10 +3804,10 @@ check_33_serve_detached_basic_auth_lifecycle() {
   [[ -n "${url}" ]] || { echo "Failed to parse serve URL from output" >&2; return 1; }
 
   local code=""
-  code="$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "${url}/doc")"
+  code="$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "${url}/doc" || true)"
   [[ "${code}" == "401" ]] || { echo "Expected HTTP 401 without basic auth, got ${code}" >&2; return 1; }
 
-  code="$(curl -sS --connect-timeout 5 --max-time 15 -u "opencode:${pass}" -o /dev/null -w '%{http_code}' "${url}/doc")"
+  code="$(curl -sS --connect-timeout 5 --max-time 15 -u "opencode:${pass}" -o /dev/null -w '%{http_code}' "${url}/doc" || true)"
   [[ "${code}" == "200" ]] || { echo "Expected HTTP 200 with basic auth, got ${code}" >&2; return 1; }
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" suspend "${sbx}"
@@ -3486,7 +3820,7 @@ check_33_serve_detached_basic_auth_lifecycle() {
   OPENCODE_SERVER_PASSWORD="${pass}" MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture resume_out with_timeout 180 \
     agbox_exec "${ACTIVE_BIN}" resume -d "${sbx}"
   printf '%s\n' "${resume_out}"
-  code="$(curl -sS --connect-timeout 5 --max-time 15 -u "opencode:${pass}" -o /dev/null -w '%{http_code}' "${url}/doc")"
+  code="$(curl -sS --connect-timeout 5 --max-time 15 -u "opencode:${pass}" -o /dev/null -w '%{http_code}' "${url}/doc" || true)"
   [[ "${code}" == "200" ]] || { echo "Expected HTTP 200 after resume, got ${code}" >&2; return 1; }
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${sbx}"
@@ -3497,19 +3831,19 @@ check_34_live_agent_update() {
     skip_check "covered in isolated lifecycle when non-disruptive"
   fi
   cleanup_34() {
-    AGBOX_DATA_DIR="${ORIG_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" update clear all >/dev/null 2>&1 || true
+    AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 30 agbox_exec "${ACTIVE_BIN}" update clear all >/dev/null 2>&1 || true
   }
-  trap cleanup_34 RETURN
+  trap cleanup_34 EXIT
 
   MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 600 agbox_exec "${ACTIVE_BIN}" update both
   local st=""
-  AGBOX_DATA_DIR="${ORIG_DATA_DIR}" run_capture st agbox_exec "${ACTIVE_BIN}" update status
+  AGBOX_DATA_DIR="${ORIG_DATA_DIR}" run_capture st with_timeout 30 agbox_exec "${ACTIVE_BIN}" update status
   assert_contains "${st}" "antigravity: version=" "live update status antigravity"
   assert_contains "${st}" "opencode: version=" "live update status opencode"
 
   MSB_HOME="${ORIG_MSB_HOME}" AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 180 agbox_exec "${ACTIVE_BIN}" run --no-net --name "${SUITE_ID}-updchk" --cmd \
     'agy --version && opencode --version && grep -q " /home/agent/.local/bin/agy " /proc/self/mountinfo'
-  AGBOX_DATA_DIR="${ORIG_DATA_DIR}" agbox_exec "${ACTIVE_BIN}" update clear all
+  AGBOX_DATA_DIR="${ORIG_DATA_DIR}" with_timeout 30 agbox_exec "${ACTIVE_BIN}" update clear all
 }
 
 # ---------------------------------------------------------------------------
@@ -3518,9 +3852,9 @@ check_34_live_agent_update() {
 
 check_40_isolated_full_lifecycle() {
   build_test_binaries
-  local iso_msb="${TEST_ROOT}/full-iso-msb"
-  local iso_data="${TEST_ROOT}/full-iso-data"
-  local iso_bin_dir="${TEST_ROOT}/full-iso-bin"
+  iso_msb="${TEST_ROOT}/full-iso-msb"
+  iso_data="${TEST_ROOT}/full-iso-data"
+  iso_bin_dir="${TEST_ROOT}/full-iso-bin"
 
   if ! prepare_isolated_msb_home "${iso_msb}"; then
     skip_check "msb does not isolate MSB_HOME (use --disruptive to test create-base, edit-base, and remove)"
@@ -3530,23 +3864,27 @@ check_40_isolated_full_lifecycle() {
   chmod 0700 "${iso_bin_dir}"
 
   cleanup_40() {
-    if [[ -x "${iso_bin_dir}/agbox" ]]; then
-      MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" agbox_exec "${iso_bin_dir}/agbox" remove --yes >/dev/null 2>&1 || true
+    if [[ -n "${iso_bin_dir:-}" && -x "${iso_bin_dir}/agbox" ]]; then
+      MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" with_timeout 60 agbox_exec "${iso_bin_dir}/agbox" remove --yes >/dev/null 2>&1 || true
     fi
   }
-  trap cleanup_40 RETURN
+  trap cleanup_40 EXIT
 
   local -a inst_args=()
   if [[ "${ALLOW_ROOT}" -eq 1 ]]; then
     inst_args+=(--allow-root)
   fi
+  local iso_comp_dir="${TEST_ROOT}/full-iso-comp"
+  mkdir -p "${iso_comp_dir}"
   (
     cd "${REPO_DIR}"
-    MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" AGBOX_INSTALL_DIR="${iso_bin_dir}" with_timeout 300 ./install.sh "${inst_args[@]}"
+    MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" AGBOX_INSTALL_DIR="${iso_bin_dir}" AGBOX_COMPLETION_DIR="${iso_comp_dir}" with_timeout 300 ./install.sh "${inst_args[@]}"
   )
   local ibin="${iso_bin_dir}/agbox"
   [[ -x "${ibin}" ]] || return 1
   [[ -f "${iso_data}/rules/AGBOX_ENV_RULES.md" ]] || { echo "Expected default AGBOX_ENV_RULES.md in ${iso_data}/rules" >&2; return 1; }
+  [[ -f "${iso_comp_dir}/agbox" ]] || { echo "Expected bash completion script in ${iso_comp_dir}/agbox" >&2; return 1; }
+  bash -n "${iso_comp_dir}/agbox"
 
   MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" with_timeout 900 agbox_exec "${ibin}" create-base --add core both
   MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" with_timeout 300 agbox_exec "${ibin}" edit-base --cmd "echo iso-v2 > /etc/agbox-iso-v2"
@@ -3557,10 +3895,10 @@ check_40_isolated_full_lifecycle() {
 
   MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" with_timeout 600 agbox_exec "${ibin}" update both
   local up_st=""
-  AGBOX_DATA_DIR="${iso_data}" run_capture up_st agbox_exec "${ibin}" update status
+  AGBOX_DATA_DIR="${iso_data}" run_capture up_st with_timeout 30 agbox_exec "${ibin}" update status
   assert_contains "${up_st}" "antigravity: version=" "iso update status"
   assert_contains "${up_st}" "opencode: version=" "iso update status"
-  AGBOX_DATA_DIR="${iso_data}" agbox_exec "${ibin}" update clear all
+  AGBOX_DATA_DIR="${iso_data}" with_timeout 30 agbox_exec "${ibin}" update clear all
 
   local abort_rc=0
   printf 'n\n' | MSB_HOME="${iso_msb}" AGBOX_DATA_DIR="${iso_data}" with_timeout_stdin 30 agbox_exec "${ibin}" remove >/dev/null 2>&1 || abort_rc=$?
@@ -3590,9 +3928,14 @@ check_99_verify_host_unchanged() {
   local after_dir="${TEST_ROOT}/after-baseline"
   capture_state "${after_dir}"
 
+  local -a items=(data_dir.fp install_bin.fp msb_home_bins.fp msb_sandboxes.txt msb_snaps.txt msb_volumes.txt agbox_mounts.txt)
+  if [[ "${RUNTIME_MSB_HOME}" != "${ORIG_MSB_HOME}" ]]; then
+    items+=(msb_home.fp)
+  fi
+
   local failed=0
   local item=""
-  for item in data_dir.fp install_bin.fp msb_home.fp msb_sandboxes.txt msb_snaps.txt msb_volumes.txt agbox_mounts.txt; do
+  for item in "${items[@]}"; do
     if ! diff -u "${BASELINE_DIR}/${item}" "${after_dir}/${item}"; then
       printf 'Host state drift detected in %s\n' "${item}" >&2
       failed=1
@@ -3655,6 +3998,7 @@ check_99_verify_disruptive_cleanup() {
 
 init_environment() {
   unset_passthrough_secrets
+  unset AGBOX_ALLOW_OUTSIDE_HOME AGBOX_MASK_VCS 2>/dev/null || true
 
   if [[ "${EUID_VAL}" -eq 0 && "${ALLOW_ROOT}" -ne 1 ]]; then
     die_msg "Do not run ${SCRIPT_NAME} as root. Pass --allow-root or set AGBOX_ALLOW_ROOT=1."
@@ -3703,6 +4047,10 @@ init_environment() {
   fi
   mkdir -p "${TEST_ROOT}"
   chmod 0700 "${TEST_ROOT}"
+  trap global_cleanup EXIT
+  trap 'handle_interrupt INT 130' INT
+  trap 'handle_interrupt TERM 143' TERM
+  trap 'handle_interrupt HUP 129' HUP
 
   STYLECHECK_SRC="${TEST_ROOT}/helpers/stylecheck/main.go"
   STUB_AGY_BIN="${TEST_ROOT}/helpers/agy"
@@ -3856,7 +4204,7 @@ prepare_runtime_env_for_vm_tests() {
         mkdir -p "${RUNTIME_DATA_DIR}/run/${bid}"
         chmod 0700 "${RUNTIME_DATA_DIR}/run/${bid}"
         local mf=""
-        for mf in run.meta suspended detached; do
+        for mf in run.meta suspended detached deleting; do
           if [[ -f "${d}/${mf}" ]]; then
             install -m 0600 "${d}/${mf}" "${RUNTIME_DATA_DIR}/run/${bid}/${mf}"
           fi
@@ -3976,10 +4324,6 @@ print_final_report() {
 main() {
   parse_args "$@"
   init_environment
-  trap global_cleanup EXIT
-  trap 'handle_interrupt INT 130' INT
-  trap 'handle_interrupt TERM 143' TERM
-  trap 'handle_interrupt HUP 129' HUP
 
   log_msg "Starting agbox test suite (mode: full=${FULL_MODE}, disruptive=${DISRUPTIVE_MODE}, skip_vm=${SKIP_VM})"
   log_msg "Logs directory: ${LOG_DIR}"

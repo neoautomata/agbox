@@ -1381,11 +1381,20 @@ func StartHubSubprocessWithOptions(exePath, mntDir, sockPath, pidFile string, in
 	})
 }
 
+const defaultHubControlTimeout = 10 * time.Second
+
 func callHubSocket(sockPath string, req hubControlRequest) (hubControlResponse, error) {
-	return callHubSocketWithUID(sockPath, req, uint32(os.Geteuid()))
+	return callHubSocketWithUIDAndTimeout(sockPath, req, uint32(os.Geteuid()), defaultHubControlTimeout)
 }
 
 func callHubSocketWithUID(sockPath string, req hubControlRequest, expectedUID uint32) (hubControlResponse, error) {
+	return callHubSocketWithUIDAndTimeout(sockPath, req, expectedUID, defaultHubControlTimeout)
+}
+
+func callHubSocketWithUIDAndTimeout(sockPath string, req hubControlRequest, expectedUID uint32, timeout time.Duration) (hubControlResponse, error) {
+	if timeout <= 0 {
+		timeout = defaultHubControlTimeout
+	}
 	info, err := os.Lstat(sockPath)
 	if err != nil {
 		return hubControlResponse{}, fmt.Errorf("stat workspace hub socket %q: %w", sockPath, err)
@@ -1397,16 +1406,17 @@ func callHubSocketWithUID(sockPath string, req hubControlRequest, expectedUID ui
 		return hubControlResponse{}, fmt.Errorf("path %q is not a Unix domain socket", sockPath)
 	}
 
-	addr, err := net.ResolveUnixAddr("unix", sockPath)
-	if err != nil {
-		return hubControlResponse{}, err
-	}
-	conn, err := net.DialUnix("unix", nil, addr)
+	rawConn, err := net.DialTimeout("unix", sockPath, timeout)
 	if err != nil {
 		return hubControlResponse{}, fmt.Errorf("connect to workspace hub socket %q: %w", sockPath, err)
 	}
+	conn, ok := rawConn.(*net.UnixConn)
+	if !ok {
+		_ = rawConn.Close()
+		return hubControlResponse{}, fmt.Errorf("unexpected connection type for workspace hub socket %q", sockPath)
+	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 
 	if err := verifyPeerUID(conn, expectedUID); err != nil {
 		return hubControlResponse{}, err
@@ -1448,7 +1458,13 @@ func pingHub(sockPath string) error {
 
 // ListHubShares queries all active shares from a running Workspace Hub.
 func ListHubShares(sockPath string) ([]HubShareStatus, error) {
-	resp, err := callHubSocket(sockPath, hubControlRequest{Op: "list"})
+	return ListHubSharesWithTimeout(sockPath, defaultHubControlTimeout)
+}
+
+// ListHubSharesWithTimeout queries all active shares from a running Workspace Hub
+// with a bounded connection and read timeout.
+func ListHubSharesWithTimeout(sockPath string, timeout time.Duration) ([]HubShareStatus, error) {
+	resp, err := callHubSocketWithUIDAndTimeout(sockPath, hubControlRequest{Op: "list"}, uint32(os.Geteuid()), timeout)
 	if err != nil {
 		return nil, err
 	}

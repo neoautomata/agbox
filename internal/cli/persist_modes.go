@@ -628,8 +628,10 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 
 	origMode := meta.Mode
 	origCmd := meta.Cmd
+	origRC := meta.RemoteControl
+	origAgent := meta.Agent
 
-	if opts.Agent != "" {
+	if opts.Agent != "" || opts.Serve || opts.RemoteControl {
 		effAgent, aErr := selectEffectiveAgent(baseState.Agent, opts)
 		if aErr != nil {
 			return aErr
@@ -643,13 +645,22 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 	case opts.Cmd != "":
 		meta.Mode = config.RunModeCmd
 		meta.Cmd = opts.Cmd
+		meta.RemoteControl = false
 	case opts.Serve:
 		meta.Mode = config.RunModeServe
+		meta.RemoteControl = false
 	case opts.RemoteControl:
 		meta.RemoteControl = true
 		if opts.Detach || a.IsTTY == nil || !a.IsTTY() {
 			meta.Mode = config.RunModeRemoteControl
 		} else {
+			meta.Mode = config.RunModeTUI
+		}
+	default:
+		if opts.Agent == "opencode" && (meta.RemoteControl || meta.Mode == config.RunModeRemoteControl) {
+			meta.RemoteControl = false
+			meta.Mode = config.RunModeTUI
+		} else if opts.Agent == "antigravity" && meta.Mode == config.RunModeServe {
 			meta.Mode = config.RunModeTUI
 		}
 	}
@@ -672,11 +683,23 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 	})
 
 	if opts.Cmd != "" && origMode != config.RunModeCmd && hasMarker(suspendedPath) {
+		metaLock, lockErr := lockRunMeta(runFilterDir)
+		if lockErr == nil {
+			defer metaLock.unlock()
+		}
 		if latest, lErr := config.LoadRunMeta(suspendedPath); lErr == nil {
 			latest.Mode = origMode
 			latest.Cmd = origCmd
+			latest.RemoteControl = origRC
+			latest.Agent = origAgent
 			if sErr := config.SaveRunMeta(suspendedPath, latest); sErr != nil {
 				a.warnf("Could not restore persistent run mode for %s: %v", runSandbox, sErr)
+			}
+			runMetaPath := filepath.Join(runFilterDir, "run.meta")
+			if hasMarker(runMetaPath) {
+				if mErr := config.SaveRunMeta(runMetaPath, latest); mErr != nil {
+					a.warnf("Could not restore run metadata for %s: %v", runSandbox, mErr)
+				}
 			}
 		}
 	}

@@ -12,12 +12,13 @@ die()  { printf '[agbox-install] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--allow-root] [--skip-setup] [--help]
+Usage: ./install.sh [--allow-root] [--skip-setup] [--skip-completion] [--help]
 
 Options:
-  --allow-root   Allow installation as the root user (or set AGBOX_ALLOW_ROOT=1).
-  --skip-setup   Skip 'agbox setup' during installation.
-  -h, --help     Show this help message and exit.
+  --allow-root       Allow installation as the root user (or set AGBOX_ALLOW_ROOT=1).
+  --skip-setup       Skip 'agbox setup' during installation.
+  --skip-completion  Skip installing the bash completion script.
+  -h, --help         Show this help message and exit.
 EOF
 }
 
@@ -25,6 +26,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 BUILD_TMP_DIR=""
 MSB_INSTALLER_TMP=""
 INSTALL_STAGE_BIN=""
+INSTALL_STAGE_COMP=""
 
 cleanup() {
   if [[ -n "${MSB_INSTALLER_TMP}" && -e "${MSB_INSTALLER_TMP}" ]]; then
@@ -35,6 +37,10 @@ cleanup() {
     rm -f "${INSTALL_STAGE_BIN}"
   fi
   INSTALL_STAGE_BIN=""
+  if [[ -n "${INSTALL_STAGE_COMP}" && -e "${INSTALL_STAGE_COMP}" ]]; then
+    rm -f "${INSTALL_STAGE_COMP}"
+  fi
+  INSTALL_STAGE_COMP=""
   if [[ -n "${BUILD_TMP_DIR}" && -d "${BUILD_TMP_DIR}" ]]; then
     rm -rf "${BUILD_TMP_DIR}"
   fi
@@ -49,6 +55,7 @@ main() {
     allow_root=1
   fi
   local skip_setup=0
+  local skip_completion=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -58,6 +65,10 @@ main() {
         ;;
       --skip-setup)
         skip_setup=1
+        shift
+        ;;
+      --skip-completion)
+        skip_completion=1
         shift
         ;;
       -h|--help)
@@ -145,7 +156,7 @@ main() {
   log "Building agbox from ${SCRIPT_DIR}..."
   (
     cd "${SCRIPT_DIR}"
-    CGO_ENABLED=0 go build -o "${BUILD_TMP_DIR}/agbox" -trimpath ./cmd/agbox
+    CGO_ENABLED=0 go build -o "${BUILD_TMP_DIR}/agbox" -buildvcs=false -trimpath ./cmd/agbox
   )
   mkdir -p "${install_dir}"
   [[ ! -L "${install_dir}/agbox" ]] || die "Refusing to overwrite symlink at ${install_dir}/agbox."
@@ -162,6 +173,35 @@ main() {
     "${install_dir}/agbox" rules add --allow-root --force "${SCRIPT_DIR}/AGBOX_ENV_RULES.md" >/dev/null
   else
     "${install_dir}/agbox" rules add --force "${SCRIPT_DIR}/AGBOX_ENV_RULES.md" >/dev/null
+  fi
+
+  if [[ "${skip_completion}" -eq 1 ]]; then
+    log "Skipping bash completion installation (--skip-completion)."
+  else
+    local comp_dir=""
+    if [[ -n "${AGBOX_COMPLETION_DIR:-}" ]]; then
+      comp_dir="${AGBOX_COMPLETION_DIR}"
+    elif [[ "${euid}" -eq 0 ]]; then
+      if [[ -d /usr/share/bash-completion/completions || ! -d /etc/bash_completion.d ]]; then
+        comp_dir="/usr/share/bash-completion/completions"
+      else
+        comp_dir="/etc/bash_completion.d"
+      fi
+    else
+      comp_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/bash-completion/completions"
+    fi
+    while [[ "${comp_dir}" != "/" && "${comp_dir}" == */ ]]; do
+      comp_dir="${comp_dir%/}"
+    done
+    mkdir -p "${comp_dir}"
+    [[ ! -L "${comp_dir}/agbox" ]] || die "Refusing to overwrite symlink at ${comp_dir}/agbox."
+    [[ ! -d "${comp_dir}/agbox" ]] || die "Refusing to overwrite directory at ${comp_dir}/agbox."
+    INSTALL_STAGE_COMP="$(mktemp "${comp_dir}/.agbox.tmp.XXXXXX")"
+    "${install_dir}/agbox" completion bash > "${INSTALL_STAGE_COMP}"
+    chmod 0644 "${INSTALL_STAGE_COMP}"
+    mv -f "${INSTALL_STAGE_COMP}" "${comp_dir}/agbox"
+    INSTALL_STAGE_COMP=""
+    log "Installed bash completion: ${comp_dir}/agbox"
   fi
 
   # 5. Check host prerequisites and run the microVM smoke test.
