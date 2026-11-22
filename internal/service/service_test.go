@@ -1,10 +1,12 @@
 package service
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agbox/internal/config"
 )
@@ -221,7 +223,8 @@ func TestRenderAndInstallTemplateUnit(t *testing.T) {
 		t.Fatalf("RenderTemplateUnit failed: %v", err)
 	}
 	for _, want := range []string{
-		"Type=simple",
+		"Type=notify",
+		"NotifyAccess=main",
 		`ExecStart="/home/alice/.local/bin/agbox" __service-run %i`,
 		`Environment="PATH=/home/alice/.local/bin:/usr/bin:/bin"`,
 		`Environment="AGBOX_DATA_DIR=/home/alice/.local/share/agbox"`,
@@ -230,7 +233,9 @@ func TestRenderAndInstallTemplateUnit(t *testing.T) {
 		"After=network-online.target",
 		"Restart=on-failure",
 		"KillMode=mixed",
+		"TimeoutStartSec=120",
 		"TimeoutStopSec=30",
+		"WatchdogSec=90s",
 		"WantedBy=default.target",
 	} {
 		if !strings.Contains(unit, want) {
@@ -284,5 +289,34 @@ func TestUserUnitDir(t *testing.T) {
 	}
 	if _, err := UserUnitDir("/home/alice", "relative/cfg"); err == nil {
 		t.Fatal("UserUnitDir accepted relative XDG_CONFIG_HOME")
+	}
+}
+
+func TestNotifyUnixgram(t *testing.T) {
+	t.Parallel()
+
+	// Empty socket path is a no-op.
+	if err := Notify("", "READY=1"); err != nil {
+		t.Fatalf("Notify empty socket failed: %v", err)
+	}
+
+	sockPath := filepath.Join(t.TempDir(), "notify.sock")
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sockPath, Net: "unixgram"})
+	if err != nil {
+		t.Fatalf("ListenUnixgram failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := Notify(sockPath, "READY=1"); err != nil {
+		t.Fatalf("Notify READY=1 failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Read datagram failed: %v", err)
+	}
+	if got := string(buf[:n]); got != "READY=1" {
+		t.Fatalf("got %q, want READY=1", got)
 	}
 }

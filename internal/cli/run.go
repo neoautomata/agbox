@@ -555,16 +555,16 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			Env:     envFlags,
 			Command: []string{"sh", "-c", inner},
 		})
+		if supervised {
+			return a.superviseCmd(ctx, sandbox, execArgs)
+		}
 		res, err := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:        execArgs,
 			Stdin:       a.Stdin,
 			Stdout:      a.Stdout,
 			Stderr:      a.Stderr,
-			Interactive: !supervised,
+			Interactive: true,
 		})
-		if supervised && ctx.Err() != nil {
-			return nil
-		}
 		return wrapPassthroughExit(res, err)
 
 	case config.RunModeRemoteControl:
@@ -597,14 +597,15 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			Env:     envFlags,
 			Command: []string{"sh", "-c", statusInner},
 		})
-		_, _ = a.MSB.Run(ctx, msb.CommandRequest{
+		statusRes, statusErr := a.MSB.Run(ctx, msb.CommandRequest{
 			Args:   statusArgs,
 			Stdout: a.Stdout,
 			Stderr: a.Stderr,
 		})
 		fmt.Fprintln(a.Stdout, "[agbox] Antigravity Remote Control active: https://antigravity.google.com")
 		if supervised {
-			return a.superviseRemoteControl(ctx, sandbox)
+			initialHealthy := isRemoteControlStatusHealthy(statusRes.Stdout, statusRes.Stderr, statusErr)
+			return a.superviseRemoteControl(ctx, sandbox, workDir, envFlags, initialHealthy)
 		}
 		fmt.Fprintf(a.Stdout, "[agbox] Suspend: agbox suspend %s | Stop: agbox stop %s\n", sandbox, sandbox)
 		return nil
@@ -627,15 +628,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 				Env:     envFlags,
 				Command: []string{"sh", "-c", serveCmd},
 			})
-			res, err := a.MSB.Run(ctx, msb.CommandRequest{
-				Args:   execArgs,
-				Stdout: a.Stdout,
-				Stderr: a.Stderr,
-			})
-			if ctx.Err() != nil {
-				return nil
-			}
-			return wrapPassthroughExit(res, err)
+			return a.superviseServe(ctx, sandbox, meta.Port, execArgs)
 		}
 		if willDetach || probe {
 			bgCmd := fmt.Sprintf(
@@ -718,10 +711,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 	}
 }
 
-func (a *appRuntime) defaultWaitServeUI(ctx context.Context, port int, sandbox string) bool {
-	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-	defer cancel()
-
+func (a *appRuntime) defaultProbeServeUI(ctx context.Context, port int) bool {
 	client := &http.Client{
 		Timeout: 3 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -735,21 +725,28 @@ func (a *appRuntime) defaultWaitServeUI(ctx context.Context, port int, sandbox s
 		user = defaultStr(a.Getenv("OPENCODE_SERVER_USERNAME"), "opencode")
 		pass = a.Getenv("OPENCODE_SERVER_PASSWORD")
 	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	if pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+func (a *appRuntime) defaultWaitServeUI(ctx context.Context, port int, sandbox string) bool {
+	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
 
 	for waitCtx.Err() == nil {
-		req, err := http.NewRequestWithContext(waitCtx, http.MethodGet, url, nil)
-		if err != nil {
-			return false
-		}
-		if pass != "" {
-			req.SetBasicAuth(user, pass)
-		}
-		resp, err := client.Do(req)
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return true
-			}
+		if a.defaultProbeServeUI(waitCtx, port) {
+			return true
 		}
 		if a.MSB != nil {
 			if _, pErr := a.MSB.Run(waitCtx, msb.CommandRequest{Args: []string{"ping", sandbox}}); pErr != nil {

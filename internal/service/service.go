@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"agbox/internal/config"
 )
@@ -379,7 +381,8 @@ func RenderTemplateUnit(opts TemplateUnitOpts) (string, error) {
 	b.WriteString("StartLimitBurst=5\n")
 	b.WriteString("\n")
 	b.WriteString("[Service]\n")
-	b.WriteString("Type=simple\n")
+	b.WriteString("Type=notify\n")
+	b.WriteString("NotifyAccess=main\n")
 	fmt.Fprintf(&b, "ExecStart=%s %s %%i\n", FormatSystemdQuote(opts.ExePath), SubcommandName)
 	if opts.PathEnv != "" {
 		fmt.Fprintf(&b, "Environment=%s\n", FormatSystemdQuote("PATH="+opts.PathEnv))
@@ -392,11 +395,33 @@ func RenderTemplateUnit(opts TemplateUnitOpts) (string, error) {
 	b.WriteString("Restart=on-failure\n")
 	b.WriteString("RestartSec=5s\n")
 	b.WriteString("KillMode=mixed\n")
+	b.WriteString("TimeoutStartSec=120\n")
 	b.WriteString("TimeoutStopSec=30\n")
+	b.WriteString("WatchdogSec=90s\n")
 	b.WriteString("\n")
 	b.WriteString("[Install]\n")
 	b.WriteString("WantedBy=default.target\n")
 	return b.String(), nil
+}
+
+// Notify sends a systemd sd_notify datagram (such as READY=1 or WATCHDOG=1) to socketPath.
+// Empty socketPath is a no-op so manual runs outside systemd succeed.
+func Notify(socketPath, state string) error {
+	if socketPath == "" || state == "" {
+		return nil
+	}
+	addr := &net.UnixAddr{Name: socketPath, Net: "unixgram"}
+	if strings.HasPrefix(socketPath, "@") {
+		addr.Name = "\x00" + socketPath[1:]
+	}
+	conn, err := net.DialUnix("unixgram", nil, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err = conn.Write([]byte(state))
+	return err
 }
 
 // FormatSystemdQuote wraps s in double quotes and escapes backslashes, quotes, and percent signs.

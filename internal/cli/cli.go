@@ -112,30 +112,33 @@ func defaultStr(v, fallback string) string {
 }
 
 type appRuntime struct {
-	Env                 config.Env
-	ExePath             string
-	MSB                 msb.Runner
-	MountCtl            mounttab.Controller
-	ServiceCtl          service.Controller
-	ServicePollInterval time.Duration
-	CurrentUser         func() (string, error)
-	Stdin               io.Reader
-	Stdout              io.Writer
-	Stderr              io.Writer
-	Getenv              func(string) string
-	IsTTY               func() bool
-	GetEUID             func() int
-	GetEGID             func() int
-	SupportsXattr       func(path string, isDir bool) bool
-	TruncateFile        func(path string, size int64) error
-	RunHostCmd          func(ctx context.Context, name string, args ...string) ([]byte, error)
-	Now                 func() time.Time
-	CheckKVM            func() error
-	CheckFUSE           func() error
-	PID                 int
-	StartFilter         func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error)
-	StartHub            func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error)
-	WaitServeUI         func(ctx context.Context, port int, sandbox string) bool
+	Env                  config.Env
+	ExePath              string
+	MSB                  msb.Runner
+	MountCtl             mounttab.Controller
+	ServiceCtl           service.Controller
+	ServicePollInterval  time.Duration
+	ServiceFailThreshold int
+	NotifySystemd        func(state string)
+	CurrentUser          func() (string, error)
+	Stdin                io.Reader
+	Stdout               io.Writer
+	Stderr               io.Writer
+	Getenv               func(string) string
+	IsTTY                func() bool
+	GetEUID              func() int
+	GetEGID              func() int
+	SupportsXattr        func(path string, isDir bool) bool
+	TruncateFile         func(path string, size int64) error
+	RunHostCmd           func(ctx context.Context, name string, args ...string) ([]byte, error)
+	Now                  func() time.Time
+	CheckKVM             func() error
+	CheckFUSE            func() error
+	PID                  int
+	StartFilter          func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error)
+	StartHub             func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error)
+	WaitServeUI          func(ctx context.Context, port int, sandbox string) bool
+	ProbeServeUI         func(ctx context.Context, port int) bool
 }
 
 func newApp() (*appRuntime, error) {
@@ -156,12 +159,13 @@ func newApp() (*appRuntime, error) {
 	}
 
 	app := &appRuntime{
-		Env:                 env,
-		ExePath:             exePath,
-		MSB:                 runner,
-		MountCtl:            mounttab.OSController{},
-		ServiceCtl:          service.OSController{},
-		ServicePollInterval: 15 * time.Second,
+		Env:                  env,
+		ExePath:              exePath,
+		MSB:                  runner,
+		MountCtl:             mounttab.OSController{},
+		ServiceCtl:           service.OSController{},
+		ServicePollInterval:  15 * time.Second,
+		ServiceFailThreshold: 3,
 		CurrentUser: func() (string, error) {
 			u, uErr := user.Current()
 			if uErr != nil {
@@ -205,6 +209,12 @@ func newApp() (*appRuntime, error) {
 		}, dieWithParent)
 	}
 	app.WaitServeUI = app.defaultWaitServeUI
+	app.ProbeServeUI = app.defaultProbeServeUI
+	app.NotifySystemd = func(state string) {
+		if app.Getenv != nil {
+			_ = service.Notify(app.Getenv("NOTIFY_SOCKET"), state)
+		}
+	}
 	return app, nil
 }
 

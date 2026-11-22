@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agbox/internal/config"
@@ -967,24 +968,231 @@ func (a *appRuntime) servicePollInterval() time.Duration {
 	return 15 * time.Second
 }
 
-func (a *appRuntime) superviseRemoteControl(ctx context.Context, sandbox string) error {
+func (a *appRuntime) serviceFailThreshold() int {
+	if a.ServiceFailThreshold > 0 {
+		return a.ServiceFailThreshold
+	}
+	return 3
+}
+
+func (a *appRuntime) notifySystemd(state string) {
+	if a.NotifySystemd != nil {
+		a.NotifySystemd(state)
+		return
+	}
+	if a.Getenv != nil {
+		_ = service.Notify(a.Getenv("NOTIFY_SOCKET"), state)
+	}
+}
+
+func isRemoteControlStatusHealthy(stdout, stderr string, err error) bool {
+	if err != nil {
+		return false
+	}
+	combined := strings.ToLower(stdout + "\n" + stderr)
+	for _, bad := range []string{"not running", "stopped", "inactive", "disconnected", "offline"} {
+		if strings.Contains(combined, bad) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *appRuntime) superviseRemoteControl(ctx context.Context, sandbox, workDir string, envFlags []string, initialHealthy bool) error {
+	threshold := a.serviceFailThreshold()
+	statusInner := fmt.Sprintf("%s cd %s && agy remote-control status", msb.KeyLoaderPrefix, msb.ShellQuote(workDir))
+	statusArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
+		Sandbox: sandbox,
+		User:    config.GuestUser,
+		Stream:  true,
+		NoStdin: true,
+		Env:     envFlags,
+		Command: []string{"sh", "-c", statusInner},
+	})
+
+	readySent := false
+	if initialHealthy {
+		a.notifySystemd("READY=1")
+		a.notifySystemd("WATCHDOG=1")
+		readySent = true
+	}
+
+	failures := 0
 	ticker := time.NewTicker(a.servicePollInterval())
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			a.notifySystemd("STOPPING=1")
 			return nil
 		case <-ticker.C:
-			pingRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ping", sandbox}})
-			if err != nil {
+			var checkErr error
+			if pingRes, pErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ping", sandbox}}); pErr != nil {
 				if ctx.Err() != nil {
+					a.notifySystemd("STOPPING=1")
 					return nil
 				}
-				return formatMSBError("sandbox health check failed for "+sandbox, pingRes, err)
+				checkErr = formatMSBError("sandbox ping failed for "+sandbox, pingRes, pErr)
+			} else {
+				stRes, stErr := a.MSB.Run(ctx, msb.CommandRequest{Args: statusArgs})
+				if ctx.Err() != nil {
+					a.notifySystemd("STOPPING=1")
+					return nil
+				}
+				if !isRemoteControlStatusHealthy(stRes.Stdout, stRes.Stderr, stErr) {
+					if stErr != nil {
+						checkErr = formatMSBError("agy remote-control status failed for "+sandbox, stRes, stErr)
+					} else {
+						checkErr = fmt.Errorf("agy remote-control is unhealthy in %s (%s)", sandbox, strings.TrimSpace(stRes.Stdout+" "+stRes.Stderr))
+					}
+				}
+			}
+
+			if checkErr == nil {
+				failures = 0
+				if !readySent {
+					a.notifySystemd("READY=1")
+					readySent = true
+				}
+				a.notifySystemd("WATCHDOG=1")
+				continue
+			}
+
+			failures++
+			a.warnf("Health check failed for %s (%d/%d): %v", sandbox, failures, threshold, checkErr)
+			if failures >= threshold {
+				a.notifySystemd("STOPPING=1")
+				return fmt.Errorf("health check failed %d consecutive times for %s: %w", failures, sandbox, checkErr)
 			}
 		}
 	}
+}
+
+func (a *appRuntime) superviseServe(ctx context.Context, sandbox string, port int, execArgs []string) error {
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+
+	probeFn := a.ProbeServeUI
+	if probeFn == nil {
+		probeFn = a.defaultProbeServeUI
+	}
+	waitFn := a.WaitServeUI
+	if waitFn == nil {
+		waitFn = a.defaultWaitServeUI
+	}
+	threshold := a.serviceFailThreshold()
+
+	var healthMu sync.Mutex
+	var healthErr error
+	setHealthErr := func(err error) {
+		healthMu.Lock()
+		if healthErr == nil {
+			healthErr = err
+		}
+		healthMu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if !waitFn(serveCtx, port, sandbox) {
+			if serveCtx.Err() == nil {
+				setHealthErr(fmt.Errorf("opencode serve did not become ready on http://127.0.0.1:%d", port))
+				cancelServe()
+			}
+			return
+		}
+		a.notifySystemd("READY=1")
+		a.notifySystemd("WATCHDOG=1")
+
+		failures := 0
+		ticker := time.NewTicker(a.servicePollInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-serveCtx.Done():
+				return
+			case <-ticker.C:
+				if probeFn(serveCtx, port) {
+					failures = 0
+					a.notifySystemd("WATCHDOG=1")
+					continue
+				}
+				if serveCtx.Err() != nil {
+					return
+				}
+				failures++
+				a.warnf("OpenCode health check failed for %s on http://127.0.0.1:%d (%d/%d).", sandbox, port, failures, threshold)
+				if failures >= threshold {
+					setHealthErr(fmt.Errorf("opencode serve health check failed %d consecutive times on http://127.0.0.1:%d", failures, port))
+					cancelServe()
+					return
+				}
+			}
+		}
+	}()
+
+	res, err := a.MSB.Run(serveCtx, msb.CommandRequest{
+		Args:   execArgs,
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
+	})
+	cancelServe()
+	wg.Wait()
+	a.notifySystemd("STOPPING=1")
+
+	if ctx.Err() != nil {
+		return nil
+	}
+	healthMu.Lock()
+	hErr := healthErr
+	healthMu.Unlock()
+	if hErr != nil {
+		return hErr
+	}
+	return wrapPassthroughExit(res, err)
+}
+
+func (a *appRuntime) superviseCmd(ctx context.Context, sandbox string, execArgs []string) error {
+	cmdCtx, cancelCmd := context.WithCancel(ctx)
+	defer cancelCmd()
+
+	a.notifySystemd("READY=1")
+	a.notifySystemd("WATCHDOG=1")
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(a.servicePollInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-cmdCtx.Done():
+				return
+			case <-ticker.C:
+				if _, pErr := a.MSB.Run(cmdCtx, msb.CommandRequest{Args: []string{"ping", sandbox}}); pErr == nil {
+					a.notifySystemd("WATCHDOG=1")
+				}
+			}
+		}
+	}()
+
+	res, err := a.MSB.Run(cmdCtx, msb.CommandRequest{
+		Args:   execArgs,
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
+	})
+	cancelCmd()
+	wg.Wait()
+	a.notifySystemd("STOPPING=1")
+
+	if ctx.Err() != nil {
+		return nil
+	}
+	return wrapPassthroughExit(res, err)
 }
 
 func runOptsFromSpec(spec service.Spec, allowRoot bool) runOpts {

@@ -468,7 +468,7 @@ Inside any interactive `agy` session, `/remote-control` and `/remote-control off
 
 Use `agbox service` to run headless sandboxes at machine boot without login and keep them running after logout. `agbox` installs one shared user template unit (`~/.config/systemd/user/agbox@.service`) and stores each service spec in `$DATA_DIR/services/<name>.json` (mode `0600`).
 
-Each service runs under a foreground supervisor (`agbox __service-run <name>`). The template unit sets `KillMode=mixed` and `TimeoutStopSec=30`. On stop or host reboot, the supervisor stops the microVM first, flushes any `--persist` or `--profile` disk, and then unmounts FUSE shares.
+Each service runs under a foreground supervisor (`agbox __service-run <name>`). The template unit sets `Type=notify`, `WatchdogSec=90s`, `KillMode=mixed`, and `TimeoutStopSec=30`. The supervisor sends `READY=1` once the agent answers health checks, sends `WATCHDOG=1` on each healthy poll, and exits non-zero after 3 consecutive failed checks so `systemd` restarts the service (`opencode serve` probes `http://127.0.0.1:<port>/doc`, and `agy` runs `msb ping` plus `agy remote-control status`). On stop or host reboot, the supervisor stops the microVM first, flushes any `--persist` or `--profile` disk, and then unmounts FUSE shares.
 
 ```bash
 # Save a persistent Remote Control service and enable it at boot

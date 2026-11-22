@@ -224,7 +224,7 @@ func TestServiceLifecycleAndLinger(t *testing.T) {
 	if strings.Contains(unitText, "secret") || strings.Contains(unitText, "OPENCODE_SERVER_PASSWORD") {
 		t.Fatalf("template unit must never contain secrets:\n%s", unitText)
 	}
-	if !strings.Contains(unitText, "KillMode=mixed") || !strings.Contains(unitText, "WantedBy=default.target") {
+	if !strings.Contains(unitText, "KillMode=mixed") || !strings.Contains(unitText, "WantedBy=default.target") || !strings.Contains(unitText, "Type=notify") || !strings.Contains(unitText, "WatchdogSec=90s") {
 		t.Fatalf("unexpected template unit content:\n%s", unitText)
 	}
 	if !svcCtl.lingerEnabled {
@@ -546,4 +546,152 @@ func TestRemoveCleansUpManagedServices(t *testing.T) {
 		t.Fatalf("expected agbox@.service to be removed by 'agbox remove --yes': %v", err)
 	}
 	_ = home
+}
+
+func TestServiceRunRemoteControlStatusUnhealthyTriggersRestart(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var notifyEvents []string
+	statusCalls := 0
+
+	fakeMSB := &serviceFakeRunner{
+		fn: func(_ context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
+			if len(req.Args) == 0 {
+				return msb.CommandResult{}, nil
+			}
+			switch req.Args[0] {
+			case "snap":
+				return msb.CommandResult{Stdout: "agbox:v1\n"}, nil
+			case "ls":
+				return msb.CommandResult{Stdout: "NAME STATUS\n"}, nil
+			case "ping":
+				// VM itself is still alive, but agy remote-control inside dies.
+				return msb.CommandResult{}, nil
+			case "exec":
+				joined := strings.Join(req.Args, " ")
+				if strings.Contains(joined, "agy remote-control status") {
+					mu.Lock()
+					statusCalls++
+					n := statusCalls
+					mu.Unlock()
+					if n == 1 {
+						return msb.CommandResult{Stdout: "Remote Control running\n"}, nil
+					}
+					return msb.CommandResult{Stdout: "Remote Control is not running\n"}, nil
+				}
+				return msb.CommandResult{}, nil
+			default:
+				return msb.CommandResult{}, nil
+			}
+		},
+	}
+
+	app, _, stderr, _ := newServiceTestApp(t, &fakeServiceCtl{}, fakeMSB)
+	app.ServiceFailThreshold = 2
+	app.NotifySystemd = func(state string) {
+		mu.Lock()
+		notifyEvents = append(notifyEvents, state)
+		mu.Unlock()
+	}
+
+	if err := service.SaveSpec(app.Env.DataDir, service.Spec{
+		Name:  "rcunhealthy",
+		Agent: "antigravity",
+		Mode:  config.RunModeRemoteControl,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code := app.dispatch(context.Background(), []string{service.SubcommandName, "rcunhealthy"})
+	if code == 0 {
+		t.Fatal("expected non-zero exit when agy remote-control status reports not running")
+	}
+	if !strings.Contains(stderr.String(), "2 consecutive times") {
+		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+
+	mu.Lock()
+	events := append([]string(nil), notifyEvents...)
+	mu.Unlock()
+	joinedEvents := strings.Join(events, ",")
+	if !strings.Contains(joinedEvents, "READY=1") || !strings.Contains(joinedEvents, "WATCHDOG=1") || !strings.Contains(joinedEvents, "STOPPING=1") {
+		t.Fatalf("expected READY=1, WATCHDOG=1, STOPPING=1 notifications, got: %v", events)
+	}
+}
+
+func TestServiceRunServeHungHealthCheckTriggersRestart(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var notifyEvents []string
+	probeCalls := 0
+
+	fakeMSB := &serviceFakeRunner{
+		fn: func(runCtx context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
+			if len(req.Args) == 0 {
+				return msb.CommandResult{}, nil
+			}
+			switch req.Args[0] {
+			case "snap":
+				return msb.CommandResult{Stdout: "agbox:v1\n"}, nil
+			case "ls":
+				return msb.CommandResult{Stdout: "NAME STATUS\n"}, nil
+			case "exec":
+				joined := strings.Join(req.Args, " ")
+				if strings.Contains(joined, "opencode serve") {
+					// Simulate a hung opencode serve process that only exits when cancelled.
+					<-runCtx.Done()
+					return msb.CommandResult{}, runCtx.Err()
+				}
+				return msb.CommandResult{}, nil
+			default:
+				return msb.CommandResult{}, nil
+			}
+		},
+	}
+
+	app, _, stderr, _ := newServiceTestApp(t, &fakeServiceCtl{}, fakeMSB)
+	app.ServiceFailThreshold = 2
+	app.WaitServeUI = func(_ context.Context, _ int, _ string) bool {
+		return true
+	}
+	app.ProbeServeUI = func(_ context.Context, _ int) bool {
+		mu.Lock()
+		probeCalls++
+		n := probeCalls
+		mu.Unlock()
+		// Healthy on first poll, then hangs on subsequent polls.
+		return n == 1
+	}
+	app.NotifySystemd = func(state string) {
+		mu.Lock()
+		notifyEvents = append(notifyEvents, state)
+		mu.Unlock()
+	}
+
+	if err := service.SaveSpec(app.Env.DataDir, service.Spec{
+		Name:  "hungweb",
+		Agent: "opencode",
+		Mode:  config.RunModeServe,
+		Port:  4096,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code := app.dispatch(context.Background(), []string{service.SubcommandName, "hungweb"})
+	if code == 0 {
+		t.Fatal("expected non-zero exit when opencode serve fails consecutive HTTP health checks")
+	}
+	if !strings.Contains(stderr.String(), "opencode serve health check failed 2 consecutive times") {
+		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+
+	mu.Lock()
+	events := append([]string(nil), notifyEvents...)
+	mu.Unlock()
+	joinedEvents := strings.Join(events, ",")
+	if !strings.Contains(joinedEvents, "READY=1") || !strings.Contains(joinedEvents, "WATCHDOG=1") || !strings.Contains(joinedEvents, "STOPPING=1") {
+		t.Fatalf("expected READY=1, WATCHDOG=1, STOPPING=1 notifications, got: %v", events)
+	}
 }
