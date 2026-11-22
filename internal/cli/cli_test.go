@@ -1359,7 +1359,7 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 		if strings.Contains(joined, "apt-get install") && strings.Contains(joined, "shellcheck") && strings.Contains(joined, "pipx") {
 			foundBaseApt = true
 		}
-		if strings.Contains(joined, "pipx install --force mdformat") && strings.Contains(joined, "shellcheck --version") {
+		if strings.Contains(joined, "pipx install --force mdformat") && strings.Contains(joined, "pipx inject mdformat mdformat-gfm") && strings.Contains(joined, "shellcheck --version") {
 			foundBaseTools = true
 		}
 		if strings.Contains(joined, "antigravity.google") {

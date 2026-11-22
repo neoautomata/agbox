@@ -1081,12 +1081,13 @@ func GuestEnvFlags() []string {
 		"LOGNAME=" + config.GuestUser,
 		"PATH=" + guestDefaultPath,
 		"SSH_CONNECTION=1",
+		"PYTHONDONTWRITEBYTECODE=1",
 	}
 }
 
-// KeyLoaderPrefix sources GuestKeysFile in POSIX sh when that file exists.
-// Checking test -f prevents dash from aborting a non-interactive shell when absent.
-const KeyLoaderPrefix = "test -f " + config.GuestKeysFile + " && . " + config.GuestKeysFile + ";"
+// KeyLoaderPrefix sources the guest profile script and GuestKeysFile in POSIX sh when present.
+// Checking test -f prevents dash from aborting a non-interactive shell when a file is absent.
+const KeyLoaderPrefix = "test -f /etc/profile.d/agbox-path.sh && . /etc/profile.d/agbox-path.sh; test -f " + config.GuestKeysFile + " && . " + config.GuestKeysFile + ";"
 
 // ProvisionGuestUserScript returns a bash script that prepares user agent (1000:1000) with sudo.
 // It handles node:24-bookworm-slim (UID 1000 is node) and debian:bookworm-slim.

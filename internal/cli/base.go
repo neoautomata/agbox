@@ -208,7 +208,7 @@ func (a *appRuntime) createBase(ctx context.Context, args []string) error {
 	}
 
 	baseToolsScript := fmt.Sprintf(`set -euo pipefail
-su - %s -c 'export PATH="/home/agent/.local/bin:$PATH" && pipx install --force mdformat && rm -rf /home/agent/.cache/pip'
+su - %s -c 'export PATH="/home/agent/.local/bin:$PATH" && pipx install --force mdformat && pipx inject mdformat mdformat-gfm && rm -rf /home/agent/.cache/pip'
 if [ -x /home/agent/.local/bin/mdformat ]; then
   ln -sf /home/agent/.local/bin/mdformat /usr/local/bin/mdformat
 fi

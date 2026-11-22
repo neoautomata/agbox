@@ -24,23 +24,23 @@ func categories() []Category {
 		{
 			Name:    "core",
 			Aliases: []string{"base", "cli"},
-			Summary: "Build tools, C headers, Python and pipx, shellcheck, mdformat, and CLI utilities",
+			Summary: "Build tools, C headers, ccache, Python, uv, pipx, PDF tools, FUSE, shellcheck, mdformat-gfm, and CLI utilities",
 			Details: []string{
-				"apt: build-essential, pkg-config, cmake, ninja-build, libffi-dev, libssl-dev, libsqlite3-dev, sqlite3",
+				"apt: build-essential, pkg-config, cmake, ninja-build, ccache, fuse3, libffi-dev, libssl-dev, libsqlite3-dev, sqlite3",
 				"apt: ca-certificates, curl, wget, git, htop, ncdu, net-tools, iproute2, dnsutils, rsync, unzip, zip, vim",
 				"apt: jq, ripgrep, fd-find, shellcheck, less, procps, psmisc, lsof, strace, tree, file, openssh-client",
-				"apt: python3, python3-pip, python3-setuptools, python3-venv, python3-wheel, pipx",
-				"pipx: mdformat",
+				"apt: poppler-utils, qpdf, python3-pypdf, python3, python3-pip, python3-setuptools, python3-venv, python3-wheel, pipx",
+				"tools: uv (/usr/local/bin/uv), mdformat + mdformat-gfm (pipx), CMAKE_*_COMPILER_LAUNCHER=/usr/bin/ccache",
 			},
 			BuildScript: scriptCategoryCore,
 		},
 		{
 			Name:    "go",
 			Aliases: []string{"golang"},
-			Summary: "Go toolchain and tools (dlv, gopls, golangci-lint, staticcheck, govulncheck, goimports)",
+			Summary: "Go toolchain and tools (dlv, gopls, golangci-lint, staticcheck, govulncheck, goimports, protoc-gen-go)",
 			Details: []string{
 				"toolchain: latest upstream Go in /usr/local/go (or apt golang-go) + protobuf-compiler",
-				"go install: dlv, gopls, golangci-lint, goimports, staticcheck, govulncheck",
+				"go install: dlv, gopls, golangci-lint, goimports, staticcheck, govulncheck, protoc-gen-go, protoc-gen-go-grpc",
 			},
 			BuildScript: scriptCategoryGo,
 		},
@@ -57,10 +57,11 @@ func categories() []Category {
 		{
 			Name:    "esphome",
 			Aliases: []string{"esp"},
-			Summary: "ESPHome, PlatformIO, esptool, and USB hardware libraries",
+			Summary: "ESPHome, bundled PlatformIO (pre-warmed ESP32/ESP32-S3), esptool, and USB hardware libraries",
 			Details: []string{
 				"apt: libudev-dev, libusb-1.0-0-dev, udev, usbutils, cmake, ninja-build, gperf, ccache, dfu-util, picocom, minicom",
-				"pipx: esphome, esptool, platformio",
+				"pipx: esphome (with pio/platformio symlinks from its venv), esptool",
+				"pre-warm: ~/.platformio and penv (ESP32 and ESP32-S3, esp-idf and arduino), ccache patches, ESPHOME_* env",
 			},
 			BuildScript: scriptCategoryESPHome,
 		},
@@ -248,8 +249,14 @@ func BuildCategoriesScript(cats []Category) string {
 }
 
 func ensureGuestPathProfileSnippet() string {
-	return fmt.Sprintf(`cat > /etc/profile.d/agbox-path.sh <<'EOF'
+	return fmt.Sprintf(`mkdir -p /etc/agbox-env.d
+cat > /etc/profile.d/agbox-path.sh <<'EOF'
 export PATH="%s"
+export PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+for _agbox_env in /etc/agbox-env.d/*.sh; do
+  [ -f "$_agbox_env" ] && . "$_agbox_env"
+done
+unset _agbox_env
 EOF
 chmod 0644 /etc/profile.d/agbox-path.sh
 grep -q 'agbox-path.sh' /home/agent/.bashrc 2>/dev/null || \
@@ -259,21 +266,36 @@ grep -q 'agbox-path.sh' /home/agent/.profile 2>/dev/null || \
 `, guestDefaultPath)
 }
 
+func ensureCcacheEnvSnippet() string {
+	return `mkdir -p /etc/agbox-env.d
+cat > /etc/agbox-env.d/10-ccache.sh <<'EOF'
+if [ -x /usr/bin/ccache ]; then
+  export CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-/usr/bin/ccache}"
+  export CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-/usr/bin/ccache}"
+fi
+EOF
+chmod 0644 /etc/agbox-env.d/10-ccache.sh
+`
+}
+
 func scriptCategoryCore() string {
 	return `apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   build-essential ca-certificates curl wget git htop ncdu net-tools iproute2 dnsutils \
-  libffi-dev libssl-dev libsqlite3-dev sqlite3 pkg-config cmake ninja-build \
+  libffi-dev libssl-dev libsqlite3-dev sqlite3 pkg-config cmake ninja-build ccache fuse3 \
+  poppler-utils qpdf python3-pypdf \
   python3 python3-pip python3-setuptools python3-venv python3-wheel pipx \
   rsync unzip zip vim jq ripgrep fd-find shellcheck less procps psmisc lsof strace tree file openssh-client >/dev/null
 if [ -x /usr/bin/fdfind ]; then
   ln -sfn /usr/bin/fdfind /usr/local/bin/fd
 fi
-su - agent -c 'set -euo pipefail; export PATH="/home/agent/.local/bin:$PATH" && pipx install --force mdformat && rm -rf /home/agent/.cache/pip'
+echo '[agbox]   -> Installing uv system-wide in /usr/local/bin...'
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+su - agent -c 'set -euo pipefail; export PATH="/home/agent/.local/bin:$PATH" && pipx install --force mdformat && pipx inject mdformat mdformat-gfm && rm -rf /home/agent/.cache/pip'
 if [ -x /home/agent/.local/bin/mdformat ]; then
   ln -sf /home/agent/.local/bin/mdformat /usr/local/bin/mdformat
 fi
-`
+` + ensureCcacheEnvSnippet()
 }
 
 func scriptCategoryGo() string {
@@ -312,7 +334,9 @@ su - agent -c '
     golang.org/x/tools/gopls@latest \
     golang.org/x/tools/cmd/goimports@latest \
     honnef.co/go/tools/cmd/staticcheck@latest \
-    golang.org/x/vuln/cmd/govulncheck@latest
+    golang.org/x/vuln/cmd/govulncheck@latest \
+    google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+    google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
   do
     echo "[agbox]   -> go install ${pkg}..."
     go install "${pkg}"
@@ -351,17 +375,148 @@ apt-get install -y -qq --no-install-recommends \
   python3 python3-pip python3-setuptools python3-venv python3-wheel pipx \
   rsync unzip zip >/dev/null
 
-su - agent -c '
-  set -euo pipefail
-  export PATH="/home/agent/.local/bin:$PATH"
-  echo "[agbox]   -> pipx install esphome..."
-  pipx install --force esphome
-  echo "[agbox]   -> pipx install esptool..."
-  pipx install --force esptool
-  echo "[agbox]   -> pipx install platformio..."
-  pipx install --force platformio
-  rm -rf /home/agent/.cache/pip
-'
+` + ensureCcacheEnvSnippet() + `mkdir -p /etc/agbox-env.d
+cat > /etc/agbox-env.d/20-esphome.sh <<'EOF'
+export ESPHOME_DATA_DIR="${ESPHOME_DATA_DIR:-/home/agent/.cache/esphome}"
+export ESPHOME_NOGITIGNORE="${ESPHOME_NOGITIGNORE:-1}"
+for _pio_bin in \
+  /home/agent/.platformio/packages/toolchain-xtensa-esp-elf/bin \
+  /home/agent/.platformio/packages/toolchain-riscv32-esp/bin \
+  /home/agent/.platformio/packages/toolchain-riscv32-esp-elf/bin
+do
+  if [ -d "$_pio_bin" ]; then
+    case ":$PATH:" in
+      *":$_pio_bin:"*) ;;
+      *) export PATH="$PATH:$_pio_bin" ;;
+    esac
+  fi
+done
+unset _pio_bin
+EOF
+chmod 0644 /etc/agbox-env.d/20-esphome.sh
+
+su - agent -s /bin/bash <<'AGENT_EOF'
+set -euo pipefail
+export PATH="/home/agent/.local/bin:$PATH"
+export PYTHONDONTWRITEBYTECODE=1
+export ESPHOME_NOGITIGNORE=1
+export CMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache
+export CMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache
+
+echo "[agbox]   -> pipx install esphome..."
+pipx install --force esphome
+echo "[agbox]   -> pipx install esptool..."
+pipx install --force esptool
+# Avoid a separate pipx platformio venv that skews from ESPHome's bundled PlatformIO.
+pipx uninstall platformio >/dev/null 2>&1 || true
+esphome_venv_bin="$(dirname "$(readlink -f /home/agent/.local/bin/esphome)")"
+for bin_name in pio platformio piodebuggdb; do
+  if [ -x "${esphome_venv_bin}/${bin_name}" ]; then
+    ln -sfn "${esphome_venv_bin}/${bin_name}" "/home/agent/.local/bin/${bin_name}"
+  fi
+done
+
+prewarm_dir="/var/tmp/agbox-esphome-prewarm"
+rm -rf "${prewarm_dir}"
+mkdir -p "${prewarm_dir}/data"
+export ESPHOME_DATA_DIR="${prewarm_dir}/data"
+
+cat > "${prewarm_dir}/esp32-idf.yaml" <<'YAML_EOF'
+esphome:
+  name: prewarm-esp32-idf
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+YAML_EOF
+
+cat > "${prewarm_dir}/esp32-arduino.yaml" <<'YAML_EOF'
+esphome:
+  name: prewarm-esp32-arduino
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+YAML_EOF
+
+cat > "${prewarm_dir}/esp32s3-idf.yaml" <<'YAML_EOF'
+esphome:
+  name: prewarm-esp32s3-idf
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+YAML_EOF
+
+cat > "${prewarm_dir}/esp32s3-arduino.yaml" <<'YAML_EOF'
+esphome:
+  name: prewarm-esp32s3-arduino
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: arduino
+YAML_EOF
+
+for cfg in esp32-idf.yaml esp32-arduino.yaml esp32s3-idf.yaml esp32s3-arduino.yaml; do
+  echo "[agbox]   -> Pre-warming ~/.platformio with ${cfg}..."
+  esphome compile "${prewarm_dir}/${cfg}"
+done
+
+test -d /home/agent/.platformio/penv
+
+echo "[agbox]   -> Patching PlatformIO espressif32 builder scripts for ccache..."
+python3 - <<'PY_EOF'
+import glob
+import os
+
+for plat_dir in sorted(glob.glob("/home/agent/.platformio/platforms/espressif32*")):
+    main_py = os.path.join(plat_dir, "builder", "main.py")
+    if os.path.isfile(main_py):
+        with open(main_py, "r", encoding="utf-8") as f:
+            src = f.read()
+        if "ccache_prefix" not in src:
+            cc_old = '    CC="%s-elf-gcc" % toolchain_arch,'
+            cxx_old = '    CXX="%s-elf-g++" % toolchain_arch,'
+            cc_idx = src.find(cc_old)
+            rep_idx = src.rfind("env.Replace(", 0, cc_idx) if cc_idx != -1 else -1
+            if rep_idx != -1 and cxx_old in src:
+                prefix_block = (
+                    'ccache_bin = "/usr/bin/ccache"\n'
+                    'ccache_prefix = (\n'
+                    '    f"{ccache_bin} "\n'
+                    '    if (os.path.isfile(ccache_bin) and os.access(ccache_bin, os.X_OK))\n'
+                    '    else ""\n'
+                    ')\n'
+                )
+                src = src[:rep_idx] + prefix_block + src[rep_idx:]
+                src = src.replace(cc_old, '    CC=f"{ccache_prefix}%s-elf-gcc" % toolchain_arch,', 1)
+                src = src.replace(cxx_old, '    CXX=f"{ccache_prefix}%s-elf-g++" % toolchain_arch,', 1)
+                with open(main_py, "w", encoding="utf-8") as f:
+                    f.write(src)
+
+    espidf_py = os.path.join(plat_dir, "builder", "frameworks", "espidf.py")
+    if os.path.isfile(espidf_py):
+        with open(espidf_py, "r", encoding="utf-8") as f:
+            src = f.read()
+        if '"-DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache"' not in src:
+            fn_idx = src.find("def run_cmake(")
+            anchor = "    if extra_args:"
+            anchor_idx = src.find(anchor, fn_idx) if fn_idx != -1 else -1
+            if anchor_idx != -1:
+                snippet = (
+                    '    if os.path.isfile("/usr/bin/ccache"):\n'
+                    '        cmd.extend([\n'
+                    '            "-DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache",\n'
+                    '            "-DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache",\n'
+                    '        ])\n\n'
+                )
+                src = src[:anchor_idx] + snippet + src[anchor_idx:]
+                with open(espidf_py, "w", encoding="utf-8") as f:
+                    f.write(src)
+PY_EOF
+
+rm -rf "${prewarm_dir}" /home/agent/.cache/pip
+AGENT_EOF
 `
 }
 

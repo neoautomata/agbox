@@ -671,6 +671,7 @@ func TestBuildCreateAndRestoreAndExecArgs(t *testing.T) {
 		"-e", "LOGNAME=agent",
 		"-e", "PATH=" + guestDefaultPath,
 		"-e", "SSH_CONNECTION=1",
+		"-e", "PYTHONDONTWRITEBYTECODE=1",
 		"agbox-run-99",
 		"--",
 		"bash", "-c", "id",
@@ -749,13 +750,34 @@ func TestCategoriesAndResolution(t *testing.T) {
 	script := BuildCategoriesScript(cats)
 	for _, kw := range []string{
 		"shellcheck",
+		"fuse3",
+		"poppler-utils",
+		"qpdf",
+		"python3-pypdf",
+		"astral.sh/uv/install.sh",
+		"UV_INSTALL_DIR=/usr/local/bin",
 		"pipx install --force mdformat",
+		"pipx inject mdformat mdformat-gfm",
+		"CMAKE_C_COMPILER_LAUNCHER",
+		"CMAKE_CXX_COMPILER_LAUNCHER",
 		"github.com/go-delve/delve/cmd/dlv@latest",
 		"golang.org/x/tools/gopls@latest",
 		"github.com/golangci/golangci-lint/cmd/golangci-lint@latest",
+		"google.golang.org/protobuf/cmd/protoc-gen-go@latest",
+		"google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest",
 		"https://sh.rustup.rs",
 		"rustup component add clippy rustfmt",
 		"pipx install --force esphome",
+		"ESPHOME_DATA_DIR",
+		"ESPHOME_NOGITIGNORE",
+		"toolchain-xtensa-esp-elf/bin",
+		"toolchain-riscv32-esp/bin",
+		"prewarm-esp32-idf",
+		"prewarm-esp32-arduino",
+		"prewarm-esp32s3-idf",
+		"prewarm-esp32s3-arduino",
+		"/home/agent/.platformio/penv",
+		"ccache_prefix",
 		"cargo install espflash",
 		"chromium chromium-driver xvfb",
 		"hugo_extended_",
@@ -767,6 +789,9 @@ func TestCategoriesAndResolution(t *testing.T) {
 		if !strings.Contains(script, kw) {
 			t.Errorf("BuildCategoriesScript missing %q", kw)
 		}
+	}
+	if strings.Contains(script, "pipx install --force platformio") {
+		t.Error("BuildCategoriesScript must not install standalone pipx platformio")
 	}
 	cmd := exec.Command("bash", "-n")
 	cmd.Stdin = strings.NewReader(script)
@@ -1060,6 +1085,8 @@ func TestProvisionGuestUserScriptAgentDefaults(t *testing.T) {
 	script := ProvisionGuestUserScript()
 	for _, want := range []string{
 		"/etc/profile.d/agbox-path.sh",
+		"/etc/agbox-env.d",
+		"PYTHONDONTWRITEBYTECODE",
 		"/usr/local/bin/mdformat",
 		"/home/agent/.agbox-agents",
 		"/home/agent/.gemini/antigravity-cli/settings.json",
