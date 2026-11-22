@@ -651,7 +651,7 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 		meta.RemoteControl = false
 	case opts.RemoteControl:
 		meta.RemoteControl = true
-		if opts.Detach || a.IsTTY == nil || !a.IsTTY() {
+		if opts.Supervised || opts.Detach || a.IsTTY == nil || !a.IsTTY() {
 			meta.Mode = config.RunModeRemoteControl
 		} else {
 			meta.Mode = config.RunModeTUI
@@ -680,6 +680,7 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 		NoSkills:        opts.NoSkills,
 		NoRules:         opts.NoRules,
 		NoAgentCache:    opts.NoAgentCache,
+		Supervised:      opts.Supervised,
 	})
 
 	if opts.Cmd != "" && origMode != config.RunModeCmd && hasMarker(suspendedPath) {

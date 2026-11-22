@@ -46,6 +46,9 @@ Modes:
       List, attach, update, or detach /workspace shares on a running or suspended sandbox.
       agbox share add defaults to ro,mask.
 
+  agbox service [--allow-root] <list|add|enable|disable|start|stop|restart|logs|rm|linger> [...]
+      Manage systemd user services (agbox@.service) that start at boot and survive logout.
+
   agbox run [options] [opencode|antigravity] [path[:opts]...]
       Restore a microVM and mask VCS files and directories.
       Block local, private, multicast, and cloud metadata IPs by default.
@@ -213,5 +216,40 @@ func completionUsageText() string {
       Print the bash completion script to stdout.
       Install in ~/.local/share/bash-completion/completions/agbox
       or add 'eval "$(agbox completion bash)"' to ~/.bashrc.
+`
+}
+
+func serviceUsageText() string {
+	return `Usage:
+  agbox service [--allow-root] [list|status]
+      List configured agbox systemd user services and show user linger state.
+
+  agbox service [--allow-root] add [service-opts] <name> [run-opts] [agent] [path[:opts]...]
+      Save a headless service spec in $DATA_DIR/services/<name>.json and install agbox@.service.
+      Requires --remote-control, --serve --port N, or --cmd "shell".
+      Service options:
+        --force              Overwrite an existing service spec with the same name
+        --env-file PATH      Load passthrough secrets from a mode 0600 KEY=VALUE file at start
+        --enable             Enable agbox@<name>.service at boot after adding it
+        --now                With --enable: start the service immediately
+        --no-linger          Skip enabling systemd-logind user linger
+
+  agbox service [--allow-root] enable [--now] [--no-linger] <name>
+      Install agbox@.service, enable user linger for boot-without-login, and enable the unit.
+
+  agbox service [--allow-root] disable [--now] <name>
+      Disable agbox@<name>.service at boot (and stop it with --now).
+
+  agbox service [--allow-root] start|stop|restart <name>
+      Control the running agbox@<name>.service systemd user unit.
+
+  agbox service [--allow-root] logs [-f|--follow] [-n|--lines N] <name>
+      Show systemd user journal logs for agbox@<name>.service.
+
+  agbox service [--allow-root] rm [--force] <name>
+      Stop and disable agbox@<name>.service and delete its service spec.
+
+  agbox service [--allow-root] linger [status|enable]
+      Show or enable systemd-logind user linger so services start at boot and survive logout.
 `
 }

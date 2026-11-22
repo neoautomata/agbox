@@ -14,6 +14,7 @@ import (
 	"agbox/internal/config"
 	"agbox/internal/msb"
 	"agbox/internal/persist"
+	"agbox/internal/service"
 	"agbox/internal/vcsfuse"
 )
 
@@ -85,6 +86,9 @@ func (a *appRuntime) completionProviders() complete.Providers {
 		Shares: func(sandbox string) []string {
 			return listCompletionShares(dataDir, sandbox, completionSocketTimeout)
 		},
+		Services: func() []string {
+			return listCompletionServices(dataDir)
+		},
 	}
 }
 
@@ -125,6 +129,24 @@ func listCompletionRules(dataDir string) []string {
 	if err != nil {
 		return nil
 	}
+	return names
+}
+
+func listCompletionServices(dataDir string) []string {
+	if dataDir == "" {
+		return nil
+	}
+	specs, err := service.ListSpecs(dataDir)
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(specs))
+	for _, sp := range specs {
+		if sp.Name != "" {
+			names = append(names, sp.Name)
+		}
+	}
+	slices.Sort(names)
 	return names
 }
 

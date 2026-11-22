@@ -464,6 +464,39 @@ agbox run --remote-control ~/projects/myapp
 
 Inside any interactive `agy` session, `/remote-control` and `/remote-control off` toggle Remote Control.
 
+### Auto-start with `systemd --user` (`agbox service`)
+
+Use `agbox service` to run headless sandboxes at machine boot without login and keep them running after logout. `agbox` installs one shared user template unit (`~/.config/systemd/user/agbox@.service`) and stores each service spec in `$DATA_DIR/services/<name>.json` (mode `0600`).
+
+Each service runs under a foreground supervisor (`agbox __service-run <name>`). The template unit sets `KillMode=mixed` and `TimeoutStopSec=30`. On stop or host reboot, the supervisor stops the microVM first, flushes any `--persist` or `--profile` disk, and then unmounts FUSE shares.
+
+```bash
+# Save a persistent Remote Control service and enable it at boot
+agbox service add work --persist --remote-control ~/projects/myapp
+agbox service enable --now work
+
+# Save an OpenCode web UI service with a mode 0600 secret env file
+chmod 600 ~/.config/agbox-web.env
+agbox service add --env-file ~/.config/agbox-web.env web --profile dev --serve --port 4096 ~/projects/myapp
+agbox service enable --now web
+
+# Inspect services, user linger state, and journal logs
+agbox service list
+agbox service logs -f work
+agbox service linger status
+
+# Stop, disable, or delete a service
+agbox service disable --now work
+agbox service rm work
+```
+
+Rules for `agbox service`:
+
+- Services require a headless mode: `--remote-control`, `--serve --port N`, or `--cmd "shell"`. Interactive TUI runs are rejected.
+- `agbox service enable` activates `systemd-logind` user linger (`loginctl enable-linger <user>`) unless you pass `--no-linger`. If polkit blocks unprivileged linger, run `sudo loginctl enable-linger <user>` once so services start at boot without login and survive logout.
+- Saved `agbox auth` credentials stream automatically at boot. Optional `--env-file` paths must be regular files with mode `0600` or stricter and zero symlinks. `agbox` never writes secrets into `agbox@.service`.
+- On startup after an unclean host reboot, the supervisor recovers stopped `--persist` sandboxes and cleans stale ephemeral sandboxes before starting.
+
 ## 8. Update agents and customize the base image
 
 Use `agbox update` to refresh `agy` and `opencode` quickly. Use `agbox edit-base` to add categories or packages to the base snapshot.
@@ -537,6 +570,7 @@ Run `agbox <mode> --help` for the flags of each mode. Run `agbox --help` for the
 | `agbox rules [list\|add [--force] [--name NAME] <file.md>\|show [<name>]\|rm <name\|--all>]` | Manages global rules. |
 | `agbox profile [list\|create [--size SIZE] <name>\|rm [--force] <name>]` | Manages `ext4` conversation profiles. |
 | `agbox share <list\|add\|set\|rm> <sandbox> [...]` | Manages `/workspace` shares on a running or suspended sandbox. |
+| `agbox service <list\|add\|enable\|disable\|start\|stop\|restart\|logs\|rm\|linger> [...]` | Manages `systemd --user` services (`agbox@.service`) that start at boot and survive logout. |
 | `agbox run [options] [opencode\|antigravity] [path[:opts]...]` | Restores a sandbox and runs an agent or command. |
 | `agbox suspend <sandbox>` | Stops a sandbox, keeps its root disk, and unmounts its shares. |
 | `agbox resume [-d] [-c] [-s ID] [--no-auth] [--no-skills] [--no-rules] [--no-agent-cache] <sandbox>` | Checks shares, mounts FUSE, starts the sandbox, and restarts its agent. |

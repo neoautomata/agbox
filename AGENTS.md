@@ -18,7 +18,8 @@ This file defines the architecture, the Safe-by-Default security rules, the upst
 | `internal/mounttab` | `/proc/self/mountinfo` parsing, `/proc/<pid>/cmdline` checks before signals, and mount-verified directory cleanup. |
 | `internal/msb` | `msb` argument builders, default-deny network rules, volume helpers, guest scripts, categories, and the `Runner` interface. |
 | `internal/persist` | Credential capture, the agent cache, skills, rules, and `flock`-guarded profile volumes. |
-| `internal/cli` | Argument parsers, mode dispatch, and orchestration. `cli.Main` is the only export. Files: `cli.go`, `parse.go`, `usage.go`, `base.go`, `run.go`, `lifecycle.go`, `persist_modes.go`, `share_mode.go`, `update_mode.go`, `completion_mode.go`. |
+| `internal/service` | Systemd user template unit (`agbox@.service`), mode `0600` service specs and env-file parsing, and `Controller` interface. |
+| `internal/cli` | Argument parsers, mode dispatch, and orchestration. `cli.Main` is the only export. Files: `cli.go`, `parse.go`, `usage.go`, `base.go`, `run.go`, `lifecycle.go`, `persist_modes.go`, `share_mode.go`, `service_mode.go`, `update_mode.go`, `completion_mode.go`. |
 | `install.sh` | Idempotent prerequisite check, static build, and atomic install. |
 | `AGBOX_ENV_RULES.md` | Default guest rules. `install.sh` and `agbox setup` install them into `$DATA_DIR/rules`. |
 | `test.sh` | End-to-end verification harness. |
@@ -189,7 +190,7 @@ Every `test.sh` edit and every new user-visible feature must follow these rules.
 |---|---|
 | `01` | Static style: `bash -n`, `gofmt`, semicolons in Go comments, error strings, and Markdown prose, and `mdformat --check`. |
 | `02` to `04` | `go vet`, `go test -race`, and binary builds. |
-| `05` | `--help` output for all 15 modes, category listing, and flag rejection. |
+| `05` | `--help` output for all 16 modes, category listing, and flag rejection. |
 | `06` | Offline security checks: share conflicts, `share set` and `share rm` errors, guest alias escapes, `--share-hub` with `--no-mask`, `run --name run-123`, hardlinked single files, `--net` conflicts, and tamper checks. |
 | `07` | Fake-`msb` error checks. Each non-zero `msb` exit shows diagnostics for `stop`, `profile`, and `remove`. |
 | `08` | Live Workspace Hub: VCS masking, `:ro`, single-file slots, `:vcs` config protection, rename escapes, hook downgrade, `rw` to `ro`, and `rm` with and without `force`. |

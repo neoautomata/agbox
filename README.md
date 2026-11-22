@@ -101,7 +101,7 @@ agbox resume agbox-myapp
 agbox stop agbox-myapp
 ```
 
-The [User Guide](USER_GUIDE.md) covers live shares (`agbox share`), conversation profiles (`--profile`), agent updates (`agbox update`), and `edit-base`.
+The [User Guide](USER_GUIDE.md) covers live shares (`agbox share`), systemd user services (`agbox service`), conversation profiles (`--profile`), agent updates (`agbox update`), and `edit-base`.
 
 ## Design
 

@@ -301,3 +301,21 @@ func TestBashScriptSyntaxAndShellcheck(t *testing.T) {
 		}
 	}
 }
+
+func TestCompleteService(t *testing.T) {
+	p := Providers{
+		Services: func() []string { return []string{"web", "work"} },
+	}
+	got := Complete([]string{"service", ""}, p)
+	if len(got.Candidates) < 5 || !slices.Contains(got.Candidates, "add") || !slices.Contains(got.Candidates, "enable") || !slices.Contains(got.Candidates, "linger") {
+		t.Fatalf("unexpected service actions: %v", got.Candidates)
+	}
+	got = Complete([]string{"service", "enable", "w"}, p)
+	if !slices.Equal(got.Candidates, []string{"web", "work"}) {
+		t.Fatalf("unexpected service name candidates: %v", got.Candidates)
+	}
+	got = Complete([]string{"service", "add", "--env-file", ""}, p)
+	if got.Directive != DirectiveFile {
+		t.Fatalf("expected file directive for --env-file, got %q", got.Directive)
+	}
+}

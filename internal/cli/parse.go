@@ -350,6 +350,7 @@ type runOpts struct {
 	NoSkills        bool
 	NoRules         bool
 	NoAgentCache    bool
+	Supervised      bool
 }
 
 func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(string) bool) (runOpts, error) {
@@ -715,6 +716,7 @@ type resumeOpts struct {
 	NoSkills        bool
 	NoRules         bool
 	NoAgentCache    bool
+	Supervised      bool
 }
 
 func parseResumeArgs(args []string) (resumeOpts, error) {

@@ -76,6 +76,10 @@ func (a *appRuntime) run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	return a.runWithOpts(ctx, opts)
+}
+
+func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
 	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
 	}
@@ -176,7 +180,7 @@ func (a *appRuntime) run(ctx context.Context, args []string) error {
 		runMode = config.RunModeCmd
 	case opts.Serve:
 		runMode = config.RunModeServe
-	case opts.RemoteControl && (opts.Detach || a.IsTTY == nil || !a.IsTTY()):
+	case opts.RemoteControl && (opts.Supervised || opts.Detach || a.IsTTY == nil || !a.IsTTY()):
 		runMode = config.RunModeRemoteControl
 	default:
 		runMode = config.RunModeTUI
@@ -269,8 +273,8 @@ func (a *appRuntime) run(ctx context.Context, args []string) error {
 		return fmt.Errorf("write initial run metadata: %w", err)
 	}
 
-	willDetach := (runMode == config.RunModeServe && !opts.Probe && (opts.Detach || a.IsTTY == nil || !a.IsTTY())) ||
-		runMode == config.RunModeRemoteControl
+	willDetach := !opts.Supervised && ((runMode == config.RunModeServe && !opts.Probe && (opts.Detach || a.IsTTY == nil || !a.IsTTY())) ||
+		runMode == config.RunModeRemoteControl)
 
 	var volumes []msb.VolumeSpec
 	var shareRecords []config.ShareRecord
@@ -470,11 +474,17 @@ func (a *appRuntime) run(ctx context.Context, args []string) error {
 	}
 
 	detachedMarker := filepath.Join(runFilterDir, "detached")
-	execErr := a.execSession(runCtx, runSandbox, meta, willDetach, opts.Probe)
+	execErr := a.execSession(runCtx, runSandbox, meta, willDetach, opts.Probe, opts.Supervised)
 	if hasMarker(filepath.Join(runFilterDir, "suspended")) || hasMarker(filepath.Join(runFilterDir, "deleting")) {
 		return nil
 	}
 	if execErr != nil {
+		if opts.Supervised && runCtx.Err() != nil {
+			if opts.Persist {
+				suspendAfter = true
+			}
+			return nil
+		}
 		if opts.Persist && !willDetach {
 			suspendAfter = true
 		}
@@ -529,14 +539,14 @@ func (a *appRuntime) pushKeys(ctx context.Context, sandbox string) error {
 	return nil
 }
 
-func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta config.RunMeta, willDetach bool, probe bool) error {
+func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta config.RunMeta, willDetach bool, probe bool, supervised bool) error {
 	workDir := sessionWorkDir(meta.Shares)
 	envFlags := msb.GuestEnvFlags()
 
 	switch meta.Mode {
 	case config.RunModeCmd:
 		inner := fmt.Sprintf("%s cd %s && exec sh -c %s", msb.KeyLoaderPrefix, msb.ShellQuote(workDir), msb.ShellQuote(meta.Cmd))
-		noStdin := a.cmdNeedsNoStdin()
+		noStdin := supervised || a.cmdNeedsNoStdin()
 		execArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: sandbox,
 			User:    config.GuestUser,
@@ -550,8 +560,11 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			Stdin:       a.Stdin,
 			Stdout:      a.Stdout,
 			Stderr:      a.Stderr,
-			Interactive: true,
+			Interactive: !supervised,
 		})
+		if supervised && ctx.Err() != nil {
+			return nil
+		}
 		return wrapPassthroughExit(res, err)
 
 	case config.RunModeRemoteControl:
@@ -590,6 +603,9 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			Stderr: a.Stderr,
 		})
 		fmt.Fprintln(a.Stdout, "[agbox] Antigravity Remote Control active: https://antigravity.google.com")
+		if supervised {
+			return a.superviseRemoteControl(ctx, sandbox)
+		}
 		fmt.Fprintf(a.Stdout, "[agbox] Suspend: agbox suspend %s | Stop: agbox stop %s\n", sandbox, sandbox)
 		return nil
 
@@ -598,6 +614,29 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			"%s cd %s && exec opencode serve --hostname 0.0.0.0 --port %d",
 			msb.KeyLoaderPrefix, msb.ShellQuote(workDir), config.GuestPort,
 		)
+		if supervised {
+			if a.Getenv == nil || a.Getenv("OPENCODE_SERVER_PASSWORD") == "" {
+				a.warnf("Loopback TCP (127.0.0.1:%d) accepts connections from any local user on this host. Set OPENCODE_SERVER_PASSWORD in the service env file on multi-user systems.", meta.Port)
+			}
+			fmt.Fprintf(a.Stdout, "[agbox] OpenCode web UI: http://127.0.0.1:%d\n", meta.Port)
+			execArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
+				Sandbox: sandbox,
+				User:    config.GuestUser,
+				Stream:  true,
+				NoStdin: true,
+				Env:     envFlags,
+				Command: []string{"sh", "-c", serveCmd},
+			})
+			res, err := a.MSB.Run(ctx, msb.CommandRequest{
+				Args:   execArgs,
+				Stdout: a.Stdout,
+				Stderr: a.Stderr,
+			})
+			if ctx.Err() != nil {
+				return nil
+			}
+			return wrapPassthroughExit(res, err)
+		}
 		if willDetach || probe {
 			bgCmd := fmt.Sprintf(
 				"%s cd %s && nohup opencode serve --hostname 0.0.0.0 --port %d </dev/null >/tmp/agbox-serve.log 2>&1 & pid=$!; sleep 1; kill -0 \"$pid\"",

@@ -427,8 +427,8 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 		return err
 	}
 
-	willDetach := (meta.Mode == config.RunModeServe && (opts.Detach || a.IsTTY == nil || !a.IsTTY())) ||
-		meta.Mode == config.RunModeRemoteControl
+	willDetach := !opts.Supervised && ((meta.Mode == config.RunModeServe && (opts.Detach || a.IsTTY == nil || !a.IsTTY())) ||
+		meta.Mode == config.RunModeRemoteControl)
 
 	runCtx, cancelRun := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	keepAlive := false
@@ -565,12 +565,16 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 	}
 
 	detachedMarker := filepath.Join(runFilterDir, "detached")
-	execErr := a.execSession(runCtx, opts.Sandbox, meta, willDetach, false)
+	execErr := a.execSession(runCtx, opts.Sandbox, meta, willDetach, false, opts.Supervised)
 	if hasMarker(suspendedPath) || hasMarker(filepath.Join(runFilterDir, "deleting")) {
 		keepAlive = true
 		return nil
 	}
 	if execErr != nil {
+		if opts.Supervised && runCtx.Err() != nil {
+			suspendAfter = true
+			return nil
+		}
 		return execErr
 	}
 	if willDetach {
@@ -663,6 +667,8 @@ func (a *appRuntime) remove(ctx context.Context, args []string) error {
 			return errors.New("aborted")
 		}
 	}
+
+	a.cleanupManagedServices(ctx)
 
 	runRoot := filepath.Join(a.Env.DataDir, "run")
 	if entries, rErr := os.ReadDir(runRoot); rErr == nil {
@@ -822,6 +828,7 @@ func (a *appRuntime) status(ctx context.Context, args []string) error {
 
 	_ = a.ensureMSB()
 	a.printPersistenceStatus(ctx)
+	a.printServiceStatus(ctx)
 
 	if a.MSB != nil {
 		if lsRes, lErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}}); lErr == nil {

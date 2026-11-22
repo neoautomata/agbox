@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	"agbox/internal/config"
 	"agbox/internal/mounttab"
 	"agbox/internal/msb"
+	"agbox/internal/service"
 	"agbox/internal/vcsfuse"
 )
 
@@ -110,27 +112,30 @@ func defaultStr(v, fallback string) string {
 }
 
 type appRuntime struct {
-	Env           config.Env
-	ExePath       string
-	MSB           msb.Runner
-	MountCtl      mounttab.Controller
-	Stdin         io.Reader
-	Stdout        io.Writer
-	Stderr        io.Writer
-	Getenv        func(string) string
-	IsTTY         func() bool
-	GetEUID       func() int
-	GetEGID       func() int
-	SupportsXattr func(path string, isDir bool) bool
-	TruncateFile  func(path string, size int64) error
-	RunHostCmd    func(ctx context.Context, name string, args ...string) ([]byte, error)
-	Now           func() time.Time
-	CheckKVM      func() error
-	CheckFUSE     func() error
-	PID           int
-	StartFilter   func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error)
-	StartHub      func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error)
-	WaitServeUI   func(ctx context.Context, port int, sandbox string) bool
+	Env                 config.Env
+	ExePath             string
+	MSB                 msb.Runner
+	MountCtl            mounttab.Controller
+	ServiceCtl          service.Controller
+	ServicePollInterval time.Duration
+	CurrentUser         func() (string, error)
+	Stdin               io.Reader
+	Stdout              io.Writer
+	Stderr              io.Writer
+	Getenv              func(string) string
+	IsTTY               func() bool
+	GetEUID             func() int
+	GetEGID             func() int
+	SupportsXattr       func(path string, isDir bool) bool
+	TruncateFile        func(path string, size int64) error
+	RunHostCmd          func(ctx context.Context, name string, args ...string) ([]byte, error)
+	Now                 func() time.Time
+	CheckKVM            func() error
+	CheckFUSE           func() error
+	PID                 int
+	StartFilter         func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error)
+	StartHub            func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error)
+	WaitServeUI         func(ctx context.Context, port int, sandbox string) bool
 }
 
 func newApp() (*appRuntime, error) {
@@ -151,14 +156,23 @@ func newApp() (*appRuntime, error) {
 	}
 
 	app := &appRuntime{
-		Env:      env,
-		ExePath:  exePath,
-		MSB:      runner,
-		MountCtl: mounttab.OSController{},
-		Stdin:    os.Stdin,
-		Stdout:   os.Stdout,
-		Stderr:   os.Stderr,
-		Getenv:   os.Getenv,
+		Env:                 env,
+		ExePath:             exePath,
+		MSB:                 runner,
+		MountCtl:            mounttab.OSController{},
+		ServiceCtl:          service.OSController{},
+		ServicePollInterval: 15 * time.Second,
+		CurrentUser: func() (string, error) {
+			u, uErr := user.Current()
+			if uErr != nil {
+				return "", uErr
+			}
+			return u.Username, nil
+		},
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+		Getenv: os.Getenv,
 		IsTTY: func() bool {
 			return isFileTerminal(os.Stdin) && isFileTerminal(os.Stdout)
 		},
@@ -565,6 +579,14 @@ func (a *appRuntime) dispatchParsed(ctx context.Context, globalOpts globalOpts) 
 			fmt.Fprint(a.Stdout, shareUsageText())
 			return 0
 		}
+	case "service":
+		err = a.serviceMode(ctx, rest)
+		if errors.Is(err, errHelp) {
+			fmt.Fprint(a.Stdout, serviceUsageText())
+			return 0
+		}
+	case service.SubcommandName:
+		err = a.serviceRun(ctx, rest)
 	case "run":
 		err = a.run(ctx, rest)
 		if errors.Is(err, errHelp) {
@@ -582,7 +604,7 @@ func (a *appRuntime) dispatchParsed(ctx context.Context, globalOpts globalOpts) 
 	case "status":
 		err = a.status(ctx, rest)
 	default:
-		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup version completion create-base edit-base update auth skills rules profile share run suspend resume stop remove status)\n", mode)
+		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup version completion create-base edit-base update auth skills rules profile share service run suspend resume stop remove status)\n", mode)
 		return 1
 	}
 

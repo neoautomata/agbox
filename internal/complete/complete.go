@@ -42,6 +42,7 @@ type Providers struct {
 	Rules      func() []string
 	Sandboxes  func(filter SandboxFilter) []string
 	Shares     func(sandbox string) []string
+	Services   func() []string
 }
 
 // Result holds completion candidates and a shell directive.
@@ -62,6 +63,7 @@ var allModes = []string{
 	"rules",
 	"profile",
 	"share",
+	"service",
 	"run",
 	"suspend",
 	"resume",
@@ -208,6 +210,8 @@ func completeNormalized(args []string, p Providers) Result {
 		return completeProfile(modePrev, cur, p)
 	case "share":
 		return completeShare(modePrev, cur, p)
+	case "service":
+		return completeService(modePrev, cur, p)
 	case "run":
 		return completeRun(modePrev, cur, p)
 	case "suspend":
@@ -488,6 +492,76 @@ func completeShare(prev []string, cur string, p Providers) Result {
 		}
 		if len(pos) == 2 {
 			return filterResult(callShares(p.Shares, pos[1]), cur, DirectiveNoFiles)
+		}
+		return Result{Directive: DirectiveNoFiles}
+	default:
+		return Result{Directive: DirectiveNoFiles}
+	}
+}
+
+func completeService(prev []string, cur string, p Providers) Result {
+	valFlags := map[string]bool{"--env-file": true, "-n": true, "--lines": true}
+	if flag, ok := pendingFlagValue(prev, valFlags); ok {
+		if flag == "--env-file" {
+			return Result{Directive: DirectiveFile}
+		}
+		return Result{Directive: DirectiveNoFiles}
+	}
+	if flag, _, ok := splitEqualsFlag(cur); ok {
+		if flag == "--env-file" {
+			return Result{Directive: DirectiveFile}
+		}
+		return Result{Directive: DirectiveNoFiles}
+	}
+
+	pos := collectPositionals(prev, valFlags)
+	if len(pos) == 0 {
+		if strings.HasPrefix(cur, "-") {
+			return filterResult(basicFlags, cur, DirectiveNoFiles)
+		}
+		return filterResult([]string{"list", "add", "enable", "disable", "start", "stop", "restart", "logs", "rm", "linger"}, cur, DirectiveNoFiles)
+	}
+
+	action := pos[0]
+	if strings.HasPrefix(cur, "-") {
+		switch action {
+		case "list", "status":
+			return filterResult(basicFlags, cur, DirectiveNoFiles)
+		case "add", "create":
+			addFlags := []string{
+				"--force", "--env-file", "--enable", "--now", "--no-linger",
+				"--persist", "--profile", "--no-auth", "--no-skills", "--no-rules", "--no-agent-cache",
+				"--allow-root", "--share", "--share-hub", "--ro", "--rw",
+				"--mask-vcs", "--vcs", "--vcs-hooks", "--no-mask",
+				"--serve", "--port", "--remote-control", "--cmd",
+				"--no-net", "--net", "--net-rule", "--cpus", "--memory",
+				"-h", "--help",
+			}
+			return filterResult(addFlags, cur, DirectiveNoFiles)
+		case "enable":
+			return filterResult([]string{"--now", "--no-linger", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
+		case "disable":
+			return filterResult([]string{"--now", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
+		case "start", "stop", "restart", "linger":
+			return filterResult(basicFlags, cur, DirectiveNoFiles)
+		case "logs":
+			return filterResult([]string{"-f", "--follow", "-n", "--lines", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
+		case "rm", "remove", "delete":
+			return filterResult([]string{"--force", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
+		default:
+			return Result{Directive: DirectiveNoFiles}
+		}
+	}
+
+	switch action {
+	case "enable", "disable", "start", "stop", "restart", "logs", "rm", "remove", "delete":
+		if len(pos) == 1 {
+			return filterResult(callStringSlice(p.Services), cur, DirectiveNoFiles)
+		}
+		return Result{Directive: DirectiveNoFiles}
+	case "linger":
+		if len(pos) == 1 {
+			return filterResult([]string{"status", "enable"}, cur, DirectiveNoFiles)
 		}
 		return Result{Directive: DirectiveNoFiles}
 	default:

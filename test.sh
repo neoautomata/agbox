@@ -1415,7 +1415,7 @@ check_05_cli_help_and_categories() {
   local help_out=""
   help_out="$(with_timeout 15 agbox_exec "${TEST_BIN}" --help)"
   assert_contains "${help_out}" "Usage: agbox" "global --help"
-  for sub in setup completion create-base edit-base update auth skills rules profile share run suspend resume stop remove status; do
+  for sub in setup completion create-base edit-base update auth skills rules profile share service run suspend resume stop remove status; do
     help_out="$(with_timeout 15 agbox_exec "${TEST_BIN}" "${sub}" --help)"
     assert_contains "${help_out}" "Usage:" "${sub} --help"
     assert_contains "${help_out}" "agbox ${sub}" "${sub} --help command line"
@@ -1556,6 +1556,12 @@ check_06_security_validation_and_tamper_checks() {
     "share add --ro --vcs-hooks agbox-test ${TEST_ROOT}/sec-src|cannot combine --ro and --vcs-hooks"
     "share list agbox-base|it is the base sandbox"
     "profile create -leading-hyphen|unknown profile option"
+    "service add mybox opencode|headless mode"
+    "service add mybox --serve|fixed --port"
+    "service add mybox -d --remote-control|do not pass --detach"
+    "service add mybox --name other --remote-control|do not pass --name"
+    "service add base --remote-control|reserved for agbox-base"
+    "service add run-123 --remote-control|names matching run-<digits> are reserved"
   )
   local spec=""
   local cmd_part=""
