@@ -1151,6 +1151,64 @@ su - "agent" -c "sudo -n true"
 `
 }
 
+// ProvisionAgyRetryHookScript installs the Antigravity high-traffic Stop retry hook.
+// It creates the script and hooks.json only when absent so user files stay intact.
+func ProvisionAgyRetryHookScript() string {
+	return `set -euo pipefail
+mkdir -p /home/agent/.gemini/config/scripts
+chmod 0700 /home/agent/.gemini /home/agent/.gemini/config
+chmod 0755 /home/agent/.gemini/config/scripts
+if [[ ! -e /home/agent/.gemini/config/scripts/retry-high-traffic.py ]]; then
+  cat <<'EOF' > /home/agent/.gemini/config/scripts/retry-high-traffic.py
+#!/usr/bin/env python3
+import json
+import sys
+import time
+
+MAX_RETRIES = 5
+SLEEP_SECONDS = 60
+
+payload = json.load(sys.stdin)
+reason = payload.get("terminationReason", "")
+error = (payload.get("error") or "").lower()
+execution_num = int(payload.get("executionNum", 0))
+
+is_high_traffic = any(
+    token in error
+    for token in ("high traffic", "503", "unavailable", "capacity")
+)
+
+if reason == "ERROR" and is_high_traffic and execution_num < MAX_RETRIES:
+    time.sleep(SLEEP_SECONDS)
+    print(json.dumps({
+        "decision": "continue",
+        "reason": "The server returned a temporary high-traffic error. Continue where you left off."
+    }))
+else:
+    print(json.dumps({"decision": "stop"}))
+EOF
+  chmod 0755 /home/agent/.gemini/config/scripts/retry-high-traffic.py
+fi
+if [[ ! -e /home/agent/.gemini/config/hooks.json ]]; then
+  cat <<'EOF' > /home/agent/.gemini/config/hooks.json
+{
+  "retry-high-traffic": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "/home/agent/.gemini/config/scripts/retry-high-traffic.py",
+        "timeout": 120
+      }
+    ]
+  }
+}
+EOF
+  chmod 0600 /home/agent/.gemini/config/hooks.json
+fi
+chown -R 1000:1000 /home/agent/.gemini/config/scripts /home/agent/.gemini/config/hooks.json
+`
+}
+
 // SandboxInfo represents one row from msb ls.
 type SandboxInfo struct {
 	Name    string

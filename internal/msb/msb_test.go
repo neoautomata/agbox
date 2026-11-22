@@ -1103,6 +1103,30 @@ func TestProvisionGuestUserScriptAgentDefaults(t *testing.T) {
 	}
 }
 
+func TestProvisionAgyRetryHookScript(t *testing.T) {
+	script := ProvisionAgyRetryHookScript()
+	for _, want := range []string{
+		"/home/agent/.gemini/config/scripts/retry-high-traffic.py",
+		"/home/agent/.gemini/config/hooks.json",
+		`"retry-high-traffic"`,
+		`"Stop"`,
+		`"timeout": 120`,
+		"MAX_RETRIES = 5",
+		"SLEEP_SECONDS = 60",
+		`"decision": "continue"`,
+		`"decision": "stop"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("ProvisionAgyRetryHookScript missing %q", want)
+		}
+	}
+	cmd := exec.Command("bash", "-n")
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ProvisionAgyRetryHookScript bash -n failed: %v (%s)", err, string(out))
+	}
+}
+
 func TestExecRunnerInteractiveStreaming(t *testing.T) {
 	tmp := t.TempDir()
 	fakeMSB := filepath.Join(tmp, "msb")

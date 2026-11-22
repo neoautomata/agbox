@@ -1363,7 +1363,10 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 			foundBaseTools = true
 		}
 		if strings.Contains(joined, "antigravity.google") {
-			foundAgyTLS = strings.Contains(joined, "=https") && strings.Contains(joined, "--tlsv1.2 -fsSL --")
+			foundAgyTLS = strings.Contains(joined, "=https") &&
+				strings.Contains(joined, "--tlsv1.2 -fsSL --") &&
+				strings.Contains(joined, "/home/agent/.gemini/config/scripts/retry-high-traffic.py") &&
+				strings.Contains(joined, "/home/agent/.gemini/config/hooks.json")
 		}
 	}
 	if !foundCreateNet || !foundAgyTLS || !foundBaseApt || !foundBaseTools {

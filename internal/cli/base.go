@@ -259,7 +259,8 @@ su - %s -c %s
 if [ -x /home/agent/.local/bin/agy ]; then
   ln -sf /home/agent/.local/bin/agy /usr/local/bin/agy
 fi
-su - %s -c "agy --version"`, config.GuestUser, msb.ShellQuote(innerCmd), config.GuestUser)
+su - %s -c "agy --version"
+%s`, config.GuestUser, msb.ShellQuote(innerCmd), config.GuestUser, msb.ProvisionAgyRetryHookScript())
 		agyArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: config.BaseSandbox,
 			User:    "root",

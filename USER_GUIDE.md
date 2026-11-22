@@ -52,7 +52,7 @@ agbox create-base --add core,go,rust,esphome both
 
 Every snapshot includes `shellcheck`, `mdformat` (with `mdformat-gfm`), and standard CLI tools. It also sets `PYTHONDONTWRITEBYTECODE=1` in the guest environment. `create-base` also writes default agent settings for unattended work. It writes a settings file only when that file does not exist:
 
-- **Antigravity (`agy`):** `toolPermission` is `"always-proceed"` (`turbo`). `queuedMessages` is `"send-immediately"`. `allowNonWorkspaceAccess` is `true`. `trustedWorkspaces` is `["/workspace"]`. The file is `/home/agent/.gemini/antigravity-cli/settings.json`.
+- **Antigravity (`agy`):** `toolPermission` is `"always-proceed"` (`turbo`). `queuedMessages` is `"send-immediately"`. `allowNonWorkspaceAccess` is `true`. `trustedWorkspaces` is `["/workspace"]`. The file is `/home/agent/.gemini/antigravity-cli/settings.json`. When `create-base` installs `agy`, it also installs a `Stop` retry hook (`/home/agent/.gemini/config/hooks.json` and `/home/agent/.gemini/config/scripts/retry-high-traffic.py`) that retries transient high-traffic errors.
 - **OpenCode (`opencode`):** `"permission"` is `"allow"` in `/home/agent/.config/opencode/opencode.json`. Queued follow-up messages already steer an active turn by default.
 
 When `create-base` ends, `agbox` stops `agbox-base` and saves the snapshot `agbox:v1`.

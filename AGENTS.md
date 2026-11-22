@@ -136,7 +136,7 @@ flowchart TD
 - `create-base` installs `shellcheck`, `mdformat`, and `mdformat-gfm` in every snapshot. It also installs `git`, `ripgrep`, `curl`, `less`, `procps`, and `sudo`, and sets `PYTHONDONTWRITEBYTECODE=1`.
 - `/etc/profile.d/agbox-path.sh` sources `/etc/agbox-env.d/*.sh`. `KeyLoaderPrefix` sources `/etc/profile.d/agbox-path.sh` before `/home/agent/.agbox-keys.sh` so category environment files apply to all guest commands.
 - `create-base` writes agent settings only when the file does not exist. It never overwrites a user file on `edit-base` or `--profile`:
-  - `agy` (`/home/agent/.gemini/antigravity-cli/settings.json`): `"toolPermission": "always-proceed"`, `"queuedMessages": "send-immediately"`, `"allowNonWorkspaceAccess": true`, and `"trustedWorkspaces": ["/workspace"]`.
+  - `agy` (`/home/agent/.gemini/antigravity-cli/settings.json`): `"toolPermission": "always-proceed"`, `"queuedMessages": "send-immediately"`, `"allowNonWorkspaceAccess": true`, and `"trustedWorkspaces": ["/workspace"]`. When `create-base` installs `agy`, it also writes `/home/agent/.gemini/config/scripts/retry-high-traffic.py` and `/home/agent/.gemini/config/hooks.json` when absent.
   - `opencode` (`/home/agent/.config/opencode/opencode.json`): `"permission": "allow"`. The default for `general.followup` is `"steer"`.
 
 ## 3. Upstream `msb` contracts
