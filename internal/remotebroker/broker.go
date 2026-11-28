@@ -1,7 +1,6 @@
 package remotebroker
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -76,6 +75,11 @@ type queuedRequest struct {
 	cancelled atomic.Bool
 }
 
+type switchRequest struct {
+	name string
+	seq  uint64
+}
+
 type editRequestPayload struct {
 	Executable     string   `json:"executable"`
 	Args           []string `json:"args"`
@@ -117,7 +121,8 @@ type Broker struct {
 	targetSB     string
 	pinnedTarget bool
 	needSBSelect bool
-	switchReqCh  chan string
+	switchSeq    uint64
+	switchReqCh  chan switchRequest
 
 	// Single-owner TTY actor state.
 	queueMu       sync.Mutex
@@ -214,7 +219,7 @@ func New(cfg Config) (*Broker, error) {
 		audit:          audit,
 		cliRedactRules: cliRedactRules,
 		respWaiters:    make(map[string]chan remoteproto.ExecResponse),
-		switchReqCh:    make(chan string, 1),
+		switchReqCh:    make(chan switchRequest, 1),
 		outputReview:   cfg.OutputReview,
 		targetSB:       targetSB,
 		pinnedTarget:   targetSB != "",
@@ -345,23 +350,21 @@ func (b *Broker) closeWakePipe() {
 
 func (b *Broker) signalWake() {
 	b.wakeMu.Lock()
-	fd := b.wakeW
-	b.wakeMu.Unlock()
-	if fd >= 0 {
-		_, _ = unix.Write(fd, []byte{1})
+	defer b.wakeMu.Unlock()
+	if b.wakeW >= 0 {
+		_, _ = unix.Write(b.wakeW, []byte{1})
 	}
 }
 
 func (b *Broker) drainWake() {
 	b.wakeMu.Lock()
-	fd := b.wakeR
-	b.wakeMu.Unlock()
-	if fd < 0 {
+	defer b.wakeMu.Unlock()
+	if b.wakeR < 0 {
 		return
 	}
 	var junk [64]byte
 	for {
-		n, err := unix.Read(fd, junk[:])
+		n, err := unix.Read(b.wakeR, junk[:])
 		if n <= 0 || err != nil {
 			break
 		}
@@ -763,7 +766,6 @@ func (b *Broker) reconnectOnce(ctx context.Context) error {
 	b.remoteMu.Lock()
 	pinned := b.pinnedSrvFP
 	sid := b.sessionID
-	nextSeq := b.connSeq + 1
 	b.remoteMu.Unlock()
 
 	dialer := &net.Dialer{Timeout: remoteproto.HandshakeTimeout}
@@ -778,6 +780,13 @@ func (b *Broker) reconnectOnce(ctx context.Context) error {
 		return err
 	}
 	_ = tlsConn.SetDeadline(time.Now().Add(remoteproto.CommitRevealTimeout))
+
+	// Advance connSeq before sending RESUME so a lost RESUME_OK never stalls retries on a stale sequence.
+	b.remoteMu.Lock()
+	b.connSeq++
+	nextSeq := b.connSeq
+	b.remoteMu.Unlock()
+
 	if _, err := remoteproto.WriteFrame(tlsConn, remoteproto.FrameResume, remoteproto.ResumePayload{
 		SessionIDHex: hex.EncodeToString(sid[:]),
 		ConnSeq:      nextSeq,
@@ -799,7 +808,6 @@ func (b *Broker) reconnectOnce(ctx context.Context) error {
 
 	b.remoteMu.Lock()
 	b.remoteConn = tlsConn
-	b.connSeq = nextSeq
 	b.remoteMu.Unlock()
 	return nil
 }
@@ -858,6 +866,7 @@ func (b *Broker) sandboxAttachLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		b.sbMu.Lock()
 		target := b.targetSB
+		mySeq := b.switchSeq
 		b.sbMu.Unlock()
 
 		cands, err := b.listSandboxes()
@@ -897,13 +906,10 @@ func (b *Broker) sandboxAttachLoop(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case newT := <-b.switchReqCh:
-					b.sbMu.Lock()
-					b.targetSB = newT
-					b.pinnedTarget = false
-					b.needSBSelect = false
-					b.sbMu.Unlock()
-					waitState = ""
+				case sw := <-b.switchReqCh:
+					if sw.seq > mySeq {
+						waitState = ""
+					}
 				case <-time.After(500 * time.Millisecond):
 				}
 				continue
@@ -919,13 +925,10 @@ func (b *Broker) sandboxAttachLoop(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case newT := <-b.switchReqCh:
-					b.sbMu.Lock()
-					b.targetSB = newT
-					b.pinnedTarget = false
-					b.needSBSelect = false
-					b.sbMu.Unlock()
-					waitState = ""
+				case sw := <-b.switchReqCh:
+					if sw.seq > mySeq {
+						waitState = ""
+					}
 				case <-time.After(500 * time.Millisecond):
 				}
 				continue
@@ -942,13 +945,10 @@ func (b *Broker) sandboxAttachLoop(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case newT := <-b.switchReqCh:
-					b.sbMu.Lock()
-					b.targetSB = newT
-					b.pinnedTarget = false
-					b.needSBSelect = false
-					b.sbMu.Unlock()
-					waitState = ""
+				case sw := <-b.switchReqCh:
+					if sw.seq > mySeq {
+						waitState = ""
+					}
 				case <-time.After(500 * time.Millisecond):
 				}
 				continue
@@ -971,19 +971,19 @@ func (b *Broker) sandboxAttachLoop(ctx context.Context) {
 			case <-ctx.Done():
 				timer.Stop()
 				return
-			case newT := <-b.switchReqCh:
+			case <-b.switchReqCh:
 				timer.Stop()
-				b.sbMu.Lock()
-				b.targetSB = newT
-				b.pinnedTarget = false
-				b.needSBSelect = false
-				b.sbMu.Unlock()
 			case <-timer.C:
 			}
 			continue
 		}
 
 		b.sbMu.Lock()
+		if b.switchSeq != mySeq {
+			b.sbMu.Unlock()
+			_ = conn.Close()
+			continue
+		}
 		b.activeSB = chosen.Name
 		b.activeSBEph = chosen.Ephemeral
 		b.bridgeConn = conn
@@ -993,7 +993,7 @@ func (b *Broker) sandboxAttachLoop(ctx context.Context) {
 		b.queueLog(fmt.Sprintf("[agbox-remote] Attached to sandbox %s.", chosen.Name))
 		b.signalWake()
 
-		b.readBridgeLoop(ctx, conn, chosen.Name)
+		b.readBridgeLoop(ctx, conn, chosen.Name, mySeq)
 
 		// Cancel any active or queued requests belonging to the disconnected sandbox.
 		b.cancelSandboxRequests(chosen.Name)
@@ -1003,7 +1003,7 @@ func (b *Broker) sandboxAttachLoop(ctx context.Context) {
 			b.bridgeConn = nil
 			b.activeSB = ""
 			// Clear an interactively selected ephemeral PID target when it disconnects.
-			if !b.pinnedTarget && b.activeSBEph && b.targetSB == chosen.Name {
+			if !b.pinnedTarget && b.activeSBEph && b.targetSB == chosen.Name && b.switchSeq == mySeq {
 				b.targetSB = ""
 			}
 			b.activeSBEph = false
@@ -1018,22 +1018,32 @@ func (b *Broker) sandboxAttachLoop(ctx context.Context) {
 	}
 }
 
-func (b *Broker) readBridgeLoop(ctx context.Context, conn *net.UnixConn, sandboxName string) {
+func (b *Broker) readBridgeLoop(ctx context.Context, conn *net.UnixConn, sandboxName string, mySeq uint64) {
 	loopDone := make(chan struct{})
 	defer close(loopDone)
 	go func() {
-		select {
-		case <-loopDone:
-			return
-		case <-ctx.Done():
-			_ = conn.Close()
-		case newT := <-b.switchReqCh:
-			b.sbMu.Lock()
-			b.targetSB = newT
-			b.pinnedTarget = false
-			b.needSBSelect = false
-			b.sbMu.Unlock()
-			_ = conn.Close()
+		for {
+			select {
+			case <-loopDone:
+				return
+			case <-ctx.Done():
+				_ = conn.Close()
+				return
+			case sw := <-b.switchReqCh:
+				if sw.seq <= mySeq {
+					continue
+				}
+				b.sbMu.Lock()
+				if b.switchSeq < sw.seq {
+					b.targetSB = sw.name
+					b.pinnedTarget = false
+					b.needSBSelect = false
+					b.switchSeq = sw.seq
+				}
+				b.sbMu.Unlock()
+				_ = conn.Close()
+				return
+			}
 		}
 	}()
 
@@ -1074,11 +1084,19 @@ func (b *Broker) sendBridgeResp(sandbox, slotID string, resp remoteproto.ExecRes
 	}
 	b.bridgeWrite.Lock()
 	defer b.bridgeWrite.Unlock()
-	_, _ = remoteproto.WriteFrame(conn, "bridge", remoteproto.BridgeMessage{
+	if _, err := remoteproto.WriteFrame(conn, "bridge", remoteproto.BridgeMessage{
 		Op:       "resp",
 		SlotID:   slotID,
 		Response: &resp,
-	}, remoteproto.PostAuthMaxFrameBytes)
+	}, remoteproto.PostAuthMaxFrameBytes); err != nil {
+		fmt.Fprintf(b.cfg.Stderr, "[agbox-remote] WARN: failed to send response for slot %s (%v). Sending uniform deny.\n", slotID, err)
+		fallback := remoteproto.DeniedResponse(slotID, "")
+		_, _ = remoteproto.WriteFrame(conn, "bridge", remoteproto.BridgeMessage{
+			Op:       "resp",
+			SlotID:   slotID,
+			Response: &fallback,
+		}, remoteproto.PostAuthMaxFrameBytes)
+	}
 }
 
 func (b *Broker) enqueueGuestRequest(sandbox, slotID string, req remoteproto.GuestRequest) {
@@ -1155,15 +1173,17 @@ func (b *Broker) requestSwitchSandbox(name string) {
 	b.targetSB = name
 	b.pinnedTarget = false
 	b.needSBSelect = false
-	b.sbMu.Unlock()
+	b.switchSeq++
+	req := switchRequest{name: name, seq: b.switchSeq}
 	select {
 	case <-b.switchReqCh:
 	default:
 	}
 	select {
-	case b.switchReqCh <- name:
+	case b.switchReqCh <- req:
 	default:
 	}
+	b.sbMu.Unlock()
 }
 
 func (b *Broker) consumeNeedSBSelect() bool {
@@ -1688,23 +1708,24 @@ func (b *Broker) processOneRequest(ctx context.Context, item *queuedRequest, que
 }
 
 func (b *Broker) applyCLIRedact(data []byte) ([]byte, int) {
-	if len(b.cliRedactRules) == 0 || len(data) == 0 || bytes.IndexByte(data, 0) >= 0 {
+	if len(b.cliRedactRules) == 0 || len(data) == 0 {
 		return data, 0
 	}
-	cur := string(data)
+	cur := data
 	total := 0
+	replacement := []byte("[REDACTED:CUSTOM]")
 	for _, re := range b.cliRedactRules {
-		matches := re.FindAllStringIndex(cur, -1)
+		matches := re.FindAllIndex(cur, -1)
 		if len(matches) == 0 {
 			continue
 		}
 		total += len(matches)
-		cur = re.ReplaceAllString(cur, "[REDACTED:CUSTOM]")
+		cur = re.ReplaceAll(cur, replacement)
 	}
 	if total == 0 {
 		return data, 0
 	}
-	return []byte(cur), total
+	return cur, total
 }
 
 func (b *Broker) executeOnRemote(ctx context.Context, item *queuedRequest, req remoteproto.ExecRequest) (remoteproto.ExecResponse, bool) {
@@ -1718,6 +1739,14 @@ func (b *Broker) executeOnRemote(ctx context.Context, item *queuedRequest, req r
 
 	execCtx, cancelExec := context.WithCancel(ctx)
 	b.queueMu.Lock()
+	if item.cancelled.Load() {
+		b.queueMu.Unlock()
+		cancelExec()
+		b.respMu.Lock()
+		delete(b.respWaiters, req.ReqID)
+		b.respMu.Unlock()
+		return remoteproto.ExecResponse{}, false
+	}
 	b.activeExecID = req.ReqID
 	b.activeExecCnl = cancelExec
 	b.queueMu.Unlock()
@@ -1732,6 +1761,9 @@ func (b *Broker) executeOnRemote(ctx context.Context, item *queuedRequest, req r
 		b.respMu.Unlock()
 	}()
 
+	if item.cancelled.Load() {
+		return remoteproto.ExecResponse{}, false
+	}
 	if err := b.writeRemoteFrame(remoteproto.FrameExecReq, req); err != nil {
 		fmt.Fprintf(b.cfg.Stderr, "[agbox-remote] Failed to send request %s: %v\n", req.ReqID, err)
 		return remoteproto.ExecResponse{}, false
@@ -1757,6 +1789,7 @@ func (b *Broker) executeOnRemote(ctx context.Context, item *queuedRequest, req r
 			return remoteproto.ExecResponse{}, false
 		case <-ticker.C:
 			if item.cancelled.Load() {
+				_ = b.writeRemoteFrame(remoteproto.FrameCancel, remoteproto.CancelPayload{ReqID: req.ReqID})
 				return remoteproto.ExecResponse{}, false
 			}
 			elapsed := int(time.Since(start).Seconds())
@@ -2194,23 +2227,23 @@ func (b *Broker) runPhase2Prompt(
 			}
 		case "r":
 			if canEditOut && !canEditErr {
-				if ed, eErr := b.editBytes(ctx, "stdout", curOut); eErr == nil {
+				if ed, ok := b.editPhase2Stream(ctx, "stdout", curOut, len(curErr)); ok {
 					curOut = ed
 				}
 			} else if canEditErr && !canEditOut {
-				if ed, eErr := b.editBytes(ctx, "stderr", curErr); eErr == nil {
+				if ed, ok := b.editPhase2Stream(ctx, "stderr", curErr, len(curOut)); ok {
 					curErr = ed
 				}
 			}
 		case "r1":
 			if canEditOut {
-				if ed, eErr := b.editBytes(ctx, "stdout", curOut); eErr == nil {
+				if ed, ok := b.editPhase2Stream(ctx, "stdout", curOut, len(curErr)); ok {
 					curOut = ed
 				}
 			}
 		case "r2":
 			if canEditErr {
-				if ed, eErr := b.editBytes(ctx, "stderr", curErr); eErr == nil {
+				if ed, ok := b.editPhase2Stream(ctx, "stderr", curErr, len(curOut)); ok {
 					curErr = ed
 				}
 			}
@@ -2222,6 +2255,19 @@ func (b *Broker) runPhase2Prompt(
 			return nil, nil, false, false, ""
 		}
 	}
+}
+
+func (b *Broker) editPhase2Stream(ctx context.Context, prefix string, cur []byte, otherLen int) ([]byte, bool) {
+	ed, err := b.editBytes(ctx, prefix, cur)
+	if err != nil {
+		fmt.Fprintf(b.cfg.Stderr, "[agbox-remote] Edit aborted: %v\n", err)
+		return nil, false
+	}
+	if len(ed)+otherLen > remoteproto.MaxOutputBytes {
+		fmt.Fprintf(b.cfg.Stderr, "[agbox-remote] Edit aborted: combined output exceeds %d bytes\n", remoteproto.MaxOutputBytes)
+		return nil, false
+	}
+	return ed, true
 }
 
 func (b *Broker) askRetryEdit(ctx context.Context, cancelled *atomic.Bool, errMsg string) bool {

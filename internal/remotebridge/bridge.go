@@ -182,6 +182,7 @@ type Bridge struct {
 	instrBytes []byte
 
 	mu         sync.Mutex
+	closing    bool
 	slots      map[string]*reqSlot
 	totalBytes int64
 	doneMtime  time.Time
@@ -348,6 +349,9 @@ func (b *Bridge) Mount() error {
 func (b *Bridge) Close() error {
 	var firstErr error
 	b.stopOne.Do(func() {
+		b.mu.Lock()
+		b.closing = true
+		b.mu.Unlock()
 		close(b.stopCh)
 		b.closeControlSocket()
 		if b.fuseSrv != nil {
@@ -559,7 +563,13 @@ func (b *Bridge) flushSlot(h *reqFileHandle) syscall.Errno {
 
 func (b *Bridge) scheduleJitteredDeny(slotID string) {
 	delay := b.randomJitter()
+	b.mu.Lock()
+	if b.closing {
+		b.mu.Unlock()
+		return
+	}
 	b.wg.Add(1)
+	b.mu.Unlock()
 	go func() {
 		defer b.wg.Done()
 		if delay > 0 {

@@ -369,6 +369,14 @@ func TestSecurityFixesC1H3H5M11M12M15AndModes(t *testing.T) {
 		t.Fatalf("L7: expected 'omit relative paths' error, got %v", err)
 	}
 
+	// L5: bare '.' executable rejected by ValidateExecutable and Evaluate.
+	if err := ValidateExecutable("."); err == nil {
+		t.Fatal("L5: expected ValidateExecutable(\".\") to fail")
+	}
+	if d := Evaluate(DefaultPolicy(), EvalInput{Executable: "."}, nil); d.Action != ActionDeny {
+		t.Fatalf("L5: expected deny for executable '.', got %+v", d)
+	}
+
 	// Duplicate rule IDs rejected.
 	if _, _, err := Parse([]byte(`{"version":1,"rules":[{"id":"dup","action":"deny","executables":["rm"]},{"id":"dup","action":"ask","executables":["ls"]}]}`)); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("expected duplicate rule id error, got %v", err)

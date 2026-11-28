@@ -516,28 +516,33 @@ func emitResponse(resp remoteproto.ExecResponse, stdout, stderr io.Writer) int {
 		} else {
 			fmt.Fprintln(stderr, "agbox-remote: remote command timed out")
 		}
+		emitResponseNotes(resp, stderr)
 		return remoteproto.TimeoutExitCode
 
 	case remoteproto.StatusCompleted:
 		writeDecodedStream(resp.StdoutB64, stdout)
 		writeDecodedStream(resp.StderrB64, stderr)
-		if resp.StdoutTruncated {
-			fmt.Fprintln(stderr, "[agbox-remote] NOTE: the remote daemon truncated stdout at the configured output limit.")
-		}
-		if resp.StderrTruncated {
-			fmt.Fprintln(stderr, "[agbox-remote] NOTE: the remote daemon truncated stderr at the configured output limit.")
-		}
-		if resp.RedactedCount > 0 {
-			fmt.Fprintf(stderr, "[agbox-remote] NOTE: %d secret pattern(s) redacted.\n", resp.RedactedCount)
-		}
-		if resp.DroppedOutput {
-			fmt.Fprintln(stderr, "[agbox-remote] NOTE: output dropped by operator.")
-		}
+		emitResponseNotes(resp, stderr)
 		return resp.ExitCode
 
 	default:
 		fmt.Fprintln(stderr, remoteproto.DenyErrorMessage)
 		return remoteproto.DenyExitCode
+	}
+}
+
+func emitResponseNotes(resp remoteproto.ExecResponse, stderr io.Writer) {
+	if resp.StdoutTruncated {
+		fmt.Fprintln(stderr, "[agbox-remote] NOTE: the remote daemon truncated stdout at the configured output limit.")
+	}
+	if resp.StderrTruncated {
+		fmt.Fprintln(stderr, "[agbox-remote] NOTE: the remote daemon truncated stderr at the configured output limit.")
+	}
+	if resp.RedactedCount > 0 {
+		fmt.Fprintf(stderr, "[agbox-remote] NOTE: %d secret pattern(s) redacted.\n", resp.RedactedCount)
+	}
+	if resp.DroppedOutput {
+		fmt.Fprintln(stderr, "[agbox-remote] NOTE: output dropped by operator.")
 	}
 }
 

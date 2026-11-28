@@ -63,23 +63,31 @@ func (b *syncBuffer) Len() int {
 	return b.buf.Len()
 }
 
-func (b *syncBuffer) waitFor(t *testing.T, from int, substr string, timeout time.Duration) int {
-	t.Helper()
+func (b *syncBuffer) waitForErr(from int, substr string, timeout time.Duration) (int, error) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
 		s := b.String()
 		if from <= len(s) {
 			if idx := strings.Index(s[from:], substr); idx >= 0 {
-				return from + idx + len(substr)
+				return from + idx + len(substr), nil
 			}
 		}
 		select {
 		case <-b.notify:
 		case <-deadline.C:
-			t.Fatalf("timed out waiting for %q after offset %d in buffer:\n%s", substr, from, s)
+			return 0, fmt.Errorf("timed out waiting for %q after offset %d in buffer:\n%s", substr, from, s)
 		}
 	}
+}
+
+func (b *syncBuffer) waitFor(t *testing.T, from int, substr string, timeout time.Duration) int {
+	t.Helper()
+	pos, err := b.waitForErr(from, substr, timeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pos
 }
 
 // fakeBridgeSock implements the real Unix remote.sock control protocol without FUSE.
@@ -974,11 +982,11 @@ func TestPhase1GateAndSessionGrants(t *testing.T) {
 	var slowEditDone atomic.Bool
 
 	h := startBrokerHarness(t, harnessOpts{
-		askTimeout: 300 * time.Millisecond,
+		askTimeout: 600 * time.Millisecond,
 		viewText: func(_ context.Context, text string) {
 			viewedText.Store(text)
 			// Sleep longer than AskTimeout to verify pager pauses the ask-timeout.
-			time.Sleep(380 * time.Millisecond)
+			time.Sleep(680 * time.Millisecond)
 		},
 		editBytes: func(_ context.Context, prefix string, content []byte) ([]byte, error) {
 			switch prefix {
@@ -1004,7 +1012,7 @@ func TestPhase1GateAndSessionGrants(t *testing.T) {
 				}
 				if n == 4 {
 					// Valid edit with lower max_output_bytes and changed args.
-					time.Sleep(380 * time.Millisecond)
+					time.Sleep(680 * time.Millisecond)
 					slowEditDone.Store(true)
 					var p editRequestPayload
 					_ = json.Unmarshal(content, &p)
@@ -1168,16 +1176,16 @@ func TestPhase1GateAndSessionGrants(t *testing.T) {
 	h.writeIn("d\n")
 	_ = h.waitResp(ch11)
 
-	// Verify pre-editor wait time is NOT refunded (M7):
-	// AskTimeout is 300ms. Wait 180ms, press [v] (which runs without deducting time),
-	// then wait at the returned prompt -> remaining budget is ~120ms, NOT refunded to 300ms.
+	// Verify pre-editor wait time is not refunded (M7):
+	// AskTimeout is 600ms. Wait 350ms, press [v] (which pauses the timer),
+	// then wait at the returned prompt -> remaining budget is ~250ms, not refunded to 600ms.
 	_, ch12 := h.submitAsync(remoteproto.GuestRequest{
 		Executable: "cat",
 		StdinB64:   base64.StdEncoding.EncodeToString([]byte("budget-check")),
 	})
 	off = h.stdout.waitFor(t, off, "budget-check", 5*time.Second)
 	off = h.stdout.waitFor(t, off, "Choice (", 5*time.Second)
-	time.Sleep(180 * time.Millisecond)
+	time.Sleep(350 * time.Millisecond)
 	h.writeIn("v\n")
 	off = h.stdout.waitFor(t, off, "Choice (", 5*time.Second)
 	startWait := time.Now()
@@ -1186,7 +1194,7 @@ func TestPhase1GateAndSessionGrants(t *testing.T) {
 	if resp12.Status != remoteproto.StatusDenied {
 		t.Fatalf("expected timeout deny after non-refunded pre-pager wait, got %#v", resp12)
 	}
-	if waited > 260*time.Millisecond {
+	if waited > 520*time.Millisecond {
 		t.Fatalf("pre-pager wait appears to have been refunded (waited %v after pager)", waited)
 	}
 
@@ -1337,6 +1345,79 @@ func TestPhase2OutputReviewModes(t *testing.T) {
 	h.quit()
 }
 
+func TestPhase2EditErrorsAndOversizeCap(t *testing.T) {
+	t.Parallel()
+	var editMode atomic.Int32
+	h := startBrokerHarness(t, harnessOpts{
+		outputReview: true,
+		askTimeout:   3 * time.Second,
+		editBytes: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+			switch editMode.Load() {
+			case 1:
+				return nil, errors.New("editor crashed")
+			case 2:
+				return bytes.Repeat([]byte("X"), remoteproto.MaxOutputBytes), nil
+			default:
+				return []byte("ok\n"), nil
+			}
+		},
+	})
+
+	// 1. Phase 2 [r] editor error prints an abort message and keeps original output.
+	editMode.Store(1)
+	off := h.stdout.Len()
+	errOff := h.stderr.Len()
+	_, ch1 := h.submitAsync(remoteproto.GuestRequest{Executable: "echo", Args: []string{"keep-original"}})
+	off = h.stdout.waitFor(t, off, "Choice (", 5*time.Second)
+	h.writeIn("a\n")
+	off = h.stdout.waitFor(t, off, "[r]edact-stdout", 5*time.Second)
+	h.writeIn("r\n")
+	errOff = h.stderr.waitFor(t, errOff, "[agbox-remote] Edit aborted: editor crashed", 5*time.Second)
+	off = h.stdout.waitFor(t, off, "Choice (", 5*time.Second)
+	h.writeIn("a\n")
+	resp1 := h.waitResp(ch1)
+	if resp1.Status != remoteproto.StatusCompleted || decodeB64(t, resp1.StdoutB64) != "keep-original\n" {
+		t.Fatalf("expected untouched output after editor error, got %#v", resp1)
+	}
+
+	// 2. Phase 2 [r1] combined output exceeding MaxOutputBytes rejects the edit and keeps original output.
+	editMode.Store(2)
+	_, ch2 := h.submitAsync(remoteproto.GuestRequest{
+		Executable: "python3",
+		Args:       []string{"-c", "import sys; sys.stdout.write('out1\\n'); sys.stderr.write('err1\\n')"},
+	})
+	off = h.stdout.waitFor(t, off, "Choice (", 5*time.Second)
+	h.writeIn("a\n")
+	off = h.stdout.waitFor(t, off, "[r1]redact-stdout", 5*time.Second)
+	h.writeIn("r1\n")
+	wantOversize := fmt.Sprintf("[agbox-remote] Edit aborted: combined output exceeds %d bytes", remoteproto.MaxOutputBytes)
+	errOff = h.stderr.waitFor(t, errOff, wantOversize, 5*time.Second)
+	off = h.stdout.waitFor(t, off, "Choice (", 5*time.Second)
+	h.writeIn("a\n")
+	resp2 := h.waitResp(ch2)
+	if resp2.Status != remoteproto.StatusCompleted || decodeB64(t, resp2.StdoutB64) != "out1\n" || decodeB64(t, resp2.StderrB64) != "err1\n" {
+		t.Fatalf("expected untouched streams after oversized edit, got %#v", resp2)
+	}
+
+	// 3. sendBridgeResp falls back to uniform deny when WriteFrame fails on an oversized response.
+	slotFallback := h.nextSlotID()
+	fbCh := make(chan remoteproto.ExecResponse, 1)
+	h.bridge.mu.Lock()
+	h.bridge.respWaiters[slotFallback] = fbCh
+	h.bridge.mu.Unlock()
+	h.broker.sendBridgeResp("agbox-sb1", slotFallback, remoteproto.ExecResponse{
+		Status:    remoteproto.StatusCompleted,
+		StdoutB64: strings.Repeat("A", remoteproto.PostAuthMaxFrameBytes+1024),
+	})
+	h.stderr.waitFor(t, errOff, "Sending uniform deny.", 5*time.Second)
+	respFB := h.waitResp(fbCh)
+	if respFB.Status != remoteproto.StatusDenied || respFB.ExitCode != remoteproto.DenyExitCode || respFB.ReqID != slotFallback {
+		t.Fatalf("expected uniform deny fallback on oversized bridge frame, got %#v", respFB)
+	}
+
+	h.quit()
+}
+
 func TestPhase1PolicyHotReloadTOCTOU(t *testing.T) {
 	t.Parallel()
 	h := startBrokerHarness(t, harnessOpts{})
@@ -1394,7 +1475,7 @@ func TestCLIRedactPatternIndependentOfPolicy(t *testing.T) {
 		Rules: []remotepolicy.Rule{{
 			ID:          "allow-echo",
 			Action:      remotepolicy.ActionAllow,
-			Executables: []string{"echo"},
+			Executables: []string{"echo", "printf"},
 			Args:        remotepolicy.ArgsMatcher{AllowAnyArgs: true},
 		}},
 	}
@@ -1434,6 +1515,20 @@ func TestCLIRedactPatternIndependentOfPolicy(t *testing.T) {
 	out2 := decodeB64(t, resp2.StdoutB64)
 	if strings.Contains(out2, "POL_PAT_59") || strings.Contains(out2, "CUSTOM_SECRET_9999") || resp2.RedactedCount < 2 {
 		t.Fatalf("expected both policy and CLI patterns to apply when combined > 100, got resp=%#v out=%q", resp2, out2)
+	}
+
+	// Verify NUL bytes cannot bypass CLI --redact-pattern rules.
+	_, ch3 := h.submitAsync(remoteproto.GuestRequest{
+		Executable: "printf",
+		Args:       []string{`bin\000CUSTOM_SECRET_7777\000tail`},
+	})
+	resp3 := h.waitResp(ch3)
+	out3 := decodeB64(t, resp3.StdoutB64)
+	if resp3.Status != remoteproto.StatusCompleted || strings.Contains(out3, "CUSTOM_SECRET_7777") || !strings.Contains(out3, "[REDACTED:CUSTOM]") || resp3.RedactedCount < 1 {
+		t.Fatalf("expected CLI --redact-pattern to redact around NUL bytes, got resp=%#v out=%q", resp3, out3)
+	}
+	if !strings.Contains(out3, "\x00") {
+		t.Fatalf("expected NUL bytes to remain in output around redaction, got %q", out3)
 	}
 
 	h.quit()
@@ -2059,17 +2154,27 @@ func TestEndToEndLoopbackWithFUSEBridge(t *testing.T) {
 
 	// 6. Ask command (`echo AKIAIOSFODNN7EXAMPLE`) approved deterministically returns redacted output.
 	off := bOut.Len()
+	waitErrCh := make(chan error, 1)
 	go func() {
-		bOut.waitFor(t, off, "Choice (", 5*time.Second)
-		_, _ = brokerInW.WriteString("a\n")
+		if _, err := bOut.waitForErr(off, "Choice (", 5*time.Second); err != nil {
+			waitErrCh <- err
+			return
+		}
+		_, err := brokerInW.WriteString("a\n")
+		waitErrCh <- err
 	}()
 	cOut.Reset()
 	cErr.Reset()
-	rc = remoteclient.Run(ctx, []string{"echo", "AKIAIOSFODNN7EXAMPLE"}, remoteclient.RunOptions{
+	runCtx, runCancel := context.WithTimeout(ctx, 8*time.Second)
+	rc = remoteclient.Run(runCtx, []string{"echo", "AKIAIOSFODNN7EXAMPLE"}, remoteclient.RunOptions{
 		BridgeDir: mntDir,
 		Stdout:    &cOut,
 		Stderr:    &cErr,
 	})
+	runCancel()
+	if err := <-waitErrCh; err != nil {
+		t.Fatalf("approve echo prompt: %v", err)
+	}
 	if rc != 0 || !strings.Contains(cOut.String(), "[REDACTED:AWS_KEY]") || strings.Contains(cOut.String(), "AKIAIOSFODNN7EXAMPLE") {
 		t.Fatalf("expected baseline secret redaction on approved echo, got rc=%d out=%q err=%q", rc, cOut.String(), cErr.String())
 	}

@@ -524,8 +524,20 @@ func TestDaemonPairingResumeConcurrencyAndGrace(t *testing.T) {
 	}, remoteproto.PostAuthMaxFrameBytes); err != nil {
 		t.Fatal(err)
 	}
-	// Give slow-1 a moment to claim activeCancel.
-	time.Sleep(80 * time.Millisecond)
+	// Poll until slow-1 claims activeCancel.
+	waitDeadline := time.Now().Add(2 * time.Second)
+	for {
+		d.cmdMu.Lock()
+		active := d.activeCancel != nil
+		d.cmdMu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("timed out waiting for slow-1 to claim activeCancel")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if _, err := remoteproto.WriteFrame(sess1.conn, remoteproto.FrameExecReq, remoteproto.ExecRequest{
 		ReqID:      "concurrent-2",
 		Executable: "echo",
@@ -633,6 +645,126 @@ func TestDaemonPairingResumeConcurrencyAndGrace(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("expected daemon Serve to exit after ReconnectGrace expiry")
+	}
+}
+
+func TestDaemonImmediateExecAfterResumeWhileCommandRunning(t *testing.T) {
+	wd := t.TempDir()
+	var outBuf, errBuf bytes.Buffer
+	d, err := New(Config{
+		ListenAddr:     "127.0.0.1:0",
+		AllowCWD:       []string{wd},
+		ReconnectGrace: 2 * time.Second,
+		IdleTimeout:    30 * time.Second,
+		Stdout:         &outBuf,
+		Stderr:         &errBuf,
+		PromptConfirm: func(_ context.Context, _, _ string) (bool, error) {
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := d.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	defer cancelServe()
+	go func() { serveDone <- d.Serve(serveCtx) }()
+	defer d.Close()
+
+	cliID, err := remoteproto.GenerateEphemeralIdentity("test-broker-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess1, err := pairTestClient(t, addr.String(), cliID, true)
+	if err != nil {
+		t.Fatalf("initial pairing failed: %v", err)
+	}
+	defer sess1.conn.Close()
+
+	// Start a long-running command on seq=1 and poll until it holds activeCancel.
+	if _, err := remoteproto.WriteFrame(sess1.conn, remoteproto.FrameExecReq, remoteproto.ExecRequest{
+		ReqID:          "long-1",
+		Executable:     "sleep",
+		Args:           []string{"30"},
+		CWD:            wd,
+		ExecTimeoutSec: 30,
+	}, remoteproto.PostAuthMaxFrameBytes); err != nil {
+		t.Fatal(err)
+	}
+	waitDeadline := time.Now().Add(2 * time.Second)
+	for {
+		d.cmdMu.Lock()
+		active := d.activeCancel != nil
+		d.cmdMu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatal("timed out waiting for long-1 to claim activeCancel")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Resume on seq=2 while long-1 is still running on seq=1.
+	raw, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn2 := tls.Client(raw, remoteproto.ClientTLSConfig(cliID, &sess1.serverFP))
+	defer conn2.Close()
+	_ = conn2.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := conn2.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remoteproto.WriteFrame(conn2, remoteproto.FrameResume, remoteproto.ResumePayload{
+		SessionIDHex: hex.EncodeToString(sess1.sessionID[:]),
+		ConnSeq:      2,
+	}, remoteproto.PreAuthMaxFrameBytes); err != nil {
+		t.Fatal(err)
+	}
+	rTyp, rPay, _, err := remoteproto.ReadFrame(conn2, remoteproto.PreAuthMaxFrameBytes)
+	if err != nil || rTyp != remoteproto.FrameResumeOK {
+		t.Fatalf("expected RESUME_OK, got typ=%q err=%v", rTyp, err)
+	}
+	var okMsg remoteproto.ResumeOKPayload
+	if err := remoteproto.DecodeStrict(rPay, &okMsg); err != nil || okMsg.ConnSeq != 2 {
+		t.Fatalf("unexpected RESUME_OK payload: %+v err=%v", okMsg, err)
+	}
+
+	// Send EXEC_REQ immediately after RESUME_OK with no sleep.
+	if _, err := remoteproto.WriteFrame(conn2, remoteproto.FrameExecReq, remoteproto.ExecRequest{
+		ReqID:      "immediate-2",
+		Executable: "echo",
+		Args:       []string{"immediate-ok"},
+		CWD:        wd,
+	}, remoteproto.PostAuthMaxFrameBytes); err != nil {
+		t.Fatal(err)
+	}
+	typ, payload, _, err := remoteproto.ReadFrame(conn2, remoteproto.PostAuthMaxFrameBytes)
+	if err != nil || typ != remoteproto.FrameExecResp {
+		t.Fatalf("expected EXEC_RESP on seq=2, got typ=%q err=%v", typ, err)
+	}
+	var resp remoteproto.ExecResponse
+	if err := remoteproto.DecodeStrict(payload, &resp); err != nil {
+		t.Fatalf("decode EXEC_RESP failed: %v", err)
+	}
+	outBytes, _ := base64.StdEncoding.DecodeString(resp.StdoutB64)
+	if resp.ReqID != "immediate-2" || resp.Status != remoteproto.StatusCompleted || string(outBytes) != "immediate-ok\n" {
+		t.Fatalf("expected immediate EXEC_REQ after RESUME to succeed, got %+v out=%q", resp, string(outBytes))
+	}
+
+	_, _ = remoteproto.WriteFrame(conn2, remoteproto.FrameBye, nil, remoteproto.PostAuthMaxFrameBytes)
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned error after BYE: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected daemon Serve to exit after BYE")
 	}
 }
 

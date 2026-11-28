@@ -79,19 +79,21 @@ type Daemon struct {
 	idleMu    sync.Mutex
 	idleTimer *time.Timer
 
-	sessMu        sync.Mutex
-	paired        bool
-	pinnedFP      [32]byte
-	sessionID     [32]byte
-	activeSeq     uint64
-	activeConn    *tls.Conn
-	activeWriteMu sync.Mutex
-	cmdMu         sync.Mutex
-	activeCmdID   string
-	activeCancel  context.CancelFunc
-	graceTimer    *time.Timer
-	doneCh        chan struct{}
-	doneOnce      sync.Once
+	sessMu           sync.Mutex
+	paired           bool
+	pinnedFP         [32]byte
+	sessionID        [32]byte
+	activeSeq        uint64
+	activeConn       *tls.Conn
+	activeConnCancel context.CancelFunc
+	activeWriteMu    sync.Mutex
+	cmdMu            sync.Mutex
+	activeCmdID      string
+	activeCancel     context.CancelFunc
+	activeCmdDone    chan struct{}
+	graceTimer       *time.Timer
+	doneCh           chan struct{}
+	doneOnce         sync.Once
 }
 
 func (d *Daemon) logOut(format string, args ...any) {
@@ -355,11 +357,16 @@ func (d *Daemon) Close() {
 		d.graceTimer.Stop()
 		d.graceTimer = nil
 	}
+	oldCancel := d.activeConnCancel
+	d.activeConnCancel = nil
 	if d.activeConn != nil {
 		_ = d.activeConn.Close()
 		d.activeConn = nil
 	}
 	d.sessMu.Unlock()
+	if oldCancel != nil {
+		oldCancel()
+	}
 }
 
 func (d *Daemon) allowPeerIP(addr net.Addr) (netip.Addr, bool) {
@@ -631,16 +638,32 @@ func (d *Daemon) handleInitialPairing(ctx context.Context, tlsConn *tls.Conn, pe
 		<-peerCh
 		return
 	}
-	peerRes := <-peerCh
+	var peerRes peerPairRes
+	select {
+	case peerRes = <-peerCh:
+	case <-promptCtx.Done():
+		d.recordFailure(peerIP)
+		reason := "canceled"
+		if errors.Is(promptCtx.Err(), context.DeadlineExceeded) {
+			reason = "timeout"
+		}
+		_, _ = remoteproto.WriteFrame(tlsConn, remoteproto.FramePairReject, remoteproto.PairDecisionPayload{Reason: reason}, remoteproto.PreAuthMaxFrameBytes)
+		_ = tlsConn.SetReadDeadline(time.Now())
+		<-peerCh
+		d.logOut("[agbox-remote-serve] Pairing canceled before peer confirmation.\n")
+		return
+	}
 	if peerRes.err != nil || peerRes.typ != remoteproto.FramePairAck {
 		d.recordFailure(peerIP)
 		d.logOut("[agbox-remote-serve] Peer did not confirm pairing.\n")
 		return
 	}
 
+	connCtx, connCancel := context.WithCancel(ctx)
 	d.sessMu.Lock()
 	if d.paired {
 		d.sessMu.Unlock()
+		connCancel()
 		return
 	}
 	d.paired = true
@@ -648,13 +671,14 @@ func (d *Daemon) handleInitialPairing(ctx context.Context, tlsConn *tls.Conn, pe
 	d.sessionID = sessionID
 	d.activeSeq = 1
 	d.activeConn = tlsConn
+	d.activeConnCancel = connCancel
 	mySeq := d.activeSeq
 	d.sessMu.Unlock()
 
 	releasePreAuth()
 	d.resetIdleTimer()
 	d.logOut("[agbox-remote-serve] Paired with %s. Ready for approved commands.\n", remoteproto.SanitizeLine(peerAddr))
-	d.servePairedLoop(ctx, tlsConn, mySeq)
+	d.servePairedLoop(connCtx, connCancel, tlsConn, mySeq)
 }
 
 func (d *Daemon) handleResume(ctx context.Context, tlsConn *tls.Conn, peerIP netip.Addr, wantSID [32]byte, releasePreAuth func()) {
@@ -675,32 +699,61 @@ func (d *Daemon) handleResume(ctx context.Context, tlsConn *tls.Conn, peerIP net
 		return
 	}
 
+	connCtx, connCancel := context.WithCancel(ctx)
 	// Atomically supersede any stale half-open connection when conn_seq > activeSeq.
 	d.sessMu.Lock()
 	if res.ConnSeq <= d.activeSeq {
 		d.sessMu.Unlock()
+		connCancel()
 		d.recordFailure(peerIP)
 		return
 	}
 	oldConn := d.activeConn
+	oldConnCancel := d.activeConnCancel
+	oldCmdCancel, oldCmdDone := d.snapshotActiveCommandLocked()
 	if d.graceTimer != nil {
 		d.graceTimer.Stop()
 		d.graceTimer = nil
 	}
 	d.activeSeq = res.ConnSeq
 	d.activeConn = tlsConn
+	d.activeConnCancel = connCancel
 	mySeq := d.activeSeq
 	d.sessMu.Unlock()
 
+	if oldConnCancel != nil {
+		oldConnCancel()
+	}
 	if oldConn != nil {
 		_ = oldConn.Close()
 	}
-	d.cancelActiveCommand()
+	if oldCmdCancel != nil {
+		oldCmdCancel()
+	}
+	// Wait for any canceled command goroutine to release the active slot before sending RESUME_OK.
+	if oldCmdDone != nil {
+		waitTimer := time.NewTimer(3 * time.Second)
+		select {
+		case <-oldCmdDone:
+		case <-connCtx.Done():
+			waitTimer.Stop()
+			connCancel()
+			return
+		case <-ctx.Done():
+			waitTimer.Stop()
+			connCancel()
+			return
+		case <-waitTimer.C:
+		}
+		waitTimer.Stop()
+	}
 
 	if _, err := remoteproto.WriteFrame(tlsConn, remoteproto.FrameResumeOK, remoteproto.ResumeOKPayload{ConnSeq: mySeq}, remoteproto.PreAuthMaxFrameBytes); err != nil {
+		connCancel()
 		d.sessMu.Lock()
 		if d.activeSeq == mySeq && d.activeConn == tlsConn {
 			d.activeConn = nil
+			d.activeConnCancel = nil
 			d.armGraceTimerLocked(mySeq)
 		}
 		d.sessMu.Unlock()
@@ -709,7 +762,7 @@ func (d *Daemon) handleResume(ctx context.Context, tlsConn *tls.Conn, peerIP net
 	releasePreAuth()
 	d.resetIdleTimer()
 	d.logOut("[agbox-remote-serve] Broker reconnected (seq=%d).\n", mySeq)
-	d.servePairedLoop(ctx, tlsConn, mySeq)
+	d.servePairedLoop(connCtx, connCancel, tlsConn, mySeq)
 }
 
 func (d *Daemon) armGraceTimerLocked(mySeq uint64) {
@@ -731,22 +784,29 @@ func (d *Daemon) armGraceTimerLocked(mySeq uint64) {
 	})
 }
 
-func (d *Daemon) servePairedLoop(ctx context.Context, tlsConn *tls.Conn, mySeq uint64) {
+func (d *Daemon) servePairedLoop(connCtx context.Context, connCancel context.CancelFunc, tlsConn *tls.Conn, mySeq uint64) {
 	cleanBye := false
 	defer func() {
+		connCancel()
 		d.sessMu.Lock()
 		// Guard all disconnect cleanup with activeSeq == mySeq so a superseded socket never kills a newer session.
 		if d.activeSeq == mySeq {
 			d.activeConn = nil
+			d.activeConnCancel = nil
+			oldCmdCancel, _ := d.snapshotActiveCommandLocked()
 			if cleanBye {
 				d.sessMu.Unlock()
-				d.cancelActiveCommand()
+				if oldCmdCancel != nil {
+					oldCmdCancel()
+				}
 				d.doneOnce.Do(func() { close(d.doneCh) })
 				return
 			}
 			d.armGraceTimerLocked(mySeq)
 			d.sessMu.Unlock()
-			d.cancelActiveCommand()
+			if oldCmdCancel != nil {
+				oldCmdCancel()
+			}
 			d.logErr("[agbox-remote-serve] Connection lost. Waiting up to %s for broker reconnect...\n", d.cfg.ReconnectGrace)
 			return
 		}
@@ -762,7 +822,7 @@ func (d *Daemon) servePairedLoop(ctx context.Context, tlsConn *tls.Conn, mySeq u
 			select {
 			case <-stopPing:
 				return
-			case <-ctx.Done():
+			case <-connCtx.Done():
 				return
 			case <-ticker.C:
 				if err := d.writeActiveFrame(tlsConn, mySeq, remoteproto.FramePing, nil); err != nil {
@@ -797,7 +857,7 @@ func (d *Daemon) servePairedLoop(ctx context.Context, tlsConn *tls.Conn, mySeq u
 				continue
 			}
 			d.resetIdleTimer()
-			d.dispatchExec(ctx, tlsConn, mySeq, req)
+			d.dispatchExec(connCtx, tlsConn, mySeq, req)
 		default:
 			return
 		}
@@ -819,27 +879,39 @@ func (d *Daemon) writeActiveFrame(tlsConn *tls.Conn, mySeq uint64, frameType str
 	return err
 }
 
-func (d *Daemon) dispatchExec(ctx context.Context, tlsConn *tls.Conn, mySeq uint64, req remoteproto.ExecRequest) {
+func (d *Daemon) dispatchExec(connCtx context.Context, tlsConn *tls.Conn, mySeq uint64, req remoteproto.ExecRequest) {
+	// Keep consistent sessMu -> cmdMu lock order so a superseded connection cannot claim the command slot.
+	d.sessMu.Lock()
+	if d.activeSeq != mySeq || d.activeConn != tlsConn {
+		d.sessMu.Unlock()
+		return
+	}
 	d.cmdMu.Lock()
 	if d.activeCancel != nil {
 		d.cmdMu.Unlock()
+		d.sessMu.Unlock()
 		_ = d.writeActiveFrame(tlsConn, mySeq, remoteproto.FrameExecResp, remoteproto.DeniedResponse(req.ReqID, ""))
 		return
 	}
-	cmdCtx, cancel := context.WithCancel(ctx)
+	cmdCtx, cancel := context.WithCancel(connCtx)
+	cmdDone := make(chan struct{})
 	d.activeCmdID = req.ReqID
 	d.activeCancel = cancel
+	d.activeCmdDone = cmdDone
 	d.cmdMu.Unlock()
+	d.sessMu.Unlock()
 
 	go func() {
 		defer func() {
 			cancel()
 			d.cmdMu.Lock()
-			if d.activeCmdID == req.ReqID {
+			if d.activeCmdDone == cmdDone {
 				d.activeCmdID = ""
 				d.activeCancel = nil
+				d.activeCmdDone = nil
 			}
 			d.cmdMu.Unlock()
+			close(cmdDone)
 		}()
 		d.logOut("[agbox-remote-serve] Executing [%s]: %s\n",
 			remoteproto.SanitizeLine(req.ReqID),
@@ -850,13 +922,25 @@ func (d *Daemon) dispatchExec(ctx context.Context, tlsConn *tls.Conn, mySeq uint
 	}()
 }
 
-func (d *Daemon) cancelActiveCommand() {
+// snapshotActiveCommandLocked captures the active command cancel handle and done channel.
+// Callers must hold d.sessMu to keep the sessMu -> cmdMu lock order.
+func (d *Daemon) snapshotActiveCommandLocked() (context.CancelFunc, <-chan struct{}) {
 	d.cmdMu.Lock()
 	cancel := d.activeCancel
+	done := d.activeCmdDone
+	d.cmdMu.Unlock()
+	return cancel, done
+}
+
+func (d *Daemon) cancelActiveCommand() <-chan struct{} {
+	d.cmdMu.Lock()
+	cancel := d.activeCancel
+	done := d.activeCmdDone
 	d.cmdMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+	return done
 }
 
 func (d *Daemon) cancelCommandByID(reqID string) {

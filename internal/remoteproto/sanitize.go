@@ -190,7 +190,7 @@ var builtinRedactSpecs = []struct {
 	// URL credentials (scheme://user:pass@host).
 	{`([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^/\s@]+(@)`, `${1}[REDACTED:PASS]${2}`},
 	// JSON, YAML, or KEY=VALUE secret assignments.
-	{`(?i)((?:["']?(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|client[_-]?secret)["']?\s*[:=]\s*["']?))([^\s"',}\]]{4,})`, `${1}[REDACTED:SECRET]`},
+	{`(?i)((?:["']?(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|client[_-]?secret)["']?\s*[:=]\s*["']?))([^\s"',}\[\]]{4,})`, `${1}[REDACTED:SECRET]`},
 }
 
 // Redactor applies baseline and custom regular-expression secret masking.
@@ -261,14 +261,14 @@ func (r *Redactor) RedactString(s string) (string, int) {
 	return string(out), count
 }
 
-// ValidateSafeToken checks that a control identifier is non-empty ASCII without control chars.
+// ValidateSafeToken checks that a control identifier is non-empty printable ASCII without whitespace.
 func ValidateSafeToken(s string) error {
 	if s == "" {
 		return errors.New("token must not be empty")
 	}
 	for i := 0; i < len(s); i++ {
-		if s[i] <= 0x20 || s[i] == 0x7F {
-			return fmt.Errorf("token %q contains whitespace or control characters", s)
+		if s[i] <= 0x20 || s[i] >= 0x7F {
+			return fmt.Errorf("token %q contains whitespace, control, or non-ASCII characters", s)
 		}
 	}
 	return nil

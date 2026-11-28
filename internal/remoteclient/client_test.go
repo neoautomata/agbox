@@ -205,10 +205,14 @@ func TestRunAgainstFakeBridgeDir(t *testing.T) {
 					}
 				case "timeoutcmd":
 					resp = remoteproto.ExecResponse{
-						ReqID:      id,
-						Status:     remoteproto.StatusTimeout,
-						ExitCode:   remoteproto.TimeoutExitCode,
-						TimeoutSec: 5,
+						ReqID:           id,
+						Status:          remoteproto.StatusTimeout,
+						ExitCode:        remoteproto.TimeoutExitCode,
+						TimeoutSec:      5,
+						StdoutTruncated: true,
+						StderrTruncated: true,
+						RedactedCount:   2,
+						DroppedOutput:   true,
 					}
 				default:
 					resp = remoteproto.DeniedResponse(id, "use staging")
@@ -240,7 +244,12 @@ func TestRunAgainstFakeBridgeDir(t *testing.T) {
 		Stdout:    &stdout,
 		Stderr:    &stderr,
 	})
-	if rc != remoteproto.TimeoutExitCode || !strings.Contains(stderr.String(), "timed out after 5s") {
+	if rc != remoteproto.TimeoutExitCode ||
+		!strings.Contains(stderr.String(), "timed out after 5s") ||
+		!strings.Contains(stderr.String(), "the remote daemon truncated stdout") ||
+		!strings.Contains(stderr.String(), "the remote daemon truncated stderr") ||
+		!strings.Contains(stderr.String(), "2 secret pattern(s) redacted") ||
+		!strings.Contains(stderr.String(), "output dropped by operator") {
 		t.Fatalf("unexpected timeoutcmd result: rc=%d stderr=%q", rc, stderr.String())
 	}
 

@@ -4086,7 +4086,7 @@ EOF
   chmod 0755 "${emit_bin}"
 
   MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" \
-    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${sbx_live}" --cmd "sleep 180" >"${TEST_ROOT}/rem-vm-run.log" 2>&1 </dev/null &
+    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${sbx_live}" --cmd "echo GUEST_READY; sleep 180" >"${TEST_ROOT}/rem-vm-run.log" 2>&1 </dev/null &
   bg_pid_24=$!
 
   wait_for_sandbox_running "${RUNTIME_MSB_HOME}" "${sbx_live_full}" 60 || {
@@ -4102,6 +4102,19 @@ EOF
   done
   [[ -S "${rsock}" ]] || {
     echo "remote.sock did not appear for ${sbx_live_full}" >&2
+    cat "${TEST_ROOT}/rem-vm-run.log" >&2 || true
+    return 1
+  }
+  i=0
+  while ! grep -Fq "GUEST_READY" "${TEST_ROOT}/rem-vm-run.log" 2>/dev/null && [[ "${i}" -lt 150 ]]; do
+    if ! kill -0 "${bg_pid_24}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
+  grep -Fq "GUEST_READY" "${TEST_ROOT}/rem-vm-run.log" 2>/dev/null || {
+    echo "Guest setup did not finish for ${sbx_live_full}" >&2
     cat "${TEST_ROOT}/rem-vm-run.log" >&2 || true
     return 1
   }

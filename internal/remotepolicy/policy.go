@@ -278,6 +278,9 @@ func ValidateExecutable(exe string) error {
 			return fmt.Errorf("invalid executable %q: omit whitespace and control characters", exe)
 		}
 	}
+	if exe == "." {
+		return fmt.Errorf("invalid executable %q: omit '.' as executable name", exe)
+	}
 	if strings.Contains(exe, "..") {
 		return fmt.Errorf("invalid executable %q: omit '..' segments", exe)
 	}

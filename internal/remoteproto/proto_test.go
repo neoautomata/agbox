@@ -284,6 +284,16 @@ func TestSanitizerAndJSONControlEscaping(t *testing.T) {
 	if IsBinary([]byte("plain utf-8 text\n")) {
 		t.Error("expected plain UTF-8 to be non-binary")
 	}
+
+	// ValidateSafeToken accepts printable ASCII and rejects whitespace, controls, non-ASCII, and BiDi bytes.
+	if err := ValidateSafeToken("rule-1_ok"); err != nil {
+		t.Errorf("expected printable ASCII token to pass, got %v", err)
+	}
+	for _, bad := range []string{"", "has space", "ctrl\x1fid", "del\x7fid", "caf\xc3\xa9", "bidi\u202eid", "raw\xff"} {
+		if err := ValidateSafeToken(bad); err == nil {
+			t.Errorf("expected ValidateSafeToken(%q) to fail", bad)
+		}
+	}
 }
 
 func TestRedactorBaselineAndTruncatedPEM(t *testing.T) {
@@ -335,6 +345,16 @@ func TestRedactorBaselineAndTruncatedPEM(t *testing.T) {
 	}
 	if bytes.Contains(redactedBin, []byte("AKIAIOSFODNN7EXAMPLE")) || bytes.Contains(redactedBin, []byte("topsecret999")) {
 		t.Fatalf("secret leaked across NUL byte boundary: %q", string(redactedBin))
+	}
+
+	// Verify already-redacted placeholder is not double-redacted with a stray trailing bracket.
+	singleOut, singleCount := red.RedactString("password=AKIAIOSFODNN7EXAMPLE")
+	if singleOut != "password=[REDACTED:AWS_KEY]" || singleCount != 1 {
+		t.Fatalf("expected single clean redaction, got out=%q count=%d", singleOut, singleCount)
+	}
+	tokOut, tokCount := red.RedactString("password=ghp_1234567890abcdefghijklmnopqrstuvwxyz")
+	if tokOut != "password=[REDACTED:TOKEN]" || tokCount != 1 {
+		t.Fatalf("expected single clean token redaction, got out=%q count=%d", tokOut, tokCount)
 	}
 }
 

@@ -885,7 +885,7 @@ Options also accept the `--name=NAME` form. A `--` argument ends option parsing.
 | `AGBOX_ROOT_DISK` | `50G` | Default sparse root disk size for `create-base` and `edit-base`. |
 | `AGBOX_PROFILE_DISK` | `10G` | Default `ext4` disk size for `agbox profile create` and `run --profile`. |
 | `AGBOX_MASK_VCS` | `strict` | VCS filter policy: `strict`, `auto`, or `off`. |
-| `AGBOX_REMOTE` | `1` | Set to `0` to disable the remote FUSE bridge by default on `agbox run`. |
+| `AGBOX_REMOTE` | `1` | Set to `0` to disable the remote FUSE bridge by default on `agbox run` and `agbox service add`. |
 | `AGBOX_ALLOW_OUTSIDE_HOME` | `0` | Set to `1` to allow shares outside `$HOME`. The blocklists still apply. |
 | `AGBOX_OPENCODE_VERSION` | `latest` | The npm version or tag of `opencode-ai` for `create-base` and `update`. |
 | `AGBOX_AGY_INSTALLER_URL` | `https://antigravity.google/cli/install.sh` | The `agy` installer URL for `create-base` and `update`. It must use HTTPS. |
@@ -932,4 +932,4 @@ agbox remove --yes
 | `remote bridge requires a static agbox binary` | The host binary links dynamically (`PT_INTERP` present) and cannot run inside the guest. | Rebuild with `CGO_ENABLED=0 go build ./cmd/agbox` (or run `./install.sh`), or pass `--no-remote`. |
 | `interactive TTY required` on `remote serve` or `connect` | Standard input or output is not a terminal (common over plain `ssh`). | Run from an interactive terminal, or pass `ssh -t` when starting `agbox remote serve` over SSH. |
 | Broker switches policy to `DENY-ALL` | Policy hot-reload failed on permissions, symlinks, missing file, or invalid JSON. | Run `chmod 600` on the policy file, fix syntax errors, and check it with `agbox remote policy check`. |
-| `remote bridge requires FUSE` | `/dev/fuse` or `fusermount3` failed while mounting `/home/agent/.agbox-remote`. | Fix FUSE access on the host, or pass `--no-remote` (or set `AGBOX_REMOTE=0`). |
+| `remote FUSE bridge failed` | `/dev/fuse` or `fusermount3` failed while mounting `/home/agent/.agbox-remote`. | Fix FUSE access on the host, or pass `--no-remote` (or set `AGBOX_REMOTE=0`). |
