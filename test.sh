@@ -3340,6 +3340,37 @@ check_08b_remote_bridge_and_loopback() {
   [[ "${deny_rc}" -eq 126 ]] || { echo "Expected exit 126 when unattached, got ${deny_rc}: ${deny_out}" >&2; return 1; }
   assert_contains "${deny_out}" "agbox-remote: command denied" "unattached deny stderr"
 
+  # Verify msb PassthroughFs stat-virt=off create contract (openat + fchmod + fstat) over live FUSE.
+  python3 -c '
+import errno, os, stat, sys
+
+mnt = sys.argv[1]
+slot = "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"
+req_path = os.path.join(mnt, "req", slot)
+fd = os.open(req_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+try:
+    os.fchmod(fd, 0o600)
+    st = os.fstat(fd)
+    assert stat.S_IMODE(st.st_mode) == 0o200, oct(st.st_mode)
+    assert st.st_nlink == 1, st.st_nlink
+    try:
+        os.fchmod(fd, 0o4600)
+        raise AssertionError("expected setuid fchmod to fail")
+    except OSError as e:
+        assert e.errno == errno.EPERM, e
+    os.write(fd, b"{\"version\":1,\"executable\":\"true\"}")
+finally:
+    os.close(fd)
+try:
+    try:
+        os.chmod(req_path, 0o600)
+        raise AssertionError("expected post-flush chmod to fail")
+    except OSError as e:
+        assert e.errno == errno.EROFS, e
+finally:
+    os.unlink(req_path)
+' "${mnt}" || { echo "Remote bridge stat-virt=off fchmod contract check failed" >&2; return 1; }
+
   # Initialize and check starter policy.
   AGBOX_DATA_DIR="${rdata}" with_timeout 15 agbox_exec "${TEST_BIN}" remote policy init --output "${pol}" >/dev/null
   AGBOX_DATA_DIR="${rdata}" with_timeout 15 agbox_exec "${TEST_BIN}" remote policy check "${pol}" >/dev/null

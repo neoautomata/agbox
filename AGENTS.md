@@ -166,10 +166,11 @@ flowchart TD
 
 ## 3. Upstream `msb` contracts
 
-Changes in `internal/msb`, `internal/cli`, or `internal/vcsfuse` must respect these `msb` behaviors:
+Changes in `internal/msb`, `internal/cli`, `internal/vcsfuse`, or `internal/remotebridge` must respect these `msb` behaviors:
 
 - **Streaming and user.** A non-TTY `msb exec` hides child output unless you pass `--stream`. `--stream` fails unless you pipe stdin or pass `--no-stdin`. Always pass `-u root` or `-u agent`.
 - **`stat-virt` modes.** `msb snap restore -v` defaults to `stat-virt=strict`. It probes mount roots with `setxattr` and fails with `EROFS` on `/workspace`. Mount `/workspace` with `:rw,stat-virt=off` and no `uid=` or `gid=`. Mount read-only caches with `:ro,stat-virt=relaxed,uid=1000,gid=1000`.
+- **`stat-virt=off` file create.** `msb` `PassthroughFs` runs `fchmod` immediately after `openat(O_CREAT|O_EXCL)` on `stat-virt=off` mounts. On Linux, FUSE omits `FATTR_FH` for `fchmod`. Any writable FUSE file node under `stat-virt=off` (including `remotebridge` `req/<id>`) must implement `NodeSetattrer` and handle `FATTR_MODE` when the file handle is `nil`.
 - **Disk volumes.** `msb snap restore -v` forces `VolumeKind::Directory`. It rejects `--kind disk` volumes such as `agbox-profile-<name>`. Attach profile disks with `--mount-disk <disk.raw>:<guest>:rw,format=raw,fstype=ext4`.
 - **Guest flush.** Run `msb stop -t 10` before `msb rm -f` (`destroySandbox`) when a sandbox has a profile disk. This flushes guest pages and the journal to `disk.raw`. `agbox stop` writes a `deleting` marker in `$DATA_DIR/run/<id>`. Other sessions then skip the duplicate teardown. `destroySandbox` treats `sandbox not found` as success.
 - **Snapshots.** `msb snap rm` refuses to delete the current head while other members exist in the snapshot group. It also refuses to delete a parent with child snapshots unless you pass `--force`. `msb snap reindex` never prunes missing rows from SQLite. `agbox remove` deletes `agbox:v*` snapshots newest-first with `--force`. On a current-head error, it switches the head with `msb snap head <member>` and retries. It deletes `$MSB_HOME/snapshots/agbox` only after `msb snap rm` succeeds for every `agbox:v*` snapshot and zero other members remain.

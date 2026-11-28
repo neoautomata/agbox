@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -345,11 +346,35 @@ func TestBridgeLiveFUSEAndBrokerAttach(t *testing.T) {
 		_ = f.Close()
 		t.Fatalf("fchmod on req file failed: %v", err)
 	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("fstat on req file failed: %v", err)
+	}
+	if fi.Mode().Perm() != 0o200 {
+		_ = f.Close()
+		t.Fatalf("expected req file perm 0200 after fchmod, got %04o", fi.Mode().Perm())
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Nlink != 1 {
+		_ = f.Close()
+		t.Fatalf("expected req file Nlink=1, got %+v", fi.Sys())
+	}
+	if err := f.Chmod(os.ModeSetuid | 0o600); !errors.Is(err, syscall.EPERM) {
+		_ = f.Close()
+		t.Fatalf("expected EPERM for setuid fchmod on req file, got %v", err)
+	}
+	if err := f.Truncate(16); !errors.Is(err, syscall.EPERM) {
+		_ = f.Close()
+		t.Fatalf("expected EPERM for non-zero ftruncate on req file, got %v", err)
+	}
 	if _, err := f.Write(rawReq); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Chmod(reqPath, 0o600); !errors.Is(err, syscall.EROFS) {
+		t.Fatalf("expected EROFS for chmod after flush, got %v", err)
 	}
 
 	// Wait for slotID in done/.
