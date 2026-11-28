@@ -4155,14 +4155,17 @@ def read_until(mfd, pattern, buf, timeout=30.0):
 
 srv_p, srv_fd = spawn_pty(base_cmd + ["remote", "serve", "--listen", "127.0.0.1:0", "--allow-from", "127.0.0.1/32", "--allow-cwd", rwork], cwd=rwork)
 brk_p, brk_fd = None, None
+p_guest = None
+srv_buf = ""
+brk_buf = ""
 try:
-    srv_buf, m_addr = read_until(srv_fd, r"127\.0\.0\.1:(\d+)", "")
+    srv_buf, m_addr = read_until(srv_fd, r"127\.0\.0\.1:(\d+)", srv_buf)
     addr = m_addr.group(0)
 
     brk_p, brk_fd = spawn_pty(base_cmd + ["remote", "connect", "--sandbox", sbx_full, "--no-policy", "--output-review", addr])
     sas_pat = r"([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4})"
     srv_buf, m_srv_sas = read_until(srv_fd, sas_pat, srv_buf)
-    brk_buf, m_brk_sas = read_until(brk_fd, sas_pat, "")
+    brk_buf, m_brk_sas = read_until(brk_fd, sas_pat, brk_buf)
     assert m_srv_sas.group(1) == m_brk_sas.group(1), (m_srv_sas.group(1), m_brk_sas.group(1))
 
     os.write(srv_fd, b"y\n")
@@ -4170,7 +4173,7 @@ try:
     brk_buf, m_att = read_until(brk_fd, r"Attached to sandbox", brk_buf)
     brk_buf = brk_buf[m_att.end():]
 
-    guest_cmd = [msb_bin, "exec", "--stream", "--no-stdin", "-u", "agent", sbx_full, "--", "agbox-remote", "--cwd", rwork, emit_bin]
+    guest_cmd = [msb_bin, "exec", "--stream", "--no-stdin", "-u", "agent", sbx_full, "--", "/usr/local/bin/agbox-remote", "--cwd", rwork, emit_bin]
     p_guest = subprocess.Popen(guest_cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     # Phase 1: pause >2s before approving to exercise adaptive done/ polling across virtiofs.
@@ -4195,7 +4198,28 @@ try:
 
     os.write(brk_fd, b"q\n")
     brk_p.wait(timeout=10)
+except Exception:
+    if p_guest is not None:
+        g_rc = p_guest.poll()
+        g_out_d, g_err_d = "", ""
+        if g_rc is not None:
+            try:
+                g_out_d, g_err_d = p_guest.communicate(timeout=2)
+            except Exception:
+                pass
+        sys.stderr.write(f"--- GUEST (rc={g_rc}) ---\nstdout: {g_out_d!r}\nstderr: {g_err_d!r}\n")
+    sys.stderr.write(f"--- SRV ---\n{srv_buf}\n")
+    raise
 finally:
+    if p_guest is not None and p_guest.poll() is None:
+        try:
+            p_guest.terminate()
+            p_guest.wait(timeout=5)
+        except Exception:
+            try:
+                p_guest.kill()
+            except OSError:
+                pass
     for p, fd in ((brk_p, brk_fd), (srv_p, srv_fd)):
         if p is not None and p.poll() is None:
             try:

@@ -480,6 +480,49 @@ func (b *Bridge) createSlot(id string) (*reqSlot, *reqFileHandle, syscall.Errno)
 	return sl, fh, 0
 }
 
+func (b *Bridge) setattrSlot(id string, h *reqFileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var sl *reqSlot
+	if h != nil {
+		if h.revoked || h.slot == nil || h.slot.revoked {
+			return syscall.ESTALE
+		}
+		sl = h.slot
+	} else {
+		var ok bool
+		sl, ok = b.slots[id]
+		if !ok || sl.revoked {
+			return syscall.ESTALE
+		}
+	}
+	if sl.state != slotDraft {
+		return syscall.EROFS
+	}
+	if in != nil {
+		if in.Valid&(fuse.FATTR_UID|fuse.FATTR_GID) != 0 {
+			return syscall.EPERM
+		}
+		if in.Valid&fuse.FATTR_SIZE != 0 {
+			if in.Size != 0 || len(sl.reqBuf) != 0 {
+				return syscall.EPERM
+			}
+		}
+		if in.Valid&fuse.FATTR_MODE != 0 {
+			if in.Mode&(syscall.S_ISUID|syscall.S_ISGID) != 0 {
+				return syscall.EPERM
+			}
+		}
+	}
+	out.Mode = fuse.S_IFREG | 0o200
+	out.Size = uint64(len(sl.reqBuf))
+	out.Nlink = 1
+	out.Uid = b.opts.GuestUID
+	out.Gid = b.opts.GuestGID
+	out.SetTimeout(0)
+	return 0
+}
+
 func (b *Bridge) writeSlot(h *reqFileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -882,9 +925,15 @@ func (n *reqDirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	out.SetAttrTimeout(0)
 	n.b.mu.Lock()
 	sl, ok := n.b.slots[name]
-	var ino uint64
-	if ok {
+	var (
+		ino  uint64
+		size uint64
+	)
+	if ok && !sl.revoked {
 		ino = sl.ino
+		size = uint64(len(sl.reqBuf))
+	} else {
+		ok = false
 	}
 	n.b.mu.Unlock()
 	if !ok {
@@ -892,6 +941,8 @@ func (n *reqDirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	}
 	child := &reqFileNode{b: n.b, id: name}
 	out.Attr.Mode = fuse.S_IFREG | 0o200
+	out.Attr.Size = size
+	out.Attr.Nlink = 1
 	out.Attr.Uid = n.b.opts.GuestUID
 	out.Attr.Gid = n.b.opts.GuestGID
 	return n.NewInode(ctx, child, fs.StableAttr{Mode: fuse.S_IFREG, Ino: ino}), 0
@@ -911,6 +962,7 @@ func (n *reqDirNode) Create(ctx context.Context, name string, flags uint32, _ ui
 
 	child := &reqFileNode{b: n.b, id: name}
 	out.Attr.Mode = fuse.S_IFREG | 0o200
+	out.Attr.Nlink = 1
 	out.Attr.Uid = n.b.opts.GuestUID
 	out.Attr.Gid = n.b.opts.GuestGID
 	inode := n.NewInode(ctx, child, fs.StableAttr{Mode: fuse.S_IFREG, Ino: sl.ino})
@@ -947,12 +999,38 @@ type reqFileNode struct {
 	id string
 }
 
+var _ = (fs.NodeSetattrer)((*reqFileNode)(nil))
+
 func (n *reqFileNode) Getattr(_ context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	n.b.mu.Lock()
+	sl, ok := n.b.slots[n.id]
+	if !ok || sl.revoked {
+		n.b.mu.Unlock()
+		return syscall.ESTALE
+	}
+	sz := uint64(len(sl.reqBuf))
+	n.b.mu.Unlock()
 	out.Mode = fuse.S_IFREG | 0o200
+	out.Size = sz
+	out.Nlink = 1
 	out.Uid = n.b.opts.GuestUID
 	out.Gid = n.b.opts.GuestGID
 	out.SetTimeout(0)
 	return 0
+}
+
+// Setattr accepts fchmod on an active draft slot so virtiofs stat-virt=off create succeeds.
+// Linux FUSE omits FATTR_FH on fchmod, so f may be nil.
+func (n *reqFileNode) Setattr(_ context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	var fh *reqFileHandle
+	if f != nil {
+		var ok bool
+		fh, ok = f.(*reqFileHandle)
+		if !ok {
+			return syscall.EPERM
+		}
+	}
+	return n.b.setattrSlot(n.id, fh, in, out)
 }
 
 func (n *reqFileNode) Open(_ context.Context, _ uint32) (fs.FileHandle, uint32, syscall.Errno) {
@@ -964,6 +1042,12 @@ type reqFileHandle struct {
 	b       *Bridge
 	slot    *reqSlot
 	revoked bool
+}
+
+var _ = (fs.FileSetattrer)((*reqFileHandle)(nil))
+
+func (h *reqFileHandle) Setattr(_ context.Context, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	return h.b.setattrSlot("", h, in, out)
 }
 
 func (h *reqFileHandle) Write(_ context.Context, data []byte, off int64) (uint32, syscall.Errno) {
@@ -1032,6 +1116,7 @@ func (n *doneDirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOu
 	child := &doneFileNode{b: n.b, id: name}
 	out.Attr.Mode = fuse.S_IFREG | 0o400
 	out.Attr.Size = 0
+	out.Attr.Nlink = 1
 	out.Attr.Uid = n.b.opts.GuestUID
 	out.Attr.Gid = n.b.opts.GuestGID
 	return n.NewInode(ctx, child, fs.StableAttr{Mode: fuse.S_IFREG, Ino: ino}), 0
@@ -1119,6 +1204,7 @@ func (n *respDirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOu
 	child := &respFileNode{b: n.b, id: name, size: size}
 	out.Attr.Mode = fuse.S_IFREG | 0o400
 	out.Attr.Size = size
+	out.Attr.Nlink = 1
 	out.Attr.Uid = n.b.opts.GuestUID
 	out.Attr.Gid = n.b.opts.GuestGID
 	return n.NewInode(ctx, child, fs.StableAttr{Mode: fuse.S_IFREG, Ino: ino}), 0

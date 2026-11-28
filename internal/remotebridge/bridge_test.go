@@ -116,13 +116,52 @@ func TestBridgeSlotCapsHandleRevocationAndTTL(t *testing.T) {
 		t.Fatalf("expected EFBIG for oversized request, got %v", errno)
 	}
 
+	// Valid fchmod on an active draft slot succeeds with or without FATTR_FH and keeps mode 0200.
+	var attrOut fuse.AttrOut
+	if errno := handles[0].Setattr(context.Background(), &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_MODE, Mode: 0o600},
+	}, &attrOut); errno != 0 || attrOut.Mode != fuse.S_IFREG|0o200 || attrOut.Nlink != 1 {
+		t.Fatalf("expected draft handle fchmod to succeed with mode 0200, got errno=%v attr=%+v", errno, attrOut)
+	}
+	if errno := (&reqFileNode{b: b, id: ids[0]}).Setattr(context.Background(), nil, &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_MODE, Mode: 0o600},
+	}, &attrOut); errno != 0 || attrOut.Mode != fuse.S_IFREG|0o200 || attrOut.Nlink != 1 {
+		t.Fatalf("expected draft node fchmod (nil fh) to succeed with mode 0200, got errno=%v attr=%+v", errno, attrOut)
+	}
+	// Setuid, chown, and non-zero truncate fail with EPERM.
+	if errno := handles[0].Setattr(context.Background(), &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_MODE, Mode: syscall.S_ISUID | 0o600},
+	}, &attrOut); errno != syscall.EPERM {
+		t.Fatalf("expected EPERM for setuid fchmod, got %v", errno)
+	}
+	if errno := handles[0].Setattr(context.Background(), &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_UID, Owner: fuse.Owner{Uid: 0}},
+	}, &attrOut); errno != syscall.EPERM {
+		t.Fatalf("expected EPERM for chown Setattr, got %v", errno)
+	}
+	if errno := handles[0].Setattr(context.Background(), &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_SIZE, Size: 16},
+	}, &attrOut); errno != syscall.EPERM {
+		t.Fatalf("expected EPERM for non-zero truncate Setattr, got %v", errno)
+	}
+
 	// Valid write + atomic single-Flush commit.
 	reqBytes, _ := json.Marshal(remoteproto.GuestRequest{Version: 1, Executable: "uname", Args: []string{"-a"}})
 	if _, errno := b.writeSlot(handles[0], reqBytes, 0); errno != 0 {
 		t.Fatalf("writeSlot failed: %v", errno)
 	}
+	if errno := handles[0].Setattr(context.Background(), &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_SIZE, Size: 0},
+	}, &attrOut); errno != syscall.EPERM {
+		t.Fatalf("expected EPERM for truncate after write, got %v", errno)
+	}
 	if errno := b.flushSlot(handles[0]); errno != 0 {
 		t.Fatalf("first flushSlot failed: %v", errno)
+	}
+	if errno := handles[0].Setattr(context.Background(), &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_MODE, Mode: 0o600},
+	}, &attrOut); errno != syscall.EROFS {
+		t.Fatalf("expected EROFS for Setattr after flush, got %v", errno)
 	}
 	// Second Flush is a no-op. Subsequent Write returns EROFS.
 	if errno := b.flushSlot(handles[0]); errno != 0 {
@@ -164,6 +203,14 @@ func TestBridgeSlotCapsHandleRevocationAndTTL(t *testing.T) {
 
 	if errno := b.unlinkSlot(ids[0]); errno != 0 {
 		t.Fatalf("unlinkSlot failed: %v", errno)
+	}
+	if errno := handles[0].Setattr(context.Background(), &fuse.SetAttrIn{
+		SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_MODE, Mode: 0o600},
+	}, &attrOut); errno != syscall.ESTALE {
+		t.Fatalf("expected ESTALE for revoked reqFileHandle.Setattr, got %v", errno)
+	}
+	if errno := (&reqFileNode{b: b, id: ids[0]}).Getattr(context.Background(), nil, &attrOut); errno != syscall.ESTALE {
+		t.Fatalf("expected ESTALE for revoked reqFileNode.Getattr, got %v", errno)
 	}
 	buf := make([]byte, 64)
 	if _, errno := rh.Read(context.Background(), buf, 0); errno != syscall.ESTALE {
@@ -289,9 +336,14 @@ func TestBridgeLiveFUSEAndBrokerAttach(t *testing.T) {
 	slotID := "abcdef0123456789abcdef0123456789"
 	reqPath := filepath.Join(mntDir, "req", slotID)
 	rawReq, _ := json.Marshal(remoteproto.GuestRequest{Version: 1, Executable: "echo", Args: []string{"hi"}})
-	f, err := os.OpenFile(reqPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o200)
+	f, err := os.OpenFile(reqPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatalf("create req file failed: %v", err)
+	}
+	// Verify fchmod on the newly created req handle succeeds (matches msb PassthroughFs stat-virt=off).
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		t.Fatalf("fchmod on req file failed: %v", err)
 	}
 	if _, err := f.Write(rawReq); err != nil {
 		t.Fatal(err)
