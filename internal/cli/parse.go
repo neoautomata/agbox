@@ -373,6 +373,8 @@ type runOpts struct {
 	NoSkills        bool
 	NoRules         bool
 	NoAgentCache    bool
+	Remote          bool
+	NoRemote        bool
 	Supervised      bool
 }
 
@@ -592,6 +594,10 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			opts.NoRules = true
 		case "--no-agent-cache", "--no-agent-override":
 			opts.NoAgentCache = true
+		case "--remote":
+			opts.Remote = true
+		case "--no-remote":
+			opts.NoRemote = true
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return runOpts{}, fmt.Errorf("unknown run option: %s ('agbox run --help')", arg)
@@ -617,6 +623,9 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	}
 	if opts.MaskMode == config.MaskOff && opts.ShareHub {
 		return runOpts{}, errors.New("conflicting options: cannot combine --no-mask and --share-hub")
+	}
+	if opts.Remote && opts.NoRemote {
+		return runOpts{}, errors.New("conflicting options: cannot combine --remote and --no-remote")
 	}
 	opts.LockAccess = sawRO || sawRW
 	opts.LockVCS = sawMaskVCS || sawVCS || sawVCSHooks
@@ -1465,6 +1474,10 @@ func dataDirSupportsFilter(dataDir string) bool {
 		}
 	}
 	return true
+}
+
+func dataDirSupportsRemoteBridge(dataDir string) bool {
+	return dataDirSupportsFilter(dataDir) && !strings.ContainsAny(dataDir, ":,")
 }
 
 func isValidMemorySpec(spec string) bool {

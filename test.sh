@@ -440,7 +440,7 @@ unmount_tree() {
   local pidf=""
   while IFS= read -r -d '' pidf; do
     stop_filter_pidfile "${pidf}" TERM
-  done < <(find "${root_dir}" -type f \( -name 'ws.pid' -o -name 'm*.pid' \) -print0 2>/dev/null)
+  done < <(find "${root_dir}" -type f \( -name 'ws.pid' -o -name 'remote.pid' -o -name 'm*.pid' \) -print0 2>/dev/null)
 
   local fm=""
   fm="$(resolve_fusermount_bin 2>/dev/null || true)"
@@ -457,7 +457,7 @@ unmount_tree() {
   if [[ -n "$(list_active_mounts_under "${root_dir}")" ]]; then
     while IFS= read -r -d '' pidf; do
       stop_filter_pidfile "${pidf}" KILL
-    done < <(find "${root_dir}" -type f \( -name 'ws.pid' -o -name 'm*.pid' \) -print0 2>/dev/null)
+    done < <(find "${root_dir}" -type f \( -name 'ws.pid' -o -name 'remote.pid' -o -name 'm*.pid' \) -print0 2>/dev/null)
     while IFS= read -r mp; do
       [[ -n "${mp}" ]] || continue
       if [[ -n "${fm}" ]]; then
@@ -1117,7 +1117,7 @@ build_test_binaries() {
 
   (
     cd "${REPO_DIR}"
-    go_exec build -o "${TEST_BIN}" ./cmd/agbox
+    CGO_ENABLED=0 go_exec build -o "${TEST_BIN}" ./cmd/agbox
   )
   chmod 0755 "${TEST_BIN}"
 
@@ -1499,10 +1499,14 @@ check_05_cli_help_and_categories() {
   local help_out=""
   help_out="$(with_timeout 15 agbox_exec "${TEST_BIN}" --help)"
   assert_contains "${help_out}" "Usage: agbox" "global --help"
-  for sub in setup completion create-base edit-base update auth skills rules profile share service run suspend resume stop remove status; do
+  for sub in setup completion create-base edit-base update auth skills rules profile share service remote run suspend resume stop remove status; do
     help_out="$(with_timeout 15 agbox_exec "${TEST_BIN}" "${sub}" --help)"
     assert_contains "${help_out}" "Usage:" "${sub} --help"
     assert_contains "${help_out}" "agbox ${sub}" "${sub} --help command line"
+  done
+  for sub in serve connect policy; do
+    help_out="$(with_timeout 15 agbox_exec "${TEST_BIN}" remote "${sub}" --help)"
+    assert_contains "${help_out}" "agbox remote" "remote ${sub} --help"
   done
 
   local cats_out=""
@@ -1522,9 +1526,10 @@ check_05_cli_help_and_categories() {
   [[ "${rc}" -ne 0 ]] || { echo "Expected --bogus-flag to fail" >&2; return 1; }
   assert_contains "${err_out}" "[agbox] ERROR:" "--bogus-flag stderr"
 
-  # Check install.sh --help includes --skip-setup and --skip-completion.
+  # Check install.sh --help includes --remote-only, --skip-setup, and --skip-completion.
   local inst_help=""
   inst_help="$("${REPO_DIR}/install.sh" --help)"
+  assert_contains "${inst_help}" "--remote-only" "install.sh --help contains --remote-only"
   assert_contains "${inst_help}" "--skip-setup" "install.sh --help contains --skip-setup"
   assert_contains "${inst_help}" "--skip-completion" "install.sh --help contains --skip-completion"
 
@@ -1577,6 +1582,10 @@ check_05_cli_help_and_categories() {
       COMP_CWORD=3
       _agbox_completions
       printf "svc_name=%s\n" "${COMPREPLY[*]}"
+      COMP_WORDS=("$2" "remote" "")
+      COMP_CWORD=2
+      _agbox_completions
+      printf "rem_act=%s\n" "${COMPREPLY[*]}"
     ' _ "${comp_script}" "${TEST_BIN}"
   )"
   assert_contains "${comp_check}" "mode=completion" "bash completion mode"
@@ -1596,6 +1605,11 @@ check_05_cli_help_and_categories() {
   assert_contains "${svc_flags_line}" "--serve" "bash completion service add flags (--serve)"
   assert_contains "${svc_flags_line}" "--no-net" "bash completion service add flags (--no-net)"
   assert_contains "${comp_check}" "svc_name=mybox" "bash completion service name"
+  local rem_act_line=""
+  rem_act_line="$(grep '^rem_act=' <<< "${comp_check}" || true)"
+  assert_contains "${rem_act_line}" "serve" "bash completion remote actions (serve)"
+  assert_contains "${rem_act_line}" "connect" "bash completion remote actions (connect)"
+  assert_contains "${rem_act_line}" "policy" "bash completion remote actions (policy)"
 
   # Check agbox --version and agbox version.
   local ver_out=""
@@ -1673,6 +1687,14 @@ check_06_security_validation_and_tamper_checks() {
     "service add mybox --no-net --net public --cmd true|cannot combine --no-net"
     "service add base --remote-control|reserved for agbox-base"
     "service add run-123 --remote-control|names matching run-<digits> are reserved"
+    "run --remote --no-remote ${TEST_ROOT}/sec-src|cannot combine --remote and --no-remote"
+    "service add mybox --remote --no-remote --cmd true|cannot combine --remote and --no-remote"
+    "remote serve --pass-env LD_PRELOAD|refusing dangerous --pass-env"
+    "remote serve --listen 127.0.0.1:8080 --port 9090|cannot combine --listen IP:PORT with --port"
+    "remote serve --allow-from ,|empty IP or CIDR entry"
+    "remote connect --policy /tmp/a --no-policy 127.0.0.1:9000|cannot combine --policy and --no-policy"
+    "remote connect --sandbox agbox-base 127.0.0.1:9000|it is the base sandbox"
+    "remote policy check --policy /tmp/a /tmp/b|conflicting policy path"
   )
   local spec=""
   local cmd_part=""
@@ -1744,6 +1766,74 @@ EOF
   assert_contains "${err_out}" "Refusing to overwrite symlink" "install.sh symlink target refusal"
   [[ -L "${inst_target_dir}/agbox" ]] || { echo "Expected symlink at install target to stay untouched" >&2; return 1; }
   rm -rf "${inst_target_dir}" "${inst_mock_bin}"
+
+  # Check that install.sh --remote-only --skip-completion works without msb or fusermount3 and installs a static ELF.
+  local inst_ro_dir="${TEST_ROOT}/sec-install-ro-bin"
+  local inst_ro_data="${TEST_ROOT}/sec-install-ro-data"
+  local inst_ro_home="${TEST_ROOT}/sec-install-ro-home"
+  local inst_ro_path="${TEST_ROOT}/sec-install-ro-path"
+  rm -rf "${inst_ro_dir}" "${inst_ro_data}" "${inst_ro_home}" "${inst_ro_path}"
+  mkdir -p "${inst_ro_dir}" "${inst_ro_data}" "${inst_ro_home}" "${inst_ro_path}"
+  chmod 0700 "${inst_ro_dir}" "${inst_ro_data}" "${inst_ro_home}" "${inst_ro_path}"
+  local ro_tool=""
+  local ro_src=""
+  for ro_tool in bash sh go id getent cut dirname pwd mkdir mktemp install mv rm chmod awk tr env cat; do
+    ro_src="$(command -v "${ro_tool}" 2>/dev/null || true)"
+    if [[ -n "${ro_src}" ]]; then
+      ln -s "${ro_src}" "${inst_ro_path}/${ro_tool}"
+    fi
+  done
+  local ro_gocache=""
+  local ro_gopath=""
+  local ro_gomodcache=""
+  ro_gocache="$(go env GOCACHE)"
+  ro_gopath="$(go env GOPATH)"
+  ro_gomodcache="$(go env GOMODCACHE)"
+  local -a inst_ro_args=(--remote-only --skip-completion)
+  if [[ "${ALLOW_ROOT}" -eq 1 ]]; then
+    inst_ro_args+=(--allow-root)
+  fi
+  local ro_out=""
+  rc=0
+  ro_out="$(
+    with_timeout 120 env \
+      HOME="${inst_ro_home}" \
+      GOCACHE="${ro_gocache}" \
+      GOPATH="${ro_gopath}" \
+      GOMODCACHE="${ro_gomodcache}" \
+      AGBOX_DATA_DIR="${inst_ro_data}" \
+      AGBOX_INSTALL_DIR="${inst_ro_dir}" \
+      PATH="${inst_ro_path}" \
+      "${REPO_DIR}/install.sh" "${inst_ro_args[@]}" 2>&1
+  )" || rc=$?
+  [[ "${rc}" -eq 0 ]] || { echo "Expected install.sh --remote-only to succeed (rc=${rc}): ${ro_out}" >&2; return 1; }
+  assert_contains "${ro_out}" "Remote-only install (--remote-only)" "install.sh --remote-only log"
+  assert_contains "${ro_out}" "Skipping 'agbox setup' (--remote-only)" "install.sh --remote-only skips setup"
+  [[ -x "${inst_ro_dir}/agbox" && ! -L "${inst_ro_dir}/agbox" ]] || { echo "Expected executable binary at ${inst_ro_dir}/agbox" >&2; return 1; }
+  [[ ! -e "${inst_ro_data}/rules" ]] || { echo "Expected --remote-only not to install rules" >&2; return 1; }
+  python3 -c '
+import struct, sys
+with open(sys.argv[1], "rb") as f:
+    hdr = f.read(64)
+    assert hdr[:4] == b"\x7fELF", "not an ELF binary"
+    ei_class = hdr[4]
+    ei_data = hdr[5]
+    endian = "<" if ei_data == 1 else ">"
+    if ei_class == 2:
+        e_phoff = struct.unpack(endian + "Q", hdr[32:40])[0]
+        e_phentsize, e_phnum = struct.unpack(endian + "HH", hdr[54:58])
+    else:
+        e_phoff = struct.unpack(endian + "I", hdr[28:32])[0]
+        e_phentsize, e_phnum = struct.unpack(endian + "HH", hdr[42:44])
+    for i in range(e_phnum):
+        f.seek(e_phoff + i * e_phentsize)
+        p_type = struct.unpack(endian + "I", f.read(4))[0]
+        assert p_type != 3, "binary contains PT_INTERP (dynamic ELF)"
+' "${inst_ro_dir}/agbox" || { echo "Expected static ELF binary from install.sh --remote-only" >&2; return 1; }
+  local ro_help=""
+  ro_help="$(with_timeout 15 agbox_exec "${inst_ro_dir}/agbox" remote --help)"
+  assert_contains "${ro_help}" "agbox remote serve" "--remote-only binary remote --help"
+  rm -rf "${inst_ro_dir}" "${inst_ro_data}" "${inst_ro_home}" "${inst_ro_path}"
 
   rc=0
   err_out="$(AGBOX_MASK_VCS=off AGBOX_DATA_DIR="${sec_data}" with_timeout 15 agbox_exec "${TEST_BIN}" run --share-hub "${TEST_ROOT}/sec-src" 2>&1)" || rc=$?
@@ -3159,6 +3249,250 @@ finally:
   fi
 }
 
+check_08b_remote_bridge_and_loopback() {
+  build_test_binaries
+
+  if [[ ! -r /dev/fuse || ! -w /dev/fuse ]]; then
+    if [[ "${SKIP_VM}" -eq 1 ]]; then
+      skip_check "/dev/fuse is not accessible by uid ${EUID_VAL}"
+    fi
+    echo "/dev/fuse is not accessible by uid ${EUID_VAL}" >&2
+    return 1
+  fi
+
+  local fm=""
+  fm="$(resolve_fusermount_bin 2>/dev/null || true)"
+  if [[ "${EUID_VAL}" -ne 0 && -z "${fm}" ]]; then
+    if [[ "${SKIP_VM}" -eq 1 ]]; then
+      skip_check "fusermount3/fusermount is not installed"
+    fi
+    echo "fusermount3/fusermount is required for unprivileged FUSE mounts" >&2
+    return 1
+  fi
+
+  rbase="${TEST_ROOT}/remote-bridge-test"
+  local rdata="${rbase}/data"
+  local rrun="${rdata}/run/e2e"
+  local mnt="${rrun}/remote"
+  local sock="${rrun}/remote.sock"
+  local pidfile="${rrun}/remote.pid"
+  local pol="${rbase}/policy.json"
+  local rwork="${rbase}/work"
+  local bridge_log="${rbase}/bridge.log"
+
+  rm -rf "${rbase}"
+  mkdir -p "${rrun}" "${mnt}" "${rwork}"
+  chmod 0700 "${rbase}" "${rdata}" "${rdata}/run" "${rrun}" "${mnt}" "${rwork}"
+  printf '{"sandbox":"agbox-e2e","owner_pid":%d,"remote_bridge":true}\n' "$$" > "${rrun}/run.meta"
+  chmod 0600 "${rrun}/run.meta"
+
+  bridge_pid=""
+  cleanup_remote_bridge_check() {
+    if [[ -n "${bridge_pid:-}" ]]; then
+      kill -TERM "${bridge_pid}" 2>/dev/null || true
+      wait "${bridge_pid}" 2>/dev/null || true
+    fi
+    if [[ -n "${rbase:-}" ]]; then
+      unmount_tree "${rbase}"
+    fi
+  }
+  trap cleanup_remote_bridge_check EXIT
+
+  "${TEST_BIN}" __filter -bridge -mnt "${mnt}" -sock "${sock}" -guest-uid "${EUID_VAL}" -guest-gid "$(id -g)" >"${bridge_log}" 2>&1 </dev/null &
+  bridge_pid=$!
+  printf '%d\n' "${bridge_pid}" > "${pidfile}"
+  chmod 0600 "${pidfile}"
+
+  local mounted=0
+  local i=0
+  while [[ "${i}" -lt 30 ]]; do
+    if [[ -n "$(list_active_mounts_under "${mnt}")" && -S "${sock}" ]]; then
+      mounted=1
+      break
+    fi
+    if ! kill -0 "${bridge_pid}" 2>/dev/null; then
+      echo "Remote bridge exited early:" >&2
+      cat "${bridge_log}" >&2 || true
+      return 1
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
+  if [[ "${mounted}" -ne 1 ]]; then
+    echo "Timed out waiting for remote bridge mount:" >&2
+    cat "${bridge_log}" >&2 || true
+    return 1
+  fi
+
+  # Verify INSTRUCTIONS.md and direct execve of the FUSE-served static ELF agbox-remote.
+  local instr_txt=""
+  instr_txt="$(cat "${mnt}/INSTRUCTIONS.md")"
+  assert_contains "${instr_txt}" "agbox-remote" "bridge INSTRUCTIONS.md"
+
+  local help_rc=0
+  "${mnt}/bin/agbox-remote" --help >/dev/null 2>&1 || help_rc=$?
+  [[ "${help_rc}" -eq 0 ]] || { echo "Expected execve of ${mnt}/bin/agbox-remote --help to exit 0, got ${help_rc}" >&2; return 1; }
+
+  # Unattached bridge returns uniform exit 126.
+  local deny_out=""
+  local deny_rc=0
+  deny_out="$(AGBOX_REMOTE_DIR="${mnt}" with_timeout 15 "${mnt}/bin/agbox-remote" uname -a 2>&1)" || deny_rc=$?
+  [[ "${deny_rc}" -eq 126 ]] || { echo "Expected exit 126 when unattached, got ${deny_rc}: ${deny_out}" >&2; return 1; }
+  assert_contains "${deny_out}" "agbox-remote: command denied" "unattached deny stderr"
+
+  # Initialize and check starter policy.
+  AGBOX_DATA_DIR="${rdata}" with_timeout 15 agbox_exec "${TEST_BIN}" remote policy init --output "${pol}" >/dev/null
+  AGBOX_DATA_DIR="${rdata}" with_timeout 15 agbox_exec "${TEST_BIN}" remote policy check "${pol}" >/dev/null
+
+  # Exercise full PTY pairing (no test-only bypass flags), allow, deny, ask + redaction, and fail-closed reload.
+  python3 -c '
+import os, pty, re, select, signal, subprocess, sys, time
+
+test_bin, mnt, rdata, pol, rwork, allow_root = sys.argv[1:7]
+base_cmd = [test_bin] + (["--allow-root"] if allow_root == "1" else [])
+client_bin = os.path.join(mnt, "bin", "agbox-remote")
+
+env = os.environ.copy()
+env["AGBOX_DATA_DIR"] = rdata
+env["AGBOX_REMOTE_DIR"] = mnt
+
+def spawn_pty(cmd, cwd=None):
+    mfd, sfd = pty.openpty()
+    p = subprocess.Popen(cmd, stdin=sfd, stdout=sfd, stderr=sfd, env=env, cwd=cwd, close_fds=True, start_new_session=True)
+    os.close(sfd)
+    return p, mfd
+
+def read_until(mfd, pattern, buf, timeout=15.0):
+    rx = re.compile(pattern)
+    end = time.time() + timeout
+    while time.time() < end:
+        m = rx.search(buf)
+        if m:
+            return buf, m
+        r, _, _ = select.select([mfd], [], [], 0.1)
+        if r:
+            try:
+                chunk = os.read(mfd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+    raise RuntimeError(f"timeout waiting for {pattern!r}, got:\n{buf}")
+
+def drain_fd(mfd, buf, wait=0.3):
+    end = time.time() + wait
+    while time.time() < end:
+        r, _, _ = select.select([mfd], [], [], 0.05)
+        if not r:
+            continue
+        try:
+            chunk = os.read(mfd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk.decode("utf-8", "replace")
+    return buf
+
+srv_p, srv_fd = spawn_pty(base_cmd + ["remote", "serve", "--listen", "127.0.0.1:0", "--allow-from", "127.0.0.1/32", "--allow-cwd", rwork], cwd=rwork)
+brk_p, brk_fd = None, None
+try:
+    srv_buf, m_addr = read_until(srv_fd, r"127\.0\.0\.1:(\d+)", "")
+    addr = m_addr.group(0)
+
+    brk_p, brk_fd = spawn_pty(base_cmd + ["remote", "connect", "--sandbox", "agbox-e2e", "--policy", pol, addr])
+    sas_pat = r"([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4})"
+    srv_buf, m_srv_sas = read_until(srv_fd, sas_pat, srv_buf)
+    brk_buf, m_brk_sas = read_until(brk_fd, sas_pat, "")
+    assert m_srv_sas.group(1) == m_brk_sas.group(1), (m_srv_sas.group(1), m_brk_sas.group(1))
+
+    os.write(srv_fd, b"y\n")
+    os.write(brk_fd, b"y\n")
+    brk_buf, m_att = read_until(brk_fd, r"Attached to sandbox", brk_buf)
+    brk_buf = brk_buf[m_att.end():]
+
+    # 1. Auto-approved command succeeds.
+    r1 = subprocess.run([client_bin, "uname", "-a"], env=env, capture_output=True, text=True, timeout=15)
+    if not (r1.returncode == 0 and "Linux" in r1.stdout):
+        brk_buf = drain_fd(brk_fd, brk_buf)
+        srv_buf = drain_fd(srv_fd, srv_buf)
+        raise AssertionError(f"r1 failed: rc={r1.returncode} out={r1.stdout!r} err={r1.stderr!r}\n--- BRK ---\n{brk_buf}\n--- SRV ---\n{srv_buf}")
+
+    # 1b. --allow-cwd canonical rejection over live wire returns uniform exit 126.
+    r_cwd = subprocess.run([client_bin, "--cwd", "/etc", "uname", "-a"], env=env, capture_output=True, text=True, timeout=15)
+    assert r_cwd.returncode == 126 and r_cwd.stderr.strip() == "agbox-remote: command denied", (r_cwd.returncode, r_cwd.stdout, r_cwd.stderr)
+
+    # 2. Auto-denied command returns uniform exit 126.
+    r2 = subprocess.run([client_bin, "rm", "-rf", "/"], env=env, capture_output=True, text=True, timeout=15)
+    assert r2.returncode == 126 and r2.stderr.strip() == "agbox-remote: command denied", (r2.returncode, r2.stderr)
+
+    # 3. Prompted command approved with [a] returns baseline-redacted stdout.
+    p3 = subprocess.Popen([client_bin, "echo", "AKIAIOSFODNN7EXAMPLE"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    brk_buf, m_p3 = read_until(brk_fd, r"Choice \(\[a\]pprove", brk_buf)
+    brk_buf = brk_buf[m_p3.end():]
+    os.write(brk_fd, b"a\n")
+    out3, err3 = p3.communicate(timeout=15)
+    assert p3.returncode == 0, (p3.returncode, out3, err3)
+    assert "[REDACTED:AWS_KEY]" in out3 and "AKIAIOSFODNN7EXAMPLE" not in out3, out3
+
+    # 3b. --stdin-file over live FUSE mount echoes file contents cleanly.
+    stdin_path = os.path.join(rwork, "stdin-payload.txt")
+    with open(stdin_path, "w", encoding="utf-8") as f:
+        f.write("hello-stdin-file-e2e\n")
+    p_stdin = subprocess.Popen([client_bin, "--stdin-file", stdin_path, "cat"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    brk_buf, m_ps = read_until(brk_fd, r"Choice \(\[a\]pprove", brk_buf)
+    brk_buf = brk_buf[m_ps.end():]
+    os.write(brk_fd, b"a\n")
+    out_s, err_s = p_stdin.communicate(timeout=15)
+    assert p_stdin.returncode == 0 and out_s == "hello-stdin-file-e2e\n", (p_stdin.returncode, out_s, err_s)
+
+    # 3c. agbox status reports == remote == and agbox-e2e: connected while attached.
+    st_res = subprocess.run(base_cmd + ["status"], env=env, capture_output=True, text=True, timeout=15)
+    assert st_res.returncode == 0, (st_res.returncode, st_res.stdout, st_res.stderr)
+    assert "== remote ==" in st_res.stdout and "agbox-e2e: connected" in st_res.stdout, st_res.stdout
+
+    # 4. Corrupt policy hot-reloads to fail-closed DENY-ALL.
+    with open(pol, "w") as f:
+        f.write("{corrupt")
+    r4 = subprocess.run([client_bin, "uname", "-a"], env=env, capture_output=True, text=True, timeout=15)
+    assert r4.returncode == 126, (r4.returncode, r4.stdout, r4.stderr)
+
+    # Clean quit.
+    os.write(brk_fd, b"q\n")
+    brk_p.wait(timeout=10)
+finally:
+    for p, fd in ((brk_p, brk_fd), (srv_p, srv_fd)):
+        if p is not None and p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+' "${TEST_BIN}" "${mnt}" "${rdata}" "${pol}" "${rwork}" "${ALLOW_ROOT}" || { echo "Live remote bridge PTY loopback failed" >&2; return 1; }
+
+  # Verify clean unmount.
+  kill -TERM "${bridge_pid}" 2>/dev/null || true
+  wait "${bridge_pid}" 2>/dev/null || true
+  bridge_pid=""
+  unmount_tree "${rbase}"
+  if [[ -n "$(list_active_mounts_under "${mnt}")" ]]; then
+    echo "Remote FUSE bridge mount remained active after teardown" >&2
+    return 1
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Phase 4: Virtualization preflight and environment preparation
 # ---------------------------------------------------------------------------
@@ -3685,6 +4019,200 @@ check_23_serve_loopback_probe() {
   assert_contains "${out}" "OpenCode web UI: http://127.0.0.1:" "--serve URL output"
   assert_contains "${out}" "--probe: UI verified" "--probe verification message"
   wait_for_sandbox_gone "${RUNTIME_MSB_HOME}" "agbox-${SUITE_ID}-probe" 20 || return 1
+}
+
+check_24_remote_command_in_vm() {
+  local sbx_def="${SUITE_ID}-remdef"
+  local sbx_off="${SUITE_ID}-remoff"
+  local sbx_live="${SUITE_ID}-remlive"
+  sbx_live_full="agbox-${sbx_live}"
+  rwork_24="${TEST_ROOT}/rem-vm-work"
+  bg_pid_24=""
+  local out=""
+
+  cleanup_24() {
+    if [[ -n "${sbx_live_full:-}" ]]; then
+      MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${sbx_live_full}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${bg_pid_24:-}" ]]; then
+      kill "${bg_pid_24}" 2>/dev/null || true
+      wait "${bg_pid_24}" 2>/dev/null || true
+    fi
+    if [[ -n "${rwork_24:-}" && -d "${rwork_24}" ]]; then
+      rm -rf "${rwork_24}" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_24 EXIT
+
+  # Default run mounts the remote bridge, links agbox-remote, merges INSTRUCTIONS.md, and returns exit 126 when unattached.
+  local guest_check='
+set -eu
+test -L /usr/local/bin/agbox-remote
+test -x /usr/local/bin/agbox-remote
+test -f /home/agent/.agbox-remote/INSTRUCTIONS.md
+grep -q "agbox-remote" /etc/agbox-global-rules/AGENTS.md
+rc=0
+err="$(agbox-remote uname -a 2>&1)" || rc=$?
+test "${rc}" -eq 126
+test "${err}" = "agbox-remote: command denied"
+echo "GUEST_REMOTE_DEFAULT_OK"
+'
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${sbx_def}" --cmd "${guest_check}"
+  assert_contains "${out}" "GUEST_REMOTE_DEFAULT_OK" "default in-VM remote bridge check"
+
+  # --no-remote omits the bridge mount and symlink.
+  local off_check='
+set -eu
+test ! -e /home/agent/.agbox-remote
+test ! -e /usr/local/bin/agbox-remote
+echo "GUEST_NO_REMOTE_OK"
+'
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" run_capture out with_timeout 180 \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --no-remote --name "${sbx_off}" --cmd "${off_check}"
+  assert_contains "${out}" "GUEST_NO_REMOTE_OK" "--no-remote in-VM check"
+
+  # Boot a live --no-net microVM, pair serve + connect --output-review via PTY, pause >2s in Phase 1,
+  # emit >64 KiB + AWS key, approve Phase 1 and Phase 2, and verify exact bytes and redaction inside the guest.
+  rm -rf "${rwork_24}"
+  mkdir -p "${rwork_24}"
+  chmod 0700 "${rwork_24}"
+  local emit_bin="${rwork_24}/emit_big"
+  cat > "${emit_bin}" <<'EOF'
+#!/usr/bin/env python3
+import sys
+sys.stdout.write("A" * 70000 + "\nAKIAIOSFODNN7EXAMPLE\n")
+EOF
+  chmod 0755 "${emit_bin}"
+
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" \
+    agbox_exec "${ACTIVE_BIN}" run --no-net --name "${sbx_live}" --cmd "sleep 180" >"${TEST_ROOT}/rem-vm-run.log" 2>&1 </dev/null &
+  bg_pid_24=$!
+
+  wait_for_sandbox_running "${RUNTIME_MSB_HOME}" "${sbx_live_full}" 60 || {
+    echo "Timeout waiting for ${sbx_live_full}" >&2
+    cat "${TEST_ROOT}/rem-vm-run.log" >&2 || true
+    return 1
+  }
+  local rsock="${RUNTIME_DATA_DIR}/run/${sbx_live}/remote.sock"
+  local i=0
+  while [[ ! -S "${rsock}" && "${i}" -lt 50 ]]; do
+    sleep 0.2
+    i=$((i + 1))
+  done
+  [[ -S "${rsock}" ]] || {
+    echo "remote.sock did not appear for ${sbx_live_full}" >&2
+    cat "${TEST_ROOT}/rem-vm-run.log" >&2 || true
+    return 1
+  }
+
+  python3 -c '
+import os, pty, re, select, signal, subprocess, sys, time
+
+active_bin, msb_bin, runtime_msb, runtime_data, sbx_full, rwork, emit_bin, allow_root = sys.argv[1:9]
+base_cmd = [active_bin] + (["--allow-root"] if allow_root == "1" else [])
+
+env = os.environ.copy()
+env["AGBOX_DATA_DIR"] = runtime_data
+env["MSB_HOME"] = runtime_msb
+
+def spawn_pty(cmd, cwd=None):
+    mfd, sfd = pty.openpty()
+    p = subprocess.Popen(cmd, stdin=sfd, stdout=sfd, stderr=sfd, env=env, cwd=cwd, close_fds=True, start_new_session=True)
+    os.close(sfd)
+    return p, mfd
+
+def read_until(mfd, pattern, buf, timeout=30.0):
+    rx = re.compile(pattern)
+    end = time.time() + timeout
+    while time.time() < end:
+        m = rx.search(buf)
+        if m:
+            return buf, m
+        r, _, _ = select.select([mfd], [], [], 0.1)
+        if r:
+            try:
+                chunk = os.read(mfd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+    raise RuntimeError(f"timeout waiting for {pattern!r}, got:\n{buf}")
+
+srv_p, srv_fd = spawn_pty(base_cmd + ["remote", "serve", "--listen", "127.0.0.1:0", "--allow-from", "127.0.0.1/32", "--allow-cwd", rwork], cwd=rwork)
+brk_p, brk_fd = None, None
+try:
+    srv_buf, m_addr = read_until(srv_fd, r"127\.0\.0\.1:(\d+)", "")
+    addr = m_addr.group(0)
+
+    brk_p, brk_fd = spawn_pty(base_cmd + ["remote", "connect", "--sandbox", sbx_full, "--no-policy", "--output-review", addr])
+    sas_pat = r"([0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4})"
+    srv_buf, m_srv_sas = read_until(srv_fd, sas_pat, srv_buf)
+    brk_buf, m_brk_sas = read_until(brk_fd, sas_pat, "")
+    assert m_srv_sas.group(1) == m_brk_sas.group(1), (m_srv_sas.group(1), m_brk_sas.group(1))
+
+    os.write(srv_fd, b"y\n")
+    os.write(brk_fd, b"y\n")
+    brk_buf, m_att = read_until(brk_fd, r"Attached to sandbox", brk_buf)
+    brk_buf = brk_buf[m_att.end():]
+
+    guest_cmd = [msb_bin, "exec", "--stream", "--no-stdin", "-u", "agent", sbx_full, "--", "agbox-remote", "--cwd", rwork, emit_bin]
+    p_guest = subprocess.Popen(guest_cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    # Phase 1: pause >2s before approving to exercise adaptive done/ polling across virtiofs.
+    brk_buf, m_p1 = read_until(brk_fd, r"Choice \(\[a\]pprove", brk_buf)
+    brk_buf = brk_buf[m_p1.end():]
+    time.sleep(2.2)
+    os.write(brk_fd, b"a\n")
+
+    # Phase 2: wait for output review card and approve.
+    brk_buf, m_p2h = read_until(brk_fd, r"PHASE 2: OUTPUT REVIEW", brk_buf)
+    brk_buf = brk_buf[m_p2h.end():]
+    brk_buf, m_p2 = read_until(brk_fd, r"Choice \(\[a\]pprove", brk_buf)
+    brk_buf = brk_buf[m_p2.end():]
+    os.write(brk_fd, b"a\n")
+
+    g_out, g_err = p_guest.communicate(timeout=30)
+    assert p_guest.returncode == 0, (p_guest.returncode, len(g_out), g_err)
+    expected = "A" * 70000 + "\n[REDACTED:AWS_KEY]\n"
+    assert g_out == expected, (len(g_out), len(expected), g_out[:64], g_out[-64:], g_err)
+    assert "AKIAIOSFODNN7EXAMPLE" not in g_out
+    assert "[REDACTED:AWS_KEY]" in g_out
+
+    os.write(brk_fd, b"q\n")
+    brk_p.wait(timeout=10)
+finally:
+    for p, fd in ((brk_p, brk_fd), (srv_p, srv_fd)):
+        if p is not None and p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+' "${ACTIVE_BIN}" "${MSB_BIN_PATH}" "${RUNTIME_MSB_HOME}" "${RUNTIME_DATA_DIR}" "${sbx_live_full}" "${rwork_24}" "${emit_bin}" "${ALLOW_ROOT}" || {
+    echo "Live in-VM Phase 1/2 remote command check failed" >&2
+    return 1
+  }
+
+  MSB_HOME="${RUNTIME_MSB_HOME}" AGBOX_DATA_DIR="${RUNTIME_DATA_DIR}" with_timeout 60 agbox_exec "${ACTIVE_BIN}" stop "${sbx_live_full}" >/dev/null 2>&1 || true
+  sbx_live_full=""
+  if [[ -n "${bg_pid_24}" ]]; then
+    kill "${bg_pid_24}" 2>/dev/null || true
+    wait "${bg_pid_24}" 2>/dev/null || true
+    bg_pid_24=""
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -4569,8 +5097,9 @@ main() {
   maybe_run_phase_check "06-security-validation-and-tamper-checks" "Verify share conflicts, skills/rules/auth/update tamper checks" check_06_security_validation_and_tamper_checks 0
   maybe_run_phase_check "07-msb-error-diagnostics-not-swallowed" "Verify non-interactive msb errors surface diagnostics and exit code" check_07_msb_error_diagnostics_not_swallowed 0
 
-  # Phase 3: Standalone embedded FUSE Workspace Hub.
+  # Phase 3: Standalone embedded FUSE Workspace Hub and remote bridge.
   maybe_run_phase_check "08-fuse-workspace-hub" "Verify live FUSE Workspace Hub VCS masking and ro enforcement" check_08_fuse_workspace_hub 0
+  maybe_run_phase_check "08b-remote-bridge-and-loopback" "Verify live remote FUSE bridge, static ELF execve, and PTY pairing loopback" check_08b_remote_bridge_and_loopback 0
 
   # Phases 4-6: Virtualization preflight and live microVM integration suite.
   local pair=""
@@ -4579,6 +5108,7 @@ main() {
     "21-persistence-auth-skills-rules-agents-profile|Verify auth, skills, rules, agent cache, and profile disk volume|check_21_persistence_auth_skills_rules_agents_profile"
     "22-persist-remote-control-shares-suspend-resume|Verify --persist remote-control, dynamic shares, suspend, resume, and stop|check_22_persist_remote_control_shares_suspend_resume"
     "23-serve-loopback-probe|Verify loopback-bound --serve --probe readiness and teardown|check_23_serve_loopback_probe"
+    "24-remote-command-in-vm|Verify default in-VM remote bridge, INSTRUCTIONS.md merge, and --no-remote|check_24_remote_command_in_vm"
   )
   local -a full_vm_checks=(
     "30-network-isolation-firewall|Verify --no-net and default-deny IMDS/RFC1918 firewall rules|check_30_network_isolation_firewall"

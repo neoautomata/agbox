@@ -12,10 +12,11 @@ die()  { printf '[agbox-install] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh [--allow-root] [--skip-setup] [--skip-completion] [--help]
+Usage: ./install.sh [--allow-root] [--remote-only] [--skip-setup] [--skip-completion] [--help]
 
 Options:
   --allow-root       Allow install.sh to run as root (or set AGBOX_ALLOW_ROOT=1).
+  --remote-only      Install the static binary for 'agbox remote serve' (skip KVM, FUSE, msb, rules, and setup).
   --skip-setup       Skip 'agbox setup'.
   --skip-completion  Skip bash completion.
   -h, --help         Show this help message and exit.
@@ -58,11 +59,16 @@ main() {
   fi
   local skip_setup=0
   local skip_completion=0
+  local remote_only=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --allow-root)
         allow_root=1
+        shift
+        ;;
+      --remote-only)
+        remote_only=1
         shift
         ;;
       --skip-setup)
@@ -112,7 +118,7 @@ main() {
   [[ ! -L "${install_dir}/agbox" ]] || die "Refusing to overwrite symlink at ${install_dir}/agbox."
   [[ ! -d "${install_dir}/agbox" ]] || die "Refusing to overwrite directory at ${install_dir}/agbox."
 
-  if [[ -f /etc/os-release ]]; then
+  if [[ "${remote_only}" -eq 0 && -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
     if [[ "${ID:-}" != "debian" && "${ID:-}" != "ubuntu" && "${ID_LIKE:-}" != *debian* ]]; then
@@ -120,43 +126,48 @@ main() {
     fi
   fi
 
-  # 1. Check glibc 2.28 or newer (required by microsandbox).
-  command -v getconf >/dev/null 2>&1 || die "getconf is missing. install.sh cannot check the glibc version."
-  local gl=""
-  gl="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)"
-  [[ -n "${gl}" ]] || die "install.sh requires GNU libc 2.28 or newer (getconf reports no glibc version)."
-  if [[ "$(printf '%s\n' 2.28 "${gl}" | sort -V | awk 'NR==1{first=$0} END{if (NR>0) print first}')" != "2.28" ]]; then
-    die "install.sh requires glibc 2.28 or newer (found ${gl})."
-  fi
-  log "glibc ${gl}: OK"
-
-  # 2. Check the Go toolchain and FUSE helper binary.
+  # 1. Check the Go toolchain (required for all installs).
   if ! command -v go >/dev/null 2>&1; then
     die "Go toolchain is missing. Install it with: sudo apt-get install -y golang-go"
   fi
   log "Go toolchain: $(go version)"
 
-  if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
-    die "fusermount3 is missing. Install fuse3 with: sudo apt-get install -y fuse3"
-  fi
-
-  # 3. Install microsandbox (msb) if it is missing.
   local orig_path="${PATH}"
   export PATH="${HOME}/.local/bin:/usr/local/bin:${PATH}"
-  if ! command -v msb >/dev/null 2>&1; then
-    command -v curl >/dev/null 2>&1 || die "curl is missing. Install curl with: sudo apt-get install -y curl"
-    log "msb is missing. Downloading the official microsandbox installer..."
-    MSB_INSTALLER_TMP="$(mktemp)"
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://install.microsandbox.dev -o "${MSB_INSTALLER_TMP}" || die "curl failed to download the msb installer."
-    [[ -s "${MSB_INSTALLER_TMP}" ]] || die "The downloaded msb installer is empty."
-    sh "${MSB_INSTALLER_TMP}" || die "The msb installer failed."
-    rm -f "${MSB_INSTALLER_TMP}"
-    MSB_INSTALLER_TMP=""
-    command -v msb >/dev/null 2>&1 || die "msb is not on PATH."
+
+  if [[ "${remote_only}" -eq 0 ]]; then
+    # 2. Check glibc 2.28 or newer (required by microsandbox).
+    command -v getconf >/dev/null 2>&1 || die "getconf is missing. install.sh cannot check the glibc version."
+    local gl=""
+    gl="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)"
+    [[ -n "${gl}" ]] || die "install.sh requires GNU libc 2.28 or newer (getconf reports no glibc version)."
+    if [[ "$(printf '%s\n' 2.28 "${gl}" | sort -V | awk 'NR==1{first=$0} END{if (NR>0) print first}')" != "2.28" ]]; then
+      die "install.sh requires glibc 2.28 or newer (found ${gl})."
+    fi
+    log "glibc ${gl}: OK"
+
+    if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+      die "fusermount3 is missing. Install fuse3 with: sudo apt-get install -y fuse3"
+    fi
+
+    # 3. Install microsandbox (msb) if it is missing.
+    if ! command -v msb >/dev/null 2>&1; then
+      command -v curl >/dev/null 2>&1 || die "curl is missing. Install curl with: sudo apt-get install -y curl"
+      log "msb is missing. Downloading the official microsandbox installer..."
+      MSB_INSTALLER_TMP="$(mktemp)"
+      curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://install.microsandbox.dev -o "${MSB_INSTALLER_TMP}" || die "curl failed to download the msb installer."
+      [[ -s "${MSB_INSTALLER_TMP}" ]] || die "The downloaded msb installer is empty."
+      sh "${MSB_INSTALLER_TMP}" || die "The msb installer failed."
+      rm -f "${MSB_INSTALLER_TMP}"
+      MSB_INSTALLER_TMP=""
+      command -v msb >/dev/null 2>&1 || die "msb is not on PATH."
+    fi
+    local msb_ver=""
+    msb_ver="$(msb --version 2>/dev/null | awk 'NR==1{first=$0} END{if (NR>0) print first}' || true)"
+    log "msb: ${msb_ver:-unknown}"
+  else
+    log "Remote-only install (--remote-only): skipping glibc, FUSE, and msb checks."
   fi
-  local msb_ver=""
-  msb_ver="$(msb --version 2>/dev/null | awk 'NR==1{first=$0} END{if (NR>0) print first}' || true)"
-  log "msb: ${msb_ver:-unknown}"
 
   # 4. Build and install the agbox binary.
   BUILD_TMP_DIR="$(mktemp -d)"
@@ -174,12 +185,14 @@ main() {
   INSTALL_STAGE_BIN=""
   log "Installed binary: ${install_dir}/agbox"
 
-  [[ -f "${SCRIPT_DIR}/AGBOX_ENV_RULES.md" ]] || die "AGBOX_ENV_RULES.md is missing in ${SCRIPT_DIR}."
-  log "Installing default sandbox rules..."
-  if [[ "${euid}" -eq 0 ]]; then
-    "${install_dir}/agbox" rules add --allow-root --force "${SCRIPT_DIR}/AGBOX_ENV_RULES.md" >/dev/null
-  else
-    "${install_dir}/agbox" rules add --force "${SCRIPT_DIR}/AGBOX_ENV_RULES.md" >/dev/null
+  if [[ "${remote_only}" -eq 0 ]]; then
+    [[ -f "${SCRIPT_DIR}/AGBOX_ENV_RULES.md" ]] || die "AGBOX_ENV_RULES.md is missing in ${SCRIPT_DIR}."
+    log "Installing default sandbox rules..."
+    if [[ "${euid}" -eq 0 ]]; then
+      "${install_dir}/agbox" rules add --allow-root --force "${SCRIPT_DIR}/AGBOX_ENV_RULES.md" >/dev/null
+    else
+      "${install_dir}/agbox" rules add --force "${SCRIPT_DIR}/AGBOX_ENV_RULES.md" >/dev/null
+    fi
   fi
 
   if [[ "${skip_completion}" -eq 1 ]]; then
@@ -216,7 +229,9 @@ main() {
   fi
 
   # 5. Check host prerequisites and run the microVM smoke test.
-  if [[ "${skip_setup}" -eq 1 ]]; then
+  if [[ "${remote_only}" -eq 1 ]]; then
+    log "Skipping 'agbox setup' (--remote-only)."
+  elif [[ "${skip_setup}" -eq 1 ]]; then
     log "Skipping 'agbox setup' (--skip-setup)."
   else
     log "Running 'agbox setup'..."

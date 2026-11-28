@@ -30,7 +30,7 @@ Modes:
       Update agent binaries inside a disposable zero-share sandbox.
       Cache checked ELF binaries in $DATA_DIR/agents without rebuilding the base snapshot.
 
-  agbox auth [--allow-root] [antigravity|opencode|status|logout]
+  agbox auth [--allow-root] [antigravity|opencode|status|logout [antigravity|opencode|all]]
       Sign in inside a disposable sandbox and save credentials in $DATA_DIR/auth.
 
   agbox skills [--allow-root] [list|add [--force] <path>|rm <name>]
@@ -49,6 +49,9 @@ Modes:
   agbox service [--allow-root] <list|add|enable|disable|start|stop|restart|logs|rm|linger> [...]
       Manage systemd user services (agbox@.service) that start at boot and stay active after logout.
 
+  agbox remote [--allow-root] <serve|connect|policy> [...]
+      Run a remote command daemon, pair a host approval broker with a sandbox, or manage policy files.
+
   agbox run [options] [opencode|antigravity] [path[:opts]...]
       Restore a sandbox and mask VCS files and directories.
       Block local, private, multicast, and cloud metadata IPs by default.
@@ -63,6 +66,8 @@ Modes:
         --no-skills          Skip global skills from $DATA_DIR/skills
         --no-rules           Skip global rules from $DATA_DIR/rules
         --no-agent-cache     Skip cached agent binaries from $DATA_DIR/agents
+        --remote             Require the remote FUSE bridge at /home/agent/.agbox-remote (default: enabled)
+        --no-remote          Disable the remote FUSE bridge at /home/agent/.agbox-remote (not --remote-control)
         --allow-root         Allow agbox to run as the root user
         --share PATH[:OPTS]  Share a host path with modifiers (ro,rw,mask,vcs,vcs-hooks,as=NAME)
         --share-hub          Mount an empty /workspace FUSE hub to add shares live
@@ -96,7 +101,7 @@ Modes:
       Delete managed systemd user services (agbox@.service, agbox@*.service), FUSE mounts, and $DATA_DIR.
 
   agbox status [--allow-root]
-      Show base settings, persistence state, sandboxes, snapshots, and disk usage.
+      Show base settings, persistence, services, remote bridges, sandboxes, snapshots, and disk usage.
 `
 }
 
@@ -112,6 +117,8 @@ func runUsageText() string {
   --no-skills          Skip global skills from $DATA_DIR/skills
   --no-rules           Skip global rules from $DATA_DIR/rules
   --no-agent-cache     Skip cached agent binaries from $DATA_DIR/agents
+  --remote             Require the remote FUSE bridge at /home/agent/.agbox-remote (default: enabled)
+  --no-remote          Disable the remote FUSE bridge at /home/agent/.agbox-remote (not --remote-control)
   --allow-root         Allow agbox to run as the root user
   --share PATH[:OPTS]  Share a host path with modifiers (ro,rw,mask,vcs,vcs-hooks,as=NAME)
   --share-hub          Mount an empty /workspace FUSE hub to add shares live

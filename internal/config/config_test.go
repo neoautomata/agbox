@@ -63,8 +63,27 @@ func TestFromLookupDefaultsAndOverrides(t *testing.T) {
 	if env.CPUs != DefaultCPUs || env.Memory != DefaultMemory || env.RootDisk != DefaultRootDisk || env.ProfileDisk != DefaultProfileDisk {
 		t.Errorf("unexpected defaults: %+v", env)
 	}
-	if env.MaskVCS != MaskStrict || env.AllowOutsideHome || env.AllowRoot {
+	if env.MaskVCS != MaskStrict || env.AllowOutsideHome || env.AllowRoot || !env.RemoteDefault {
 		t.Errorf("unexpected security defaults: %+v", env)
+	}
+
+	envRemoteOff, err := FromLookup("/home/alice", func(k string) string {
+		if k == "AGBOX_REMOTE" {
+			return "0"
+		}
+		return ""
+	})
+	if err != nil || envRemoteOff.RemoteDefault {
+		t.Errorf("FromLookup(AGBOX_REMOTE=0) = (%+v, %v), want RemoteDefault=false", envRemoteOff, err)
+	}
+	envRemoteOn, err := FromLookup("/home/alice", func(k string) string {
+		if k == "AGBOX_REMOTE" {
+			return "1"
+		}
+		return ""
+	})
+	if err != nil || !envRemoteOn.RemoteDefault {
+		t.Errorf("FromLookup(AGBOX_REMOTE=1) = (%+v, %v), want RemoteDefault=true", envRemoteOn, err)
 	}
 
 	overrides := map[string]string{
@@ -564,6 +583,7 @@ func TestParseRunMetaNegativeInputs(t *testing.T) {
 		{"invalid share access_mode", `{"sandbox": "s1", "shares": [{"index": 0, "access_mode": "write"}]}`},
 		{"invalid share vcs_policy", `{"sandbox": "s1", "shares": [{"index": 0, "vcs_policy": "bad"}]}`},
 		{"read-only share with vcs-hooks", `{"sandbox": "s1", "read_only": true, "shares": [{"index": 0, "guest_name": "g1", "vcs_policy": "vcs-hooks"}]}`},
+		{"conflicting remote_bridge and no_remote", `{"sandbox": "s1", "remote_bridge": true, "no_remote": true}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

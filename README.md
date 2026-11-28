@@ -5,9 +5,12 @@
 ```mermaid
 flowchart TD
     CLI["Host CLI (agbox)"] --> HUB["vcsfuse Workspace Hub (1000:1000)"]
+    CLI --> BRIDGE["In-Memory Remote FUSE Bridge"]
     CLI --> CACHE["Read-Only Caches (skills, rules, agents)"]
     CLI --> DISK["Profile ext4 Disk (disk.raw)"]
     HUB --> VM["msb microVM (agent 1000:1000)"]
+    BRIDGE --> VM
+    BRIDGE -.-> REMOTE["agbox remote connect / serve (optional)"]
     CACHE --> VM
     DISK --> VM
 ```
@@ -104,7 +107,7 @@ agbox resume agbox-myapp
 agbox stop agbox-myapp
 ```
 
-The [User Guide](USER_GUIDE.md) covers live shares (`agbox share`), systemd user services (`agbox service`), conversation profiles (`--profile`), agent updates (`agbox update`), and `edit-base`.
+The [User Guide](USER_GUIDE.md) covers live shares (`agbox share`), remote command brokering (`agbox remote`), systemd user services (`agbox service`), conversation profiles (`--profile`), agent updates (`agbox update`), and `edit-base`.
 
 ## Design
 
@@ -112,7 +115,7 @@ The [User Guide](USER_GUIDE.md) covers live shares (`agbox share`), systemd user
 - **Safe-by-Default.** `agbox` masks VCS metadata and blocks local, private, multicast, and cloud metadata ranges. Each override needs an explicit flag or environment variable.
 - **Fail closed.** If a check fails, `agbox` stops. It never falls back to weaker isolation. Two overrides can weaken isolation: `--no-mask` and `AGBOX_MASK_VCS=auto`.
 - **Snapshots.** `agbox create-base` builds `agbox:v1`. `agbox edit-base` saves `agbox:v<N+1>`. `agbox run` restores a snapshot into `agbox-<name>` or `agbox-run-<pid>`. It deletes that sandbox on exit unless you pass `--persist`, detach, or suspend.
-- **One binary.** The same binary runs the CLI and the FUSE filter (`agbox __filter`). The filter uses `go-fuse/v2` and Linux `openat2`.
+- **One binary.** One static binary serves the CLI, `agbox __filter` (`vcsfuse` and `remotebridge`), and in-VM `agbox-remote`. It also runs the host broker (`agbox remote connect`) and remote daemon (`agbox remote serve`).
 - **Non-root guest.** The guest user is `agent` (`1000:1000`) with passwordless `sudo`. The FUSE Workspace Hub shows shared files as `1000:1000` (`stat-virt=off`). `agbox` mounts read-only caches with `uid=1000,gid=1000`.
 - **Secrets on stdin.** `agbox` never stores API keys in a snapshot. It never puts secrets in CLI arguments, where `/proc/<pid>/cmdline` exposes them. It streams them over `stdin` into `/home/agent/.agbox-keys.sh` (mode `0600`).
 
@@ -137,7 +140,7 @@ With `--serve`, `agbox` also adds `--net-rule allow:ingress@loopback:tcp:3000` a
 
 ### Share policy
 
-`agbox` mounts no host path and starts no FUSE daemon unless you pass a path or `--share-hub`.
+`agbox` mounts no host workspace path and starts no Workspace Hub (`vcsfuse`) daemon unless you pass a path or `--share-hub`. By default, `agbox run` mounts the in-memory remote bridge (`/home/agent/.agbox-remote`) unless you pass `--no-remote` or set `AGBOX_REMOTE=0`. Under `--no-mask` or `AGBOX_MASK_VCS=auto`, `agbox` warns and disables the remote bridge when FUSE fails unless you pass `--remote`.
 
 1. **Workspace Hub.** An embedded FUSE Workspace Hub mounts each share at `/workspace/<name>` with `nosuid,nodev`. All host access uses `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`.
 1. **VCS masking.** The default policy is `:mask`. It hides 22 VCS directory names and control files (`ENOENT`). It blocks writes to them at every depth (`EPERM`). Matching is case-insensitive.
@@ -187,6 +190,7 @@ With `--serve`, `agbox` also adds `--net-rule allow:ingress@loopback:tcp:3000` a
 | Safe deletion | `mounttab.TeardownFilterDir` | Checks for zero active mounts in `/proc/self/mountinfo` before `os.RemoveAll`. |
 | Resume checks | `cli`, `install.sh` | Checks FUSE, KVM, and an offline sandbox during setup. Checks shares, caches, and profiles again on resume. |
 | User services | `service`, `cli` | Saves mode `0600` specs. Requires a regular `--env-file` (mode `0600` or stricter, no symlinks). Keeps secrets out of `agbox@.service`. Stops the microVM before FUSE unmount (`KillMode=mixed`). |
+| Remote command broker | `remoteproto`, `remotepolicy`, `remotebridge`, `remoteclient`, `remotedaemon`, `remotebroker` | Pairs over TLS 1.3 mTLS and Vaudenay 60-bit SAS. Uses an in-memory bridge (`remote.sock` with `SO_PEERCRED`) and returns uniform `exit 126` on deny. Enforces `deny > ask > allow`, fail-closed hot-reload, two-phase review, baseline redaction, `PR_SET_NO_NEW_PRIVS`, and pinned `cwd`. |
 
 </details>
 
@@ -194,7 +198,7 @@ With `--serve`, `agbox` also adds `--net-rule allow:ingress@loopback:tcp:3000` a
 
 ```text
 agbox/
-├── cmd/agbox/         Entrypoint. Routes __filter to vcsfuse and other commands to cli.
+├── cmd/agbox/         Entrypoint. Routes agbox-remote, __filter (vcsfuse/remotebridge), and cli.
 ├── internal/
 │   ├── cli/           Argument parsers and mode execution. Main is the only export.
 │   ├── complete/      Shell completion engine and bash script generator.
@@ -203,10 +207,16 @@ agbox/
 │   ├── msb/           Argument builders, network rules, categories, Runner interface.
 │   ├── pathsec/       Path validation, share parsing, blocklists, alias checks.
 │   ├── persist/       Credential capture, agent cache, skills, rules, profiles.
+│   ├── remotebridge/  In-memory FUSE virtual bridge and remote.sock control server.
+│   ├── remotebroker/  Host interactive approval broker, editor, and redacted audit log.
+│   ├── remoteclient/  In-VM agbox-remote CLI client.
+│   ├── remotedaemon/  Remote target daemon (agbox remote serve) with process isolation.
+│   ├── remotepolicy/  Strict JSON policy evaluator and fail-closed hot-reloader.
+│   ├── remoteproto/   Wire framing, TLS 1.3 mTLS, Vaudenay SAS, sanitizer, secret redactor.
 │   ├── service/       Template unit for systemd --user, mode 0600 specs, env-file parser.
 │   └── vcsfuse/       Workspace Hub, VCS and hook filter, control socket.
 ├── AGBOX_ENV_RULES.md Default guest rules that install.sh and agbox setup install.
-├── install.sh         Idempotent host check, static build, and atomic install.
+├── install.sh         Idempotent host check, static build, and atomic install (--remote-only supported).
 ├── test.sh            End-to-end verification harness.
 ├── AGENTS.md          Architecture, security rules, and verification guide.
 ├── USER_GUIDE.md      Workflows, categories, CLI reference, environment variables.
@@ -224,7 +234,7 @@ go test -v -race ./...
 
 | Command | Coverage |
 |---|---|
-| `./test.sh` | Static checks, race-tested unit tests, FUSE Workspace Hub, and core sandbox workflows. |
+| `./test.sh` | Static checks, unit tests with `-race`, Workspace Hub, remote bridge loopback (`08b`), and core sandbox checks including in-VM remote bridge (`24`). |
 | `./test.sh --full` | Adds firewall, descriptor revocation, profile lock, `--serve`, live update, and lifecycle checks. |
 | `./test.sh --skip-vm` | Offline checks for hosts without KVM or `msb`. |
 | `./test.sh --disruptive` | Clean-slate run. It restores the installed binary and runs `agbox remove --yes` before and after. |

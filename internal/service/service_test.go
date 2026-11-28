@@ -479,6 +479,27 @@ func TestSpecValidationAndListSpecsEdgeCases(t *testing.T) {
 		t.Fatalf("SaveSpec(cmdSpec) failed: %v", err)
 	}
 
+	// Remote and NoRemote round-trip cleanly through SaveSpec and LoadSpec.
+	remSpec := Spec{Name: "remtrue", Mode: config.RunModeCmd, Cmd: "true", Remote: true}
+	if err := SaveSpec(dataDir, remSpec); err != nil {
+		t.Fatalf("SaveSpec(remtrue) failed: %v", err)
+	}
+	gotRem, err := LoadSpec(dataDir, "remtrue")
+	if err != nil || !gotRem.Remote || gotRem.NoRemote {
+		t.Fatalf("LoadSpec(remtrue) = (%+v, %v), want Remote=true NoRemote=false", gotRem, err)
+	}
+	noRemSpec := Spec{Name: "remfalse", Mode: config.RunModeCmd, Cmd: "true", NoRemote: true}
+	if err := SaveSpec(dataDir, noRemSpec); err != nil {
+		t.Fatalf("SaveSpec(remfalse) failed: %v", err)
+	}
+	gotNoRem, err := LoadSpec(dataDir, "remfalse")
+	if err != nil || gotNoRem.Remote || !gotNoRem.NoRemote {
+		t.Fatalf("LoadSpec(remfalse) = (%+v, %v), want Remote=false NoRemote=true", gotNoRem, err)
+	}
+	if err := validateSpec(Spec{Name: "bothrem", Mode: config.RunModeCmd, Cmd: "true", Remote: true, NoRemote: true}); err == nil {
+		t.Fatal("validateSpec accepted Remote=true with NoRemote=true")
+	}
+
 	// Invalid specs rejected by SaveSpec.
 	invalidSpecs := []struct {
 		name string
@@ -494,6 +515,7 @@ func TestSpecValidationAndListSpecsEdgeCases(t *testing.T) {
 		{"serve-port-high", Spec{Name: "phigh", Mode: config.RunModeServe, Port: 65536}},
 		{"invalid-mask", Spec{Name: "badmask", Mode: config.RunModeCmd, Cmd: "true", MaskMode: "1"}},
 		{"invalid-vcs", Spec{Name: "badvcs", Mode: config.RunModeCmd, Cmd: "true", DefaultVCS: "bogus"}},
+		{"remote-and-no-remote", Spec{Name: "bothrem", Mode: config.RunModeCmd, Cmd: "true", Remote: true, NoRemote: true}},
 	}
 	for _, tc := range invalidSpecs {
 		t.Run("save-"+tc.name, func(t *testing.T) {
@@ -524,6 +546,7 @@ func TestSpecValidationAndListSpecsEdgeCases(t *testing.T) {
 		{"badport", []byte(`{"name":"badport","mode":"serve","port":0}`)},
 		{"badmask", []byte(`{"name":"badmask","mode":"cmd","cmd":"true","mask_mode":"yes"}`)},
 		{"badvcs", []byte(`{"name":"badvcs","mode":"cmd","cmd":"true","default_vcs":"unknown"}`)},
+		{"bothrem", []byte(`{"name":"bothrem","mode":"cmd","cmd":"true","remote":true,"no_remote":true}`)},
 		{"oversized", bytes.Repeat([]byte(" "), maxSpecFileBytes+1)},
 	}
 	for _, tc := range loadBadCases {
@@ -547,8 +570,8 @@ func TestSpecValidationAndListSpecsEdgeCases(t *testing.T) {
 		t.Fatal(err)
 	}
 	specs, err := ListSpecs(dataDir)
-	if err != nil || len(specs) != 1 || specs[0].Name != "runner" {
-		t.Fatalf("ListSpecs = (%+v, %v), want [runner]", specs, err)
+	if err != nil || len(specs) != 3 || specs[0].Name != "remfalse" || specs[1].Name != "remtrue" || specs[2].Name != "runner" {
+		t.Fatalf("ListSpecs = (%+v, %v), want [remfalse remtrue runner]", specs, err)
 	}
 
 	corruptInList := SpecPath(dataDir, "broken")

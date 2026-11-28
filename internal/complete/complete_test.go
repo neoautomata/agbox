@@ -1189,3 +1189,124 @@ printf 'case4=%s|%s\n' "${COMPREPLY[0]}" "${COMPREPLY[1]}"
 		}
 	}
 }
+
+func TestCompleteRemoteSubcommands(t *testing.T) {
+	p := Providers{
+		Sandboxes: func(filter SandboxFilter) []string {
+			if filter == SandboxRunning {
+				return []string{"agbox-dev", "agbox-prod"}
+			}
+			return []string{"agbox-dev", "agbox-prod", "agbox-old"}
+		},
+	}
+
+	cases := []struct {
+		name      string
+		args      []string
+		wantCands []string
+		wantDir   Directive
+	}{
+		{
+			name:      "top-level mode includes remote",
+			args:      []string{"rem"},
+			wantCands: []string{"remote", "remove"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote actions",
+			args:      []string{"remote", ""},
+			wantCands: []string{"serve", "connect", "policy"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote serve flags",
+			args:      []string{"remote", "serve", "--allow-"},
+			wantCands: []string{"--allow-from", "--allow-cwd", "--allow-new-privs", "--allow-root"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote connect flags",
+			args:      []string{"remote", "connect", "--o"},
+			wantCands: []string{"--output-review"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote connect sandbox completion",
+			args:      []string{"remote", "connect", "--sandbox", "agbox-"},
+			wantCands: []string{"agbox-dev", "agbox-prod"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote connect policy file directive",
+			args:      []string{"remote", "connect", "--policy", ""},
+			wantCands: nil,
+			wantDir:   DirectiveFile,
+		},
+		{
+			name:      "remote policy subcommands",
+			args:      []string{"remote", "policy", ""},
+			wantCands: []string{"init", "check", "test"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote policy init -o file directive",
+			args:      []string{"remote", "policy", "init", "-o", ""},
+			wantCands: nil,
+			wantDir:   DirectiveFile,
+		},
+		{
+			name:      "remote policy init short and long flags",
+			args:      []string{"remote", "policy", "init", "-"},
+			wantCands: []string{"-o", "--output", "-f", "--force", "--allow-root", "-h", "--help"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote policy test flags before executable",
+			args:      []string{"remote", "policy", "test", "--"},
+			wantCands: []string{"--policy", "--cwd", "--stdin", "--allow-root", "--help"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote policy test stops suggesting flags after executable",
+			args:      []string{"remote", "policy", "test", "ls", "-"},
+			wantCands: nil,
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "remote policy test stops suggesting flags after policy and executable",
+			args:      []string{"remote", "policy", "test", "--policy", "/tmp/p.json", "ls", "-"},
+			wantCands: nil,
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "run flags include --remote and --no-remote",
+			args:      []string{"run", "--no-r"},
+			wantCands: []string{"--no-rules", "--no-remote"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "service add flags include --remote",
+			args:      []string{"service", "add", "web", "--rem"},
+			wantCands: []string{"--remote", "--remote-control"},
+			wantDir:   DirectiveNoFiles,
+		},
+		{
+			name:      "service add flags include --no-remote",
+			args:      []string{"service", "add", "web", "--no-r"},
+			wantCands: []string{"--no-rules", "--no-remote"},
+			wantDir:   DirectiveNoFiles,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Complete(tc.args, p)
+			if got.Directive != tc.wantDir {
+				t.Errorf("Directive = %q, want %q", got.Directive, tc.wantDir)
+			}
+			if !slices.Equal(got.Candidates, tc.wantCands) {
+				t.Errorf("Candidates = %v, want %v", got.Candidates, tc.wantCands)
+			}
+		})
+	}
+}

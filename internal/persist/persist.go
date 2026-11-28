@@ -1052,6 +1052,7 @@ const defaultEnvRuleMarkdown = "" +
 	"- Use `fusermount3` for unprivileged FUSE tests. Use `sudo` when `/dev/fuse` requires root access.\n" +
 	"- Outbound DNS and public internet work by default unless the host starts the sandbox with `--no-net`.\n" +
 	"- The default firewall blocks host, private LAN, link-local, multicast, and cloud metadata addresses. Stop and tell the user if a task needs `--net` changes.\n" +
+	"- Run `agbox-remote` to request an approved command on a pre-connected remote machine. Read `/home/agent/.agbox-remote/INSTRUCTIONS.md` for rules.\n" +
 	"- Never print, log, or copy credentials from `/home/agent/.agbox-keys.sh` or environment variables into `/workspace`.\n"
 
 // EnsureDefaultEnvRule writes the default environment rule to rulesDir when missing.
@@ -1135,15 +1136,37 @@ for f in "$src"/*.md; do
   fi
   process_rule "$f"
 done
-if [ -f "$stage/AGENTS.md" ]; then
-  chmod 0444 "$stage/AGENTS.md"
-fi
 `, qSrc, qStage)
 }
 
 // BuildGuestRulesMountScript returns a root sh script that stages /home/agent/.agbox-rules
 // and bind-mounts read-only global rules for agy and opencode.
 func BuildGuestRulesMountScript() string {
+	return BuildGuestRulesMountScriptWithOptions(true, false)
+}
+
+// BuildGuestRulesMountScriptWithOptions stages global rules and optional remote instructions
+// into /etc/agbox-global-rules and bind-mounts them read-only for agy and opencode.
+func BuildGuestRulesMountScriptWithOptions(hasRulesMount, includeRemote bool) string {
+	var stagePart string
+	if hasRulesMount {
+		stagePart = buildGuestRulesStageScript(msb.GuestRulesMount, "/etc/agbox-global-rules")
+	} else {
+		stagePart = `rm -rf /etc/agbox-global-rules
+mkdir -p /etc/agbox-global-rules/rules
+chmod 0755 /etc/agbox-global-rules /etc/agbox-global-rules/rules
+`
+	}
+	var remotePart string
+	if includeRemote {
+		remotePart = `if [ -f /home/agent/.agbox-remote/INSTRUCTIONS.md ] && [ ! -L /home/agent/.agbox-remote/INSTRUCTIONS.md ]; then
+  if [ -s /etc/agbox-global-rules/AGENTS.md ]; then
+    printf '\n\n' >> /etc/agbox-global-rules/AGENTS.md
+  fi
+  cat /home/agent/.agbox-remote/INSTRUCTIONS.md >> /etc/agbox-global-rules/AGENTS.md
+fi
+`
+	}
 	return `set -eu
 mkdir -p /home/agent/.gemini/config /home/agent/.config/opencode
 chown 1000:1000 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.config /home/agent/.config/opencode
@@ -1154,7 +1177,9 @@ for mp in /home/agent/.gemini/config/AGENTS.md /home/agent/.config/opencode/AGEN
     umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
   fi
 done
-` + buildGuestRulesStageScript(msb.GuestRulesMount, "/etc/agbox-global-rules") + `
+` + stagePart + remotePart + `if [ -f /etc/agbox-global-rules/AGENTS.md ]; then
+  chmod 0444 /etc/agbox-global-rules/AGENTS.md
+fi
 if [ -s /etc/agbox-global-rules/AGENTS.md ]; then
   for dst in /home/agent/.gemini/config/AGENTS.md /home/agent/.config/opencode/AGENTS.md; do
     rm -rf "$dst"

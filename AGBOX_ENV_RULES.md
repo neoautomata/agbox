@@ -23,4 +23,5 @@
 - Use `fusermount3` for unprivileged FUSE tests. Use `sudo` when `/dev/fuse` requires root access.
 - Outbound DNS and public internet work by default unless the host starts the sandbox with `--no-net`.
 - The default firewall blocks host, private LAN, link-local, multicast, and cloud metadata addresses. Stop and tell the user if a task needs `--net` changes.
+- Run `agbox-remote` to request an approved command on a pre-connected remote machine. Read `/home/agent/.agbox-remote/INSTRUCTIONS.md` for rules.
 - Never print, log, or copy credentials from `/home/agent/.agbox-keys.sh` or environment variables into `/workspace`.

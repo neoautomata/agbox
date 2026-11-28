@@ -556,9 +556,11 @@ func UnmountFilterDir(dir string, ctl Controller) error {
 	}
 
 	removePIDFiles(resolvedDir)
-	sockPath := filepath.Join(resolvedDir, "ws.sock")
-	if info, lErr := os.Lstat(sockPath); lErr == nil && info.Mode()&os.ModeSocket != 0 {
-		_ = os.Remove(sockPath)
+	for _, sockName := range []string{"ws.sock", "remote.sock"} {
+		sockPath := filepath.Join(resolvedDir, sockName)
+		if info, lErr := os.Lstat(sockPath); lErr == nil && info.Mode()&os.ModeSocket != 0 {
+			_ = os.Remove(sockPath)
+		}
 	}
 	return nil
 }

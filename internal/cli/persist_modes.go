@@ -579,7 +579,11 @@ func (a *appRuntime) setupGuestSkills(ctx context.Context, sandbox string) error
 }
 
 func (a *appRuntime) setupGuestRules(ctx context.Context, sandbox string) error {
-	_, err := a.runGuestRootScript(ctx, sandbox, "bind-mount global rules in "+sandbox, "sh", persist.BuildGuestRulesMountScript())
+	return a.setupGuestRulesWithOptions(ctx, sandbox, true, false)
+}
+
+func (a *appRuntime) setupGuestRulesWithOptions(ctx context.Context, sandbox string, hasRulesMount, includeRemote bool) error {
+	_, err := a.runGuestRootScript(ctx, sandbox, "bind-mount global rules in "+sandbox, "sh", persist.BuildGuestRulesMountScriptWithOptions(hasRulesMount, includeRemote))
 	return err
 }
 
@@ -720,6 +724,10 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 			metaLock.unlock()
 			return fmt.Errorf("cannot change --share-hub when resuming persistent sandbox %q. Run 'agbox stop %s' to recreate it", runSandbox, runSandbox)
 		}
+	}
+	if (opts.Remote && !meta.RemoteBridge) || (opts.NoRemote && meta.RemoteBridge) {
+		metaLock.unlock()
+		return fmt.Errorf("cannot change --remote or --no-remote when resuming persistent sandbox %q. Run 'agbox stop %s' to recreate it", runSandbox, runSandbox)
 	}
 	if opts.Port != 0 && opts.Port != meta.Port {
 		metaLock.unlock()

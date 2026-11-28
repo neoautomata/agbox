@@ -20,6 +20,7 @@ import (
 	"agbox/internal/msb"
 	"agbox/internal/pathsec"
 	"agbox/internal/persist"
+	"agbox/internal/remotebridge"
 	"agbox/internal/vcsfuse"
 )
 
@@ -400,7 +401,53 @@ func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
 		})
 	}
 
+	remoteBridge := false
+	explicitRemote := opts.Remote
+	wantRemote := a.Env.RemoteDefault
+	if opts.Remote {
+		wantRemote = true
+	} else if opts.NoRemote {
+		wantRemote = false
+	}
+	if wantRemote {
+		allowDisableOnFailure := !explicitRemote && (opts.MaskMode == config.MaskOff || opts.MaskMode == config.MaskAuto)
+		if !dataDirSupportsRemoteBridge(a.Env.DataDir) {
+			if !allowDisableOnFailure {
+				return fmt.Errorf("DATA_DIR (%s) contains unsupported characters for the remote FUSE bridge", a.Env.DataDir)
+			}
+			a.warnf("DATA_DIR (%s) contains characters unsupported by the remote FUSE bridge. Disabling remote bridge for this run.", a.Env.DataDir)
+		} else if a.StartRemoteBridge == nil {
+			if !allowDisableOnFailure {
+				return errors.New("remote FUSE bridge starter is not configured")
+			}
+			a.warnf("Remote FUSE bridge starter is nil. Disabling remote bridge for this run.")
+		} else {
+			remoteDir := filepath.Join(runFilterDir, "remote")
+			remoteSock := filepath.Join(runFilterDir, "remote.sock")
+			remotePIDFile := filepath.Join(runFilterDir, "remote.pid")
+			if err := config.EnsurePrivateDir(remoteDir); err != nil {
+				return err
+			}
+			if _, fErr := a.StartRemoteBridge(remoteDir, remoteSock, remotePIDFile, !willDetach); fErr != nil {
+				if !allowDisableOnFailure {
+					return fmt.Errorf("remote FUSE bridge failed for /home/agent/.agbox-remote (%w). Fix FUSE or pass --no-remote", fErr)
+				}
+				a.warnf("Remote FUSE bridge failed (%v). Disabling remote bridge for this run.", fErr)
+			} else {
+				remoteBridge = true
+				volumes = append(volumes, msb.VolumeSpec{
+					HostPath:  remoteDir,
+					GuestPath: remotebridge.GuestMountPath,
+					ReadOnly:  false,
+					StatVirt:  "off",
+				})
+			}
+		}
+	}
+
 	meta.WorkspaceHub = workspaceHub
+	meta.RemoteBridge = remoteBridge
+	meta.NoRemote = opts.NoRemote || !remoteBridge
 	meta.Shares = shareRecords
 	if err := config.SaveRunMeta(metaPath, meta); err != nil {
 		return fmt.Errorf("write run metadata: %w", err)
@@ -450,8 +497,14 @@ func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
 			return err
 		}
 	}
-	if mountRules {
-		if err := a.setupGuestRules(runCtx, runSandbox); err != nil {
+	if remoteBridge {
+		if err := a.setupGuestRemote(runCtx, runSandbox); err != nil {
+			return err
+		}
+	}
+	includeRemoteInstr := remoteBridge && !opts.NoRules
+	if mountRules || includeRemoteInstr {
+		if err := a.setupGuestRulesWithOptions(runCtx, runSandbox, mountRules, includeRemoteInstr); err != nil {
 			return err
 		}
 	}

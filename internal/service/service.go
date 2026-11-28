@@ -64,6 +64,8 @@ type Spec struct {
 	NoSkills     bool             `json:"no_skills,omitempty"`
 	NoRules      bool             `json:"no_rules,omitempty"`
 	NoAgentCache bool             `json:"no_agent_cache,omitempty"`
+	Remote       bool             `json:"remote,omitempty"`
+	NoRemote     bool             `json:"no_remote,omitempty"`
 	EnvFile      string           `json:"env_file,omitempty"`
 }
 
@@ -172,6 +174,9 @@ func validateSpec(spec Spec) error {
 	case "", config.VCSMask, config.VCSAllow, config.VCSAllowHooks:
 	default:
 		return fmt.Errorf("service %q has invalid default VCS policy %q (expected: mask, vcs, or vcs-hooks)", spec.Name, spec.DefaultVCS)
+	}
+	if spec.Remote && spec.NoRemote {
+		return fmt.Errorf("service %q cannot combine remote and no_remote", spec.Name)
 	}
 	return nil
 }

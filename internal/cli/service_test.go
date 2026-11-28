@@ -161,13 +161,14 @@ func newServiceTestApp(t *testing.T, svcCtl *fakeServiceCtl, fakeMSB msb.Runner)
 	var stdout, stderr bytes.Buffer
 	app := &appRuntime{
 		Env: config.Env{
-			HomeReal:   home,
-			DataDir:    dataDir,
-			ConfigFile: filepath.Join(dataDir, "config"),
-			MSBHome:    msbHome,
-			CPUs:       "2",
-			Memory:     "4G",
-			MaskVCS:    config.MaskStrict,
+			HomeReal:      home,
+			DataDir:       dataDir,
+			ConfigFile:    filepath.Join(dataDir, "config"),
+			MSBHome:       msbHome,
+			CPUs:          "2",
+			Memory:        "4G",
+			MaskVCS:       config.MaskStrict,
+			RemoteDefault: true,
 		},
 		ExePath:             filepath.Join(home, ".local", "bin", "agbox"),
 		MSB:                 fakeMSB,
@@ -187,6 +188,11 @@ func newServiceTestApp(t *testing.T, svcCtl *fakeServiceCtl, fakeMSB msb.Runner)
 		PID:                 4242,
 		StartHub: func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error) {
 			return 9999, nil
+		},
+		StartRemoteBridge: func(mntDir, sockPath, pidFile string, dieWithParent bool) (int, error) {
+			_ = os.MkdirAll(mntDir, 0o700)
+			_ = os.WriteFile(pidFile, []byte("9997\n"), 0o600)
+			return 9997, nil
 		},
 	}
 	return app, &stdout, &stderr, home
@@ -1456,5 +1462,90 @@ func TestServiceSuperviseCmdConsecutivePingFailureThreshold(t *testing.T) {
 	joined := strings.Join(events, ",")
 	if !strings.Contains(joined, "READY=1") || !strings.Contains(joined, "WATCHDOG=1") || !strings.Contains(joined, "STOPPING=1") {
 		t.Fatalf("expected READY=1, WATCHDOG=1, STOPPING=1 notifications, got %v", events)
+	}
+}
+
+func TestServiceRemoteFlagsAndPersistConflict(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	// 1. AGBOX_REMOTE=0 (RemoteDefault=false) persists NoRemote=true in the saved spec.
+	app, _, stderr, _ := newServiceTestApp(t, &fakeServiceCtl{}, &serviceFakeRunner{})
+	app.Env.RemoteDefault = false
+	if code := app.dispatch(ctx, []string{"service", "add", "remoff", "--cmd", "true"}); code != 0 {
+		t.Fatalf("service add with RemoteDefault=false failed: code=%d stderr=%s", code, stderr.String())
+	}
+	spec, err := service.LoadSpec(app.Env.DataDir, "remoff")
+	if err != nil {
+		t.Fatalf("LoadSpec(remoff): %v", err)
+	}
+	if !spec.NoRemote || spec.Remote {
+		t.Fatalf("expected NoRemote=true and Remote=false, got Remote=%v NoRemote=%v", spec.Remote, spec.NoRemote)
+	}
+
+	// Explicit --remote overrides AGBOX_REMOTE=0.
+	if code := app.dispatch(ctx, []string{"service", "add", "remon", "--remote", "--cmd", "true"}); code != 0 {
+		t.Fatalf("service add --remote failed: code=%d stderr=%s", code, stderr.String())
+	}
+	specOn, err := service.LoadSpec(app.Env.DataDir, "remon")
+	if err != nil {
+		t.Fatalf("LoadSpec(remon): %v", err)
+	}
+	if !specOn.Remote || specOn.NoRemote {
+		t.Fatalf("expected Remote=true and NoRemote=false, got Remote=%v NoRemote=%v", specOn.Remote, specOn.NoRemote)
+	}
+
+	// 2. service add --remote --no-remote fails closed.
+	stderr.Reset()
+	if code := app.dispatch(ctx, []string{"service", "add", "conflict", "--remote", "--no-remote", "--cmd", "true"}); code == 0 {
+		t.Fatal("expected service add --remote --no-remote to fail")
+	}
+
+	// 3. Persistent service restart rejects conflicting --no-remote spec change.
+	fakeMSB := &serviceFakeRunner{
+		fn: func(_ context.Context, req msb.CommandRequest) (msb.CommandResult, error) {
+			if len(req.Args) == 0 {
+				return msb.CommandResult{}, nil
+			}
+			switch req.Args[0] {
+			case "snap":
+				return msb.CommandResult{Stdout: "agbox:v1\n"}, nil
+			case "ls":
+				return msb.CommandResult{Stdout: "NAME STATUS\nagbox-perrem stopped\n"}, nil
+			default:
+				return msb.CommandResult{}, nil
+			}
+		},
+	}
+	app2, _, stderr2, _ := newServiceTestApp(t, &fakeServiceCtl{}, fakeMSB)
+	runDir := filepath.Join(app2.Env.DataDir, "run", "perrem")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(runDir, "suspended"), config.RunMeta{
+		Sandbox:      "agbox-perrem",
+		Agent:        "opencode",
+		Mode:         config.RunModeCmd,
+		Cmd:          "true",
+		MaskMode:     config.MaskStrict,
+		Persist:      true,
+		RemoteBridge: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SaveSpec(app2.Env.DataDir, service.Spec{
+		Name:     "perrem",
+		Agent:    "opencode",
+		Mode:     config.RunModeCmd,
+		Cmd:      "true",
+		Persist:  true,
+		NoRemote: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stderr2.Reset()
+	if code := app2.dispatch(ctx, []string{service.SubcommandName, "perrem"}); code == 0 || !strings.Contains(stderr2.String(), "cannot change --remote or --no-remote") {
+		t.Fatalf("expected persistent service restart with conflicting NoRemote to fail, code=%d stderr=%q", code, stderr2.String())
 	}
 }

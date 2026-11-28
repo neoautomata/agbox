@@ -493,10 +493,10 @@ func (a *appRuntime) resumeSandboxTracked(ctx context.Context, opts resumeOpts) 
 				VCSPolicy: sh.EffectiveVCSPolicy(),
 			}
 		}
+		mountsActive = true
 		if _, fErr := a.StartHub(wsDir, wsSock, wsPIDFile, initialHub, !willDetach); fErr != nil {
 			return false, fmt.Errorf("remount FUSE Workspace Hub for %s: %w", opts.Sandbox, fErr)
 		}
-		mountsActive = true
 	} else {
 		for _, sh := range meta.Shares {
 			if !sh.Masked {
@@ -513,10 +513,29 @@ func (a *appRuntime) resumeSandboxTracked(ctx context.Context, opts resumeOpts) 
 			if err := config.EnsurePrivateDir(mntDir); err != nil {
 				return false, err
 			}
+			mountsActive = true
 			if _, fErr := a.StartFilter(sh.HostPath, mntDir, pidFile, !willDetach); fErr != nil {
 				return false, fmt.Errorf("remount FUSE filter for %s: %w", sh.HostPath, fErr)
 			}
-			mountsActive = true
+		}
+	}
+
+	if meta.RemoteBridge {
+		if !dataDirSupportsRemoteBridge(a.Env.DataDir) {
+			return false, fmt.Errorf("DATA_DIR (%s) contains unsupported characters for the remote FUSE bridge", a.Env.DataDir)
+		}
+		if a.StartRemoteBridge == nil {
+			return false, errors.New("remote FUSE bridge starter is not configured")
+		}
+		remoteDir := filepath.Join(runFilterDir, "remote")
+		remoteSock := filepath.Join(runFilterDir, "remote.sock")
+		remotePIDFile := filepath.Join(runFilterDir, "remote.pid")
+		if err := config.EnsurePrivateDir(remoteDir); err != nil {
+			return false, err
+		}
+		mountsActive = true
+		if _, fErr := a.StartRemoteBridge(remoteDir, remoteSock, remotePIDFile, !willDetach); fErr != nil {
+			return false, fmt.Errorf("remount remote FUSE bridge for %s: %w", opts.Sandbox, fErr)
 		}
 	}
 
@@ -552,8 +571,15 @@ func (a *appRuntime) resumeSandboxTracked(ctx context.Context, opts resumeOpts) 
 			return true, err
 		}
 	}
-	if meta.RulesMounted && !effNoRules && hasRules {
-		if err := a.setupGuestRules(runCtx, opts.Sandbox); err != nil {
+	if meta.RemoteBridge {
+		if err := a.setupGuestRemote(runCtx, opts.Sandbox); err != nil {
+			return true, err
+		}
+	}
+	hasRulesMount := meta.RulesMounted && !effNoRules && hasRules
+	includeRemoteInstr := meta.RemoteBridge && !effNoRules
+	if hasRulesMount || includeRemoteInstr {
+		if err := a.setupGuestRulesWithOptions(runCtx, opts.Sandbox, hasRulesMount, includeRemoteInstr); err != nil {
 			return true, err
 		}
 	}
@@ -829,6 +855,7 @@ func (a *appRuntime) status(ctx context.Context, args []string) error {
 	}
 	a.printPersistenceStatus(ctx)
 	a.printServiceStatus(ctx)
+	a.printRemoteStatus()
 
 	if a.MSB != nil {
 		fmt.Fprintln(a.Stdout, "\n== sandboxes ==")

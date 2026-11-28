@@ -457,6 +457,7 @@ func newTestApp(t *testing.T) (*appRuntime, *fakeMSBRunner, *bytes.Buffer, *byte
 			AgyInstallerURL:  "https://antigravity.google/cli/install.sh",
 			MaskVCS:          config.MaskStrict,
 			AllowOutsideHome: false,
+			RemoteDefault:    true,
 		},
 		ExePath:  "/usr/local/bin/agbox",
 		MSB:      runner,
@@ -486,6 +487,11 @@ func newTestApp(t *testing.T) (*appRuntime, *fakeMSBRunner, *bytes.Buffer, *byte
 			_ = os.MkdirAll(mntDir, 0o700)
 			_ = os.WriteFile(pidFile, []byte("9998\n"), 0o600)
 			return 9998, nil
+		},
+		StartRemoteBridge: func(mntDir, _, pidFile string, _ bool) (int, error) {
+			_ = os.MkdirAll(mntDir, 0o700)
+			_ = os.WriteFile(pidFile, []byte("9997\n"), 0o600)
+			return 9997, nil
 		},
 		WaitServeUI: func(_ context.Context, _ int, _ string) bool {
 			return true
@@ -1426,21 +1432,34 @@ func TestSecurityPropertiesAcrossModes(t *testing.T) {
 	}
 	runner.handler = nil
 
-	// 3. Run mounts zero host shares when no paths are passed, and --serve binds only 127.0.0.1.
+	// 3. Run mounts zero host /workspace shares when no paths are passed, and --no-remote removes the remote bridge mount too.
 	runner.calls = nil
 	if rc := app.dispatch(ctx, []string{"run", "--name", "noshare", "--serve", "--probe", "--port", "4321"}); rc != 0 {
 		t.Fatalf("Run --serve --probe with zero shares failed: %s", stderr.String())
 	}
 	for _, c := range runner.calls {
 		if len(c.Args) >= 2 && c.Args[0] == "snap" && c.Args[1] == "restore" {
-			if slices.Contains(c.Args, "-v") {
-				t.Errorf("expected zero -v volume flags when no paths are given, got %v", c.Args)
+			for i := 0; i < len(c.Args)-1; i++ {
+				if c.Args[i] == "-v" && strings.Contains(c.Args[i+1], ":/workspace") {
+					t.Errorf("expected zero /workspace mounts when no paths are given, got %v", c.Args)
+				}
 			}
 			if !slices.Contains(c.Args, "127.0.0.1:4321:3000") {
 				t.Errorf("expected loopback-only port binding 127.0.0.1:4321:3000 in %v", c.Args)
 			}
 			if !slices.Contains(c.Args, "allow:ingress@loopback:tcp:3000") {
 				t.Errorf("expected loopback ingress rule allow:ingress@loopback:tcp:3000 in %v", c.Args)
+			}
+		}
+	}
+	runner.calls = nil
+	if rc := app.dispatch(ctx, []string{"run", "--name", "noshare2", "--no-remote", "--serve", "--probe", "--port", "4322"}); rc != 0 {
+		t.Fatalf("Run --no-remote --serve --probe with zero shares failed: %s", stderr.String())
+	}
+	for _, c := range runner.calls {
+		if len(c.Args) >= 2 && c.Args[0] == "snap" && c.Args[1] == "restore" {
+			if slices.Contains(c.Args, "-v") {
+				t.Errorf("expected zero -v volume flags when --no-remote and no paths are given, got %v", c.Args)
 			}
 		}
 	}

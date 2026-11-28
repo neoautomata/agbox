@@ -631,6 +631,8 @@ func (a *appRuntime) serviceAdd(ctx context.Context, opts serviceOpts) error {
 		NoSkills:     runOpts.NoSkills,
 		NoRules:      runOpts.NoRules,
 		NoAgentCache: runOpts.NoAgentCache,
+		Remote:       runOpts.Remote,
+		NoRemote:     runOpts.NoRemote || (!runOpts.Remote && !a.Env.RemoteDefault),
 		EnvFile:      envFilePath,
 	}
 
@@ -1344,6 +1346,8 @@ func runOptsFromSpec(spec service.Spec, allowRoot bool) runOpts {
 		NoSkills:      spec.NoSkills,
 		NoRules:       spec.NoRules,
 		NoAgentCache:  spec.NoAgentCache,
+		Remote:        spec.Remote,
+		NoRemote:      spec.NoRemote,
 		Supervised:    true,
 	}
 }

@@ -248,6 +248,11 @@ func TestUnmountFilterDirPreservesMetadataAndHandlesListMountErrors(t *testing.T
 	if lErr == nil {
 		_ = ln.Close()
 	}
+	remoteSockPath := filepath.Join(runDir, "remote.sock")
+	rln, rlErr := net.Listen("unix", remoteSockPath)
+	if rlErr == nil {
+		_ = rln.Close()
+	}
 
 	ctl := &fakeController{
 		mounts: []Entry{{MountPoint: mp, FSType: "fuse.agboxfilter"}},
@@ -257,6 +262,12 @@ func TestUnmountFilterDirPreservesMetadataAndHandlesListMountErrors(t *testing.T
 	}
 	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
 		t.Errorf("expected m0.pid to be deleted, err = %v", err)
+	}
+	if _, err := os.Lstat(sockPath); !os.IsNotExist(err) {
+		t.Errorf("expected ws.sock to be deleted, err = %v", err)
+	}
+	if _, err := os.Lstat(remoteSockPath); !os.IsNotExist(err) {
+		t.Errorf("expected remote.sock to be deleted, err = %v", err)
 	}
 	if _, err := os.Stat(suspendedPath); err != nil {
 		t.Errorf("expected suspended metadata to remain intact, err = %v", err)

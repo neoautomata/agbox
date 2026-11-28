@@ -13,9 +13,10 @@ For architecture and security properties, see [README.md](README.md).
 1. [Run agents and share project directories](#5-run-agents-and-share-project-directories)
 1. [Persist conversations and manage sandboxes](#6-persist-conversations-and-manage-sandboxes)
 1. [Connect by web interface or Remote Control](#7-connect-by-web-interface-or-remote-control)
-1. [Update agents and customize the base image](#8-update-agents-and-customize-the-base-image)
-1. [CLI reference, environment variables, and deletion](#9-cli-reference-environment-variables-and-deletion)
-1. [Troubleshooting](#10-troubleshooting)
+1. [Run approved commands on a remote machine](#8-run-approved-commands-on-a-remote-machine)
+1. [Update agents and customize the base image](#9-update-agents-and-customize-the-base-image)
+1. [CLI reference, environment variables, and deletion](#10-cli-reference-environment-variables-and-deletion)
+1. [Troubleshooting](#11-troubleshooting)
 
 ## 1. Install and check the host
 
@@ -46,7 +47,7 @@ The installer runs these steps:
 1. It warns when the install directory is not on `PATH`.
 
 > [!TIP]
-> Pass `--skip-setup` on hosts without `/dev/kvm`, such as headless containers. To load bash completion directly in `~/.bashrc`, add `eval "$(agbox completion bash)"`.
+> Pass `--skip-setup` on hosts without `/dev/kvm`, such as headless containers. Pass `--remote-only` on a remote machine to install `agbox` for `agbox remote serve` without KVM, FUSE, `msb`, rules, or setup. It still installs bash completion unless you pass `--skip-completion`. To load bash completion in `~/.bashrc`, add `eval "$(agbox completion bash)"`.
 
 To check the host again at any time, run these commands:
 
@@ -198,6 +199,7 @@ When `$DATA_DIR/rules` holds `.md` files (64 KiB maximum each), `agbox run` moun
 - Plain Markdown files and `trigger: always_on` files merge in a fixed order. `AGENTS.md` and `GEMINI.md` come first. Then `*.md` files follow in alphabetical order. The result is `/etc/agbox-global-rules/AGENTS.md` (mode `0444`).
 - `agbox` bind-mounts that file read-only onto `/home/agent/.gemini/config/AGENTS.md` and `/home/agent/.config/opencode/AGENTS.md`. Both `agy` and `opencode` read it.
 - Antigravity rule files with YAML frontmatter (`trigger: glob`, `model_decision`, or `manual`) go to `/etc/agbox-global-rules/rules/*.md` (mode `0444`). `agbox` bind-mounts that directory read-only onto `/home/agent/.gemini/config/rules`.
+- When the remote bridge is active and `--no-rules` is absent, `agbox` merges `/home/agent/.agbox-remote/INSTRUCTIONS.md` into `/etc/agbox-global-rules/AGENTS.md`. This runs even when `$DATA_DIR/rules` is empty.
 - Host edits to `$DATA_DIR/rules` apply on the next `agbox run` or `agbox resume`. You do not rebuild `agbox:vN`.
 - Antigravity truncates any single rule file larger than 24,000 bytes inline. Keep each rule file concise or split large rules.
 
@@ -360,7 +362,7 @@ agbox stop agbox-myapp
 
 `--persist` keeps conversation databases, artifacts, `apt` packages, and build caches in `agbox-<name>`. A stopped `agbox-<name>` uses no host CPU, RAM, or FUSE processes.
 
-Resuming a suspended sandbox with `agbox run --persist` rejects non-default network, CPU, RAM, port, share access, or VCS mask flags. It also rejects sandboxes that use `--profile`.
+Resuming a suspended sandbox with `agbox run --persist` rejects non-default network, CPU, RAM, port, share access, or VCS mask flags. It also rejects `--remote` or `--no-remote` flags that disagree with the recorded sandbox, and refuses `--profile` sandboxes.
 
 ### Conversation profile (`--profile`)
 
@@ -435,7 +437,7 @@ Delete a running or suspended sandbox and its `$DATA_DIR/run/<id>` state:
 agbox stop agbox-feature-auth
 ```
 
-Run `agbox status` to show base config, `auth`, `cached_agents`, skills, rules, profiles, `services` (with linger state), sandboxes, snapshots, and storage.
+Run `agbox status` to show base config, `auth`, `cached_agents`, skills, rules, profiles, and `services` (with linger state). It also shows `remote` (`default_policy` and live bridges), sandboxes, snapshots, and storage.
 
 ## 7. Connect by web interface or Remote Control
 
@@ -544,7 +546,207 @@ Rules for `agbox service`:
 - Saved `agbox auth` credentials stream automatically at boot. Every `--env-file` must be a regular file with mode `0600` or stricter and zero symlinks. `agbox` never writes secrets into `agbox@.service`.
 - After an unclean host reboot, the supervisor recovers stopped `--persist` sandboxes and deletes stale ephemeral sandboxes before startup.
 
-## 8. Update agents and customize the base image
+## 8. Run approved commands on a remote machine
+
+Use `agbox remote` to let a sandboxed agent request commands on a pre-connected remote machine under policy and human review. The guest keeps its default firewall or `--no-net`, and no remote credentials enter the microVM.
+
+```mermaid
+flowchart LR
+    GUEST["Guest (agbox-remote)"] --> BRIDGE["In-Memory FUSE Bridge (remote.sock)"]
+    BRIDGE --> BROKER["Host Broker (Policy + Phase 1/2 TTY)"]
+    BROKER <-->|"TLS 1.3 mTLS + 60-bit SAS"| DAEMON["Remote Daemon (execve, no shell)"]
+```
+
+`agbox run` mounts the in-memory remote bridge at `/home/agent/.agbox-remote` and links `/usr/local/bin/agbox-remote` by default. Pass `--no-remote` or set `AGBOX_REMOTE=0` to disable it. Without an attached host broker, every guest `agbox-remote` call returns `exit 126` (`agbox-remote: command denied`).
+
+### Quick workflow
+
+1. **Install and start the daemon on the remote machine:**
+
+   ```bash
+   # On the remote machine (no KVM, msb, or FUSE required)
+   ./install.sh --remote-only
+   agbox remote serve --listen 192.168.1.50 --allow-from 192.168.1.10/32 --allow-cwd /srv/app
+   ```
+
+   `agbox remote serve` prints its bound `IP:PORT` and waits for pairing.
+
+1. **Create a starter policy and connect from the host:**
+
+   ```bash
+   # On the host running the agbox sandbox
+   agbox remote policy init
+   agbox remote policy check
+   agbox remote policy test -- uname -a
+   agbox remote connect --sandbox agbox-myapp 192.168.1.50:41234
+   ```
+
+   Both terminals show a 12-character Short Authentication String (`XXXX-XXXX-XXXX`) bound to the TLS 1.3 mTLS session. Check that both codes match, then enter `y` at `Confirm match [y/N]:` on both terminals.
+
+1. **Run structured commands from the sandbox:**
+
+   ```bash
+   agbox-remote --cwd /srv/app -- git status -s
+   agbox-remote --stdin-file payload.json -- jq .data
+   agbox-remote --stdin -- jq .data < payload.json
+   ```
+
+   The broker evaluates your hot-reloaded JSON policy (`deny > ask > allow > session > default`). Neither the broker nor the daemon runs a shell.
+
+### Remote install without Go and SSH tunnels
+
+On a remote machine without Go, cross-compile a static binary on your host and copy it over:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -buildvcs=false -trimpath -o agbox-linux-arm64 ./cmd/agbox
+```
+
+When the remote machine sits behind NAT or a firewall, run `agbox remote serve` over an SSH local forward (`-t` allocates the required TTY):
+
+```bash
+# Terminal 1 (Remote daemon over SSH tunnel)
+ssh -t -L 127.0.0.1:49200:127.0.0.1:49200 user@remote \
+  agbox remote serve --listen 127.0.0.1:49200 --allow-from 127.0.0.1/32
+
+# Terminal 2 (Host broker)
+agbox remote connect 127.0.0.1:49200
+```
+
+### Dynamic sandbox attachment and cancellation
+
+- **Automatic attachment:** With no `--sandbox` flag, `agbox remote connect` attaches when 1 remote-enabled sandbox runs. If 0 run, it waits and attaches when one starts. If more than 1 run, it prompts you to pick one.
+- **Named attachment:** `--sandbox` accepts `foo` or `agbox-foo`. It waits and re-attaches automatically across sandbox restarts while keeping the paired TLS link active.
+- **Active cancel:** Press `Ctrl-C` during command execution to cancel only the active remote command without dropping the TLS link. Press `Ctrl-C` while idle to send `BYE` and exit cleanly.
+
+> [!WARNING]
+>
+> - If the policy file becomes unreadable, world-writable, symlinked, or invalid during hot-reload, the broker switches to fail-closed `DENY-ALL` until a valid file replaces it.
+> - Pass `--allow-new-privs` or `--allow-root` to `agbox remote serve` only when required. By default, the daemon runs non-root and sets `PR_SET_NO_NEW_PRIVS` on every child process.
+
+<details>
+<summary>Interactive review keys (Phase 1, Phase 2, and idle menu)</summary>
+
+Every decision needs a letter plus Enter. Bare Enter, EOF, or timeout defaults to `[d]` Deny. `--ask-timeout` starts when a prompt appears and pauses while `$EDITOR` or `$PAGER` runs.
+
+**Phase 1 (request review):**
+
+| Key | Action |
+|---|---|
+| `a` | Approve the request as shown. |
+| `o` | Approve the request and enable Phase 2 output review (shown when output review is off). |
+| `s` | Approve this exact command for the session (shown only when stdin is empty and executable is not an interpreter). |
+| `e` | Edit the request JSON in a hardened `$EDITOR` (`tmpfs` temp file, no swap or history). Re-checks policy before returning to Phase 1. |
+| `i` | Edit non-empty UTF-8 stdin in `$EDITOR` and return to Phase 1. |
+| `v` | View full sanitized stdin in `$PAGER` (shown when stdin is non-empty). |
+| `m` | Deny with a one-line operator note sent back to the guest. |
+| `d` | Deny with uniform `exit 126` (default on bare Enter or timeout). |
+
+**Phase 2 (output review, enabled with `--output-review`, policy, or `[o]`):**
+
+| Key | Action |
+|---|---|
+| `a` | Approve and send redacted output and exit code to the guest. |
+| `v` | View full sanitized output in `$PAGER` (shown when output is non-empty). |
+| `r` | Redact the single non-empty UTF-8 stream in `$EDITOR` and return to Phase 2. |
+| `r1`, `r2` | Redact stdout (`r1`) or stderr (`r2`) when both streams are non-empty UTF-8. |
+| `x` | Drop output streams and return only the exit code with a drop note. |
+| `m` | Deny with a one-line operator note. |
+| `d` | Deny and drop the entire response with uniform `exit 126` (default). |
+
+**Idle menu (when no request is active):**
+
+| Key | Action |
+|---|---|
+| `w` | Switch the attached sandbox. |
+| `t` | Toggle Phase 2 output review for subsequent runs. |
+| `c` | List or clear temporary session approvals. |
+| `q` | Send `BYE` and exit cleanly. |
+
+</details>
+
+<details>
+<summary>CLI options for agbox remote and in-VM agbox-remote</summary>
+
+**`agbox remote serve [options]`:**
+
+| Option | Effect |
+|---|---|
+| `--listen IP[:PORT]` | Bind a specific IP or `IP:PORT` (default: all interfaces, ephemeral port). |
+| `--port PORT` | Bind a specific port. Conflicts with `--listen IP:PORT`. |
+| `--allow-from CIDR,...` | Permit only matching source IPs or CIDRs (repeatable). |
+| `--allow-cwd DIR` | Restrict remote working directories to `DIR` (repeatable, canonicalized). |
+| `--path DIR:...` | Override remote `PATH` before sanitization. Conflicts with `--strict-path`. |
+| `--strict-path` | Limit remote `PATH` to trusted system directories only. |
+| `--pass-env VAR` | Forward safe host variable `VAR` to remote commands (repeatable, rejects `LD_*`, `PATH`, and shell hooks). |
+| `--max-output BYTES` | Cap combined stdout and stderr (default `256K`, max `2M`). |
+| `--max-stdin BYTES` | Cap stdin payload size (default `256K`, max `256K`). |
+| `--exec-timeout DUR` | Cap remote command duration (default `300s`). |
+| `--idle-timeout DUR` | Exit after idle duration (default `4h`). |
+| `--reconnect-grace DUR` | Hold pinned peer identity after TCP drop (default `5m`). |
+| `--allow-new-privs` | Disable `PR_SET_NO_NEW_PRIVS` on child processes. |
+| `--allow-root` | Allow running the daemon as `root`. |
+
+**`agbox remote connect [options] <HOST:PORT>`:**
+
+| Option | Effect |
+|---|---|
+| `--sandbox NAME` | Attach to `NAME` (`foo` or `agbox-foo`) and re-attach across restarts. |
+| `--policy PATH` | Load and hot-reload JSON policy (default: `$DATA_DIR/remote-policy.json`). |
+| `--no-policy` | Ignore `$DATA_DIR/remote-policy.json` and prompt on every command. |
+| `--output-review` | Enable Phase 2 output review on every executed command. |
+| `--redact-pattern REGEX` | Add an extra baseline secret redaction regex (repeatable). |
+| `--max-output BYTES` | Cap combined stdout and stderr (default `256K`, max `2M`). |
+| `--ask-timeout DUR` | Phase 1 and Phase 2 review timeout (default `120s`). |
+| `--audit-log PATH` | Write redacted JSONL audit log (default: `$DATA_DIR/remote-audit.jsonl`). |
+| `--allow-root` | Allow running the broker as `root`. |
+
+**`agbox remote policy <init|check|test>`:**
+
+| Subcommand | Purpose |
+|---|---|
+| `init [--output PATH] [--force]` | Write starter policy JSON at mode `0600` (default: `$DATA_DIR/remote-policy.json`). |
+| `check [--policy PATH \| PATH]` | Check policy syntax, file permissions, and GTFOBins warnings. |
+| `test [--policy PATH] [--cwd DIR] [--stdin] [--] <EXEC> [ARG...]` | Dry-run policy evaluation for one command without connecting. |
+
+**In-VM `agbox-remote [options] [--] <EXECUTABLE> [ARG...]`:**
+
+| Option or exit code | Meaning |
+|---|---|
+| `--cwd DIR` | Absolute remote working directory. |
+| `--exec-timeout DUR` | Requested timeout in seconds or Go duration (alias: `--timeout`). |
+| `--reason "TEXT"` | Short explanation shown to the host operator during Phase 1 review. |
+| `--stdin` | Read opt-in stdin from a pipe, heredoc, or file redirect (max 256 KiB, rejects TTY). |
+| `--stdin-file PATH` | Read opt-in stdin from a regular guest file (max 256 KiB). |
+| Exit `0..255` | Remote command exit code on completed runs. |
+| Exit `126` | Command denied by policy or operator, or no host broker attached. |
+| Exit `124` | Approved command timed out on the remote machine. |
+| Exit `2` | Local `agbox-remote` flag, path, or stdin size error. |
+| Exit `130` or `143` | Cancelled locally by `SIGINT` or `SIGTERM` (also cancels remote execution). |
+
+</details>
+
+<details>
+<summary>JSON policy schema and audit log</summary>
+
+**Policy schema (`version: 1`, unknown fields rejected):**
+
+- **Top-level fields:** `version` (`1`), optional `description` and `comment`, `default_action` (`"ask"` or `"deny"`), `per_run_output_review` (`"off"`, `"ask_only"`, or `"always"`), `limits`, `auto_redact`, and `rules` (max 500).
+- **`limits`:** `max_stdin_bytes` (default and max 256 KiB), `max_output_bytes` (default 256 KiB, max 2 MiB combined), `max_exec_timeout_sec` (default 300), and `ask_timeout_sec` (default 120).
+- **`auto_redact`:** `enabled` (default `true`) and `extra_patterns` (max 100 regexes, 1024 bytes each). Baseline redaction masks PEM private keys (complete or truncated), AWS keys, provider tokens, JWTs, auth headers, cookies, and URL userinfo.
+- **`rules`:** `id`, `action` (`"deny"`, `"ask"`, or `"allow"`), `output_review`, `executables` (no `"*"` in `allow`), `args` (`exact`, `prefix`, anchored `arg_patterns`, `max_args`, `forbid_arg_patterns`, or explicit `allow_any_args: true`), `cwd_allow`, `cwd_deny`, `allow_stdin` (default `false` for `allow`), and `allow_interpreter` (default `false`).
+- **Precedence and guardrails:** Evaluation order is `deny > ask > allow > session > default_action`. Built-in guardrails block `allow` rules on shells, interpreters, and wrappers unless the rule sets `allow_interpreter: true`. `policy check` warns on broad GTFOBins rules (`git`, `tar`, `find`, `kubectl`, `curl`, `rsync`, `ssh`).
+- **Hot-reload checks:** The broker polls every 1 second and before each request. It opens the file with `O_NOFOLLOW`, checks regular file type, size (`<= 512 KiB`), owner UID, and mode (`0600` or no group/world write). It fails closed to `DENY-ALL` on any error.
+
+**Audit log (`$DATA_DIR/remote-audit.jsonl`):**
+
+- Opens with `O_NOFOLLOW|O_APPEND|O_CREAT` at mode `0600` and rotates to `.1` at 10 MiB.
+- Redacts secrets in logged `args` and Phase 1 `edits`.
+- Records only `stdin` SHA-256 digest and byte length, never raw stdin bytes.
+- Coalesces repeated identical denials into one summary entry.
+
+</details>
+
+## 9. Update agents and customize the base image
 
 Use `agbox update` to refresh `agy` and `opencode` quickly. Use `agbox edit-base` to add categories or packages to the base snapshot.
 
@@ -598,7 +800,7 @@ agbox edit-base --shell
 
 Pass `--no-snap` to keep edits in `agbox-base` without a new snapshot.
 
-## 9. CLI reference, environment variables, and deletion
+## 10. CLI reference, environment variables, and deletion
 
 ### Commands
 
@@ -618,12 +820,13 @@ Run `agbox <mode> --help` for the flags of each mode. Run `agbox --help` for the
 | `agbox profile [list\|create [--size SIZE] <name>\|rm [--force] <name>]` | Manages `ext4` conversation profiles. |
 | `agbox share <list\|add\|set\|rm> <sandbox> [...]` | Manages `/workspace` shares on a running or suspended sandbox. |
 | `agbox service <list\|add\|enable\|disable\|start\|stop\|restart\|logs\|rm\|linger> [...]` | Manages `systemd --user` services (`agbox@.service`) that start at boot and stay active after logout. |
+| `agbox remote <serve\|connect\|policy> [...]` | Runs the remote command daemon, pairs a host approval broker with a sandbox, or manages policy files. |
 | `agbox run [options] [opencode\|antigravity] [path[:opts]...]` | Restores a sandbox and runs an agent or command. |
 | `agbox suspend <sandbox>` | Stops a sandbox, keeps its root disk, and unmounts its shares. |
 | `agbox resume [-d] [-c] [-s\|--session ID] [--no-auth] [--no-skills] [--no-rules] [--no-agent-cache] <sandbox>` | Checks shares, mounts FUSE, starts the sandbox, and restarts its agent. |
 | `agbox stop <sandbox>` | Deletes a running or suspended sandbox and unmounts its shares. |
 | `agbox remove [-y]` | Deletes all `agbox` state. See [Delete all state](#delete-all-state-agbox-remove). |
-| `agbox status` | Shows base config, `auth`, `cached_agents`, skills, rules, profiles, `services` (with linger state), sandboxes, snapshots, and storage. |
+| `agbox status` | Shows base config, `auth`, `cached_agents`, skills, rules, profiles, `services`, `remote` (`default_policy` and live bridges), sandboxes, snapshots, and storage. |
 
 Every mode accepts `--allow-root` (or `AGBOX_ALLOW_ROOT=1`) for host `root`.
 
@@ -642,6 +845,8 @@ Place all options before the agent name and the paths.
 | `--no-skills` | Skips global skills from `$DATA_DIR/skills`. |
 | `--no-rules` | Skips global rules from `$DATA_DIR/rules`. |
 | `--no-agent-cache` | Skips cached agent binaries from `$DATA_DIR/agents`. |
+| `--remote` | Requires the remote FUSE bridge (enabled by default). |
+| `--no-remote` | Disables the remote FUSE bridge (distinct from `--remote-control`). |
 | `--share PATH[:OPTS]` | Shares a host path. Modifiers: `ro`, `rw`, `mask`, `vcs`, `vcs-hooks`, `as=NAME`. |
 | `--share-hub` | Mounts an empty `/workspace` hub for live shares. |
 | `--ro`, `--rw` | Sets the default share access. Rejects a conflicting modifier. |
@@ -680,6 +885,7 @@ Options also accept the `--name=NAME` form. A `--` argument ends option parsing.
 | `AGBOX_ROOT_DISK` | `50G` | Default sparse root disk size for `create-base` and `edit-base`. |
 | `AGBOX_PROFILE_DISK` | `10G` | Default `ext4` disk size for `agbox profile create` and `run --profile`. |
 | `AGBOX_MASK_VCS` | `strict` | VCS filter policy: `strict`, `auto`, or `off`. |
+| `AGBOX_REMOTE` | `1` | Set to `0` to disable the remote FUSE bridge by default on `agbox run`. |
 | `AGBOX_ALLOW_OUTSIDE_HOME` | `0` | Set to `1` to allow shares outside `$HOME`. The blocklists still apply. |
 | `AGBOX_OPENCODE_VERSION` | `latest` | The npm version or tag of `opencode-ai` for `create-base` and `update`. |
 | `AGBOX_AGY_INSTALLER_URL` | `https://antigravity.google/cli/install.sh` | The `agy` installer URL for `create-base` and `update`. It must use HTTPS. |
@@ -693,6 +899,7 @@ The values `1`, `true`, and `yes` mean `strict` for `AGBOX_MASK_VCS`. The values
 > [!WARNING]
 >
 > - `AGBOX_MASK_VCS=auto` mounts shares directly with no VCS masking when the Workspace Hub cannot start. `agbox` prints a warning. `off` always mounts directly.
+> - Under `--no-mask` or `AGBOX_MASK_VCS=auto`, `agbox` warns and disables the remote FUSE bridge on FUSE failure unless you pass `--remote`.
 > - `AGBOX_ALLOW_OUTSIDE_HOME=1` lets you share paths outside `$HOME`. Check each path before you share it.
 
 ### Delete all state (`agbox remove`)
@@ -708,7 +915,7 @@ agbox remove
 agbox remove --yes
 ```
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom or error | Cause | Fix |
 |---|---|---|
@@ -721,3 +928,8 @@ agbox remove --yes
 | `resume` warns about new skills, rules, or updates | `agbox` created the sandbox before those host directories held files. | Run `agbox stop <sandbox>` and start a new sandbox to mount the new directories. |
 | `service enable` linger blocked or `--env-file` rejected | Polkit blocked unprivileged `loginctl`, or the env file is a symlink or wider than mode `0600`. | Run `sudo loginctl enable-linger "$USER"` once. Store `--env-file` as a regular file with `chmod 600`. |
 | Antigravity truncates a global rule | Antigravity caps inline loading at 24,000 bytes per rule file. | Shorten the rule file or split it into smaller `.md` files under `$DATA_DIR/rules`. |
+| `agbox-remote` exits `126` (`command denied`) | No host broker attached, or the policy or operator denied the request. | Start `agbox remote connect`, check `agbox status`, or test the command with `agbox remote policy test`. |
+| `remote bridge requires a static agbox binary` | The host binary links dynamically (`PT_INTERP` present) and cannot run inside the guest. | Rebuild with `CGO_ENABLED=0 go build ./cmd/agbox` (or run `./install.sh`), or pass `--no-remote`. |
+| `interactive TTY required` on `remote serve` or `connect` | Standard input or output is not a terminal (common over plain `ssh`). | Run from an interactive terminal, or pass `ssh -t` when starting `agbox remote serve` over SSH. |
+| Broker switches policy to `DENY-ALL` | Policy hot-reload failed on permissions, symlinks, missing file, or invalid JSON. | Run `chmod 600` on the policy file, fix syntax errors, and check it with `agbox remote policy check`. |
+| `remote bridge requires FUSE` | `/dev/fuse` or `fusermount3` failed while mounting `/home/agent/.agbox-remote`. | Fix FUSE access on the host, or pass `--no-remote` (or set `AGBOX_REMOTE=0`). |

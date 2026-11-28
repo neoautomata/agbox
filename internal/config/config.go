@@ -86,6 +86,7 @@ type Env struct {
 	MaskVCS          MaskMode
 	AllowOutsideHome bool
 	AllowRoot        bool
+	RemoteDefault    bool
 }
 
 // FromLookup builds an Env from getenv and the resolved home directory path.
@@ -191,6 +192,7 @@ func FromLookup(homeReal string, getenv func(string) string) (Env, error) {
 		MaskVCS:          maskMode,
 		AllowOutsideHome: strings.TrimSpace(getenv("AGBOX_ALLOW_OUTSIDE_HOME")) == "1",
 		AllowRoot:        strings.TrimSpace(getenv("AGBOX_ALLOW_ROOT")) == "1",
+		RemoteDefault:    strings.TrimSpace(getenv("AGBOX_REMOTE")) != "0",
 	}, nil
 }
 
@@ -466,6 +468,8 @@ type RunMeta struct {
 	RulesMounted    bool          `json:"rules_mounted,omitempty"`
 	NoAgentCache    bool          `json:"no_agent_cache,omitempty"`
 	AgentsMounted   bool          `json:"agents_mounted,omitempty"`
+	NoRemote        bool          `json:"no_remote,omitempty"`
+	RemoteBridge    bool          `json:"remote_bridge,omitempty"`
 	Shares          []ShareRecord `json:"shares,omitempty"`
 }
 
@@ -497,6 +501,9 @@ func validateRunMeta(meta RunMeta, op string) error {
 		default:
 			return fmt.Errorf("%s: invalid mask_mode %q", op, meta.MaskMode)
 		}
+	}
+	if meta.RemoteBridge && meta.NoRemote {
+		return fmt.Errorf("%s: conflicting remote_bridge and no_remote flags", op)
 	}
 	for _, sh := range meta.Shares {
 		if sh.Index < 0 {

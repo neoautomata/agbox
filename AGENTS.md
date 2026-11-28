@@ -4,13 +4,13 @@ This file defines the architecture, the Safe-by-Default security rules, the upst
 
 ## 1. Project overview and architecture
 
-`agbox` runs AI coding agents (`opencode` and `agy`) in isolated Linux microVMs. A microVM runs on `msb` (`libkrun` and `/dev/kvm`). This file calls one microVM a sandbox. One binary (`cmd/agbox`) serves the user CLI and three hidden internal subcommands: `__filter` (FUSE daemon), `__complete` (shell completion), and `__service-run` (systemd supervisor).
+`agbox` runs AI coding agents (`opencode` and `agy`) in isolated Linux microVMs. A microVM runs on `msb` (`libkrun` and `/dev/kvm`). This file calls one microVM a sandbox. One binary (`cmd/agbox`) serves the user CLI and the guest remote client (`agbox-remote` or `__guest-remote`). It also runs three hidden subcommands: `__filter` (FUSE Workspace Hub and remote bridge), `__complete` (shell completion), and `__service-run` (systemd supervisor).
 
 ### Repository map
 
 | Path | Responsibility |
 |---|---|
-| `cmd/agbox` | Entrypoint. Routes `__filter` to `vcsfuse`, and routes user commands, `__complete`, and `__service-run` to `cli.Main`. |
+| `cmd/agbox` | Entrypoint. Routes `agbox-remote` and `__guest-remote` to `remoteclient`, `__filter` (`-bridge` to `remotebridge`, else `vcsfuse`), and other commands to `cli.Main`. |
 | `internal/complete` | Pure shell completion engine and bash completion script generator. |
 | `internal/config` | Environment parsing, private state directories (`0700`, `0600`), snapshot numbers, and `run.meta` files. |
 | `internal/pathsec` | Path canonicalization, `$HOME` containment, blocklists, share modifiers, alias checks, and disjointness checks. |
@@ -18,16 +18,22 @@ This file defines the architecture, the Safe-by-Default security rules, the upst
 | `internal/mounttab` | `/proc/self/mountinfo` parsing, `/proc/<pid>/cmdline` checks before signals, and mount-verified directory cleanup. |
 | `internal/msb` | `msb` argument builders, default-deny network rules, volume helpers, guest scripts, categories, and the `Runner` interface. |
 | `internal/persist` | Credential capture, the agent cache, skills, rules, and `flock`-guarded profile volumes. |
+| `internal/remoteproto` | Wire framing, duration and byte-size parsers, ephemeral Ed25519 TLS 1.3 mTLS, Vaudenay 3-move commit-reveal 60-bit SAS pairing, output sanitizer, and baseline secret redactor. |
+| `internal/remotepolicy` | Strict JSON policy engine (`deny > ask > allow > session > default`), anchored regex patterns, interpreter guardrails, CWD scoping, and fail-closed `O_NOFOLLOW` hot-reloader. |
+| `internal/remotebridge` | In-memory FUSE virtual bridge (`/home/agent/.agbox-remote`) serving pinned static ELF `bin/agbox-remote`, `INSTRUCTIONS.md`, bounded slots, and `SO_PEERCRED`-checked `remote.sock`. |
+| `internal/remoteclient` | In-VM `agbox-remote` CLI client with opt-in stdin caps, adaptive `done/` polling, close-before-unlink, and uniform deny exit `126`. |
+| `internal/remotedaemon` | Remote target daemon (`agbox remote serve`) with TLS 1.3 mTLS, `allow-from` CIDR checks, `PR_SET_NO_NEW_PRIVS`, `Setsid`, `openat2`-pinned `cwd`, and sanitized `PATH`. |
+| `internal/remotebroker` | Host interactive approval broker (`agbox remote connect`), two-phase review, hardened editor editing, session rules, and redacted JSONL audit logging. |
 | `internal/service` | Template unit (`agbox@.service`) for `systemd --user`, mode `0600` specs, env-file parsing, and `Controller` interface. |
-| `internal/cli` | Argument parsers, mode dispatch, and orchestration. `cli.Main` is the only export. Files: `cli.go`, `parse.go`, `usage.go`, `base.go`, `run.go`, `lifecycle.go`, `persist_modes.go`, `share_mode.go`, `service_mode.go`, `update_mode.go`, `completion_mode.go`. |
-| `install.sh` | Idempotent prerequisite check, static build, and atomic install. |
+| `internal/cli` | Argument parsers, mode dispatch, and orchestration. `cli.Main` is the only export. Files: `cli.go`, `parse.go`, `usage.go`, `base.go`, `run.go`, `lifecycle.go`, `persist_modes.go`, `share_mode.go`, `service_mode.go`, `remote_mode.go`, `update_mode.go`, `completion_mode.go`. |
+| `install.sh` | Idempotent prerequisite check, static build, and atomic install (`--remote-only` skips KVM, FUSE, and `msb` checks). |
 | `AGBOX_ENV_RULES.md` | Default guest rules. `install.sh` and `agbox setup` install them into `$DATA_DIR/rules`. |
 | `test.sh` | End-to-end verification harness. |
 | `README.md` | Overview, quick start, and security summary. |
 | `USER_GUIDE.md` | User workflows, categories, CLI reference, and environment variables. |
 | `AGENTS.md` | Onboarding, security rules, `msb` contracts, `test.sh` rules, and the verification checklist. |
 
-Write pure functions for parsing, validation, and command construction. Inject side effects through interfaces and function fields. For example, `msb.Runner`, `mounttab.Controller`, `service.Controller`, and the `StartFilter` and `StartHub` fields of the `cli` runtime. Tests then run without root and without `/dev/kvm`.
+Write pure functions for parsing, validation, and command construction. Inject side effects through interfaces and function fields. For example, `msb.Runner`, `mounttab.Controller`, `service.Controller`, and the `StartFilter`, `StartHub`, and `StartRemoteBridge` fields of the `cli` runtime. Tests then run without root and without `/dev/kvm`.
 
 `persist_test.go` compares the headings of `AGBOX_ENV_RULES.md` with `defaultEnvRuleMarkdown` in `internal/persist/persist.go`. Edit both files together.
 
@@ -54,7 +60,7 @@ Every default must choose the most restrictive behavior. Each privilege increase
 
 - Reject host `root` (`euid == 0`) unless you pass `--allow-root` or set `AGBOX_ALLOW_ROOT=1`.
 - Create state directories with `config.EnsurePrivateDir`. It rejects symlinks and sets mode `0700`. Write metadata and secret files at mode `0600`.
-- Redirect `stderr` of each background FUSE daemon to a private `.err` file (`ws.err` or `m*.err`, mode `0600`). Never inherit `os.Stdout` or `os.Stderr`. This stops `$(agbox run -d ... 2>&1)` from hanging.
+- Redirect `stderr` of each background FUSE daemon to a private `.err` file (`ws.err`, `remote.err`, or `m*.err`, mode `0600`). Never inherit `os.Stdout` or `os.Stderr`. This stops `$(agbox run -d ... 2>&1)` from hanging.
 - Before a signal, check that `/proc/<pid>/cmdline` matches `agbox __filter` and the target directory (`mounttab.IsFilterCmdline`).
 - Before `os.RemoveAll` on a run directory, unmount the FUSE shares. Then check that zero mounts remain in `/proc/self/mountinfo` (`mounttab.TeardownFilterDir`).
 
@@ -73,7 +79,7 @@ flowchart TD
     G --> H
 ```
 
-- Mount zero host paths and start zero FUSE daemons when `agbox run` gets no path and no `--share-hub`.
+- Mount zero host workspace paths and start zero Workspace Hub (`vcsfuse`) daemons when `agbox run` gets no path and no `--share-hub`. Flags `--no-remote` and `AGBOX_REMOTE=0` control the in-memory remote bridge separately.
 - Reject conflicting flags and modifiers with an error. Examples: `--ro` with `--rw`, `:ro,rw`, `:mask,vcs`, `:ro,vcs-hooks`, and `:vcs` on a single-file share. Never resolve a conflict silently.
 - Run `pathsec.ValidateShare` on every share in `run`, `resume`, and `share add`:
   - Resolve symlinks. Reject missing paths, dangling symlinks, and control characters.
@@ -132,6 +138,16 @@ flowchart TD
 - Guard each `--profile` `ext4` volume with an exclusive host `flock` on `$DATA_DIR/profiles/.<name>.lock`. The lock file stays outside the profile directory. Refresh `msb ls` after you take the lock. Hold the lock during `profile rm`. Find the `disk.raw` file with `msb.ResolveVolumeDiskPath`. Attach it with `--mount-disk <disk.raw>:/home/agent/.agbox-profile:rw,format=raw,fstype=ext4`.
 - A profile name has 48 characters or fewer. A run name has 63 characters or fewer. `agbox` reserves the names `base` and `run-<digits>`.
 
+### Remote command bridge and broker
+
+- `agbox run` mounts the in-memory FUSE remote bridge at `/home/agent/.agbox-remote` (`:rw,stat-virt=off`) by default. Pass `--no-remote` or set `AGBOX_REMOTE=0` to disable it. Disposable `agbox auth` and `agbox update` sandboxes always disable it.
+- Under `--no-mask` or `AGBOX_MASK_VCS=auto` without explicit `--remote`, a failed bridge start prints a warning and disables the bridge with zero mount.
+- The bridge stays strictly in memory (`max 4` slots, `16 MiB` cap, token-bucket rate limit, `512 KiB` per request). It serves a pinned static ELF at `bin/agbox-remote` and `INSTRUCTIONS.md`.
+- `remote.sock` binds at mode `0600` in a `0700` directory with mutual `SO_PEERCRED` checks. Without a connected host broker, all guest requests return uniform `exit 126` (`agbox-remote: command denied`) after random jitter.
+- `agbox remote connect` and `agbox remote serve` pair over ephemeral Ed25519 TLS 1.3 mTLS and Vaudenay 3-move commit-reveal 60-bit SAS confirmation.
+- `agbox remote serve` runs commands directly without a shell, applies `PR_SET_NO_NEW_PRIVS` and `Setsid`, pins `cwd` with `openat2(RESOLVE_NO_SYMLINKS)`, and sanitizes `PATH` and environment variables.
+- Policy hot-reload opens files with `O_NOFOLLOW`, checks file type, owner UID, and permissions, and fails closed to DENY-ALL on any load or parse error.
+
 ### Systemd user services
 
 - Store service specs in `$DATA_DIR/services/<name>.json` at mode `0600`.
@@ -176,11 +192,11 @@ Every `test.sh` edit and every new user-visible feature must follow these rules.
 
 | Flag | Coverage |
 |---|---|
-| none | Quick non-disruptive suite: `01` to `08`, `09` to `11`, `20` to `23`, and `99`. |
+| none | Quick non-disruptive suite: `01` to `08b`, `09` to `11`, `20` to `24`, and `99`. |
 | `--full` (alias `--long`) | Adds `30` to `34` and the isolated lifecycle check `40`. |
-| `--disruptive` | Clean-slate host suite. Rejects `--skip-vm`. Backs up `ORIG_INSTALL_BIN` and the live bash completion file. Runs `remove --yes`, `./install.sh`, `create-base`, and `edit-base` (`10` to `12`). Then runs `20` to `23` and `99`. |
+| `--disruptive` | Clean-slate host suite. Rejects `--skip-vm`. Backs up `ORIG_INSTALL_BIN` and the live bash completion file. Runs `remove --yes`, `./install.sh`, `create-base`, and `edit-base` (`10` to `12`). Then runs `20` to `24` and `99`. |
 | `--full --disruptive` | Runs both suites. Check `40` does not run, because `10` to `12` cover it. |
-| `--skip-vm` | Runs `01` to `08` only. Needs no `/dev/kvm` and no `msb`. |
+| `--skip-vm` | Runs `01` to `08b` only. Needs no `/dev/kvm` and no `msb`. |
 | `--filter <text>` | Runs checks whose ID or description contains `<text>`, plus required setup checks. |
 | `--log-dir <dir>` | Writes logs to `<dir>`. The default is a new `mktemp` directory under `/tmp`. |
 | `-v`, `--verbose` | Also streams check output to stdout. |
@@ -200,12 +216,13 @@ Every `test.sh` edit and every new user-visible feature must follow these rules.
 |---|---|
 | `01` | Static style: `bash -n`, `gofmt`, semicolons in Go comments, error strings, and Markdown prose, and `mdformat --check`. |
 | `02` to `04` | `go vet`, `go test -race`, and binary builds. |
-| `05` | `--help` output for all 17 modes, `install.sh --help`, category listing, bash completion checks, and flag rejection. |
+| `05` | `--help` output for all 18 modes (including `remote` subcommands), `install.sh --help`, category listing, bash completion checks, and flag rejection. |
 | `06` | Offline security checks: share conflicts, empty share path, `share set` and `share rm` errors, guest alias escapes, `--share-hub` with `--no-mask`, `run --name run-123`, `run -d --probe`, and hardlinked single files. Also checks `--net` conflicts, `service` env-file and network rules, `install.sh` symlink target rejection, and tamper checks. |
 | `07` | Fake-`msb` error checks. Each non-zero `msb` exit shows diagnostics for `stop`, `profile`, and `remove`. |
-| `08` | Live Workspace Hub: VCS masking, `:ro`, single-file slots, `:vcs` config protection, rename escapes, hook downgrade, `rw` to `ro`, and `rm` with and without `force`. |
+| `08` | Live Workspace Hub: VCS masking, `:ro`, single-file slots, `:vcs` config protection, rename escapes, hook downgrade, `rw` to `ro`, and `rm` with or without `force`. |
+| `08b` | Live remote bridge loopback: static ELF `execve`, PTY-paired TLS 1.3 and SAS match, policy allow/deny/ask, baseline redaction, `--allow-cwd`, `--stdin-file`, `agbox status`, and fail-closed hot-reload. |
 | `09` to `12` | KVM and `msb` preflight, then an isolated base bootstrap or the disruptive clean-slate steps. |
-| `20` to `23` | Core sandbox checks: shares, secrets, global rules mounts, persistence, profiles, dynamic shares with `--rw --vcs-hooks` downgrade, suspend, resume, and `--serve --probe`. |
+| `20` to `24` | Core sandbox checks: shares, secrets, global rules mounts, persistence, profiles, dynamic shares with `--rw --vcs-hooks` downgrade, suspend, resume, `--serve --probe`, and in-VM remote bridge (`24`). |
 | `30` to `34`, `40` | Extended checks: firewall, descriptor revocation (including VCS descriptors on `share set --mask-vcs`), profile lock, password `--serve`, live `update`, and the isolated lifecycle. |
 | `99` | Host state check (`verify-host-unchanged` or `verify-disruptive-cleanup`). |
 

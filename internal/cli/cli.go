@@ -30,6 +30,7 @@ import (
 	"agbox/internal/config"
 	"agbox/internal/mounttab"
 	"agbox/internal/msb"
+	"agbox/internal/remotebridge"
 	"agbox/internal/service"
 	"agbox/internal/vcsfuse"
 )
@@ -138,6 +139,7 @@ type appRuntime struct {
 	PID                  int
 	StartFilter          func(srcDir, mntDir, pidFile string, dieWithParent bool) (int, error)
 	StartHub             func(mntDir, sockPath, pidFile string, initial []vcsfuse.HubShareConfig, dieWithParent bool) (int, error)
+	StartRemoteBridge    func(mntDir, sockPath, pidFile string, dieWithParent bool) (int, error)
 	WaitServeUI          func(ctx context.Context, port int, sandbox string) bool
 	ProbeServeUI         func(ctx context.Context, port int) bool
 }
@@ -209,6 +211,9 @@ func newApp() (*appRuntime, error) {
 			GuestUID:         config.GuestUID,
 			GuestGID:         config.GuestGID,
 		}, dieWithParent)
+	}
+	app.StartRemoteBridge = func(mntDir, sockPath, pidFile string, dieWithParent bool) (int, error) {
+		return remotebridge.StartSubprocess(app.ExePath, mntDir, sockPath, pidFile, dieWithParent)
 	}
 	app.WaitServeUI = app.defaultWaitServeUI
 	app.ProbeServeUI = app.defaultProbeServeUI
@@ -442,6 +447,7 @@ func (a *appRuntime) startDisposableVM(ctx context.Context, prefix, snapshot, me
 		Agent:    metaAgent,
 		Mode:     mode,
 		MaskMode: config.MaskStrict,
+		NoRemote: true,
 	}
 	if err := config.SaveRunMeta(filepath.Join(dispRunDir, "run.meta"), meta); err != nil {
 		cleanup()
@@ -607,6 +613,12 @@ func (a *appRuntime) dispatchParsed(ctx context.Context, globalOpts globalOpts) 
 		}
 	case service.SubcommandName:
 		err = a.serviceRun(ctx, rest)
+	case "remote":
+		err = a.remoteMode(ctx, rest)
+		if errors.Is(err, errHelp) {
+			fmt.Fprint(a.Stdout, remoteUsageText())
+			return 0
+		}
 	case "run":
 		err = a.run(ctx, rest)
 		if errors.Is(err, errHelp) {
@@ -624,7 +636,7 @@ func (a *appRuntime) dispatchParsed(ctx context.Context, globalOpts globalOpts) 
 	case "status":
 		err = a.status(ctx, rest)
 	default:
-		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup version completion create-base edit-base update auth skills rules profile share service run suspend resume stop remove status)\n", mode)
+		fmt.Fprintf(a.Stderr, "[agbox] ERROR: unknown mode %q (try: setup version completion create-base edit-base update auth skills rules profile share service remote run suspend resume stop remove status)\n", mode)
 		return 1
 	}
 
@@ -677,7 +689,11 @@ func Main(args []string) int {
 		fmt.Fprintf(os.Stderr, "[agbox] ERROR: %v\n", err)
 		return 1
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	sigs := []os.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP}
+	if globalOpts.Mode == "remote" {
+		sigs = []os.Signal{syscall.SIGTERM, syscall.SIGHUP}
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), sigs...)
 	defer cancel()
 	return app.dispatchParsed(ctx, globalOpts)
 }
