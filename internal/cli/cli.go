@@ -130,6 +130,7 @@ type appRuntime struct {
 	GetEGID              func() int
 	SupportsXattr        func(path string, isDir bool) bool
 	TruncateFile         func(path string, size int64) error
+	FindHostTool         func(name string) (string, bool)
 	RunHostCmd           func(ctx context.Context, name string, args ...string) ([]byte, error)
 	Now                  func() time.Time
 	CheckKVM             func() error
@@ -184,6 +185,7 @@ func newApp() (*appRuntime, error) {
 		GetEGID:       os.Getegid,
 		SupportsXattr: supportsUserXattr,
 		TruncateFile:  os.Truncate,
+		FindHostTool:  findHostAdminTool,
 		RunHostCmd: func(ctx context.Context, name string, args ...string) ([]byte, error) {
 			return exec.CommandContext(ctx, name, args...).CombinedOutput()
 		},
@@ -537,8 +539,16 @@ func (a *appRuntime) dispatchParsed(ctx context.Context, globalOpts globalOpts) 
 	var err error
 	switch mode {
 	case "version":
-		fmt.Fprintf(a.Stdout, "agbox %s\n", version)
-		return 0
+		if vErr := parseVersionArgs(rest); vErr != nil {
+			if errors.Is(vErr, errHelp) {
+				fmt.Fprint(a.Stdout, usageText())
+				return 0
+			}
+			err = vErr
+		} else {
+			fmt.Fprintf(a.Stdout, "agbox %s\n", version)
+			return 0
+		}
 	case "completion":
 		err = a.completion(rest)
 		if errors.Is(err, errHelp) {

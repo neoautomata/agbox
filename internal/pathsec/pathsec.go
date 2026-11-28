@@ -448,6 +448,67 @@ func CheckDisjointHostPaths(targets []ShareTarget) error {
 	return nil
 }
 
+const maxSymlinkHops = 40
+
+// resolveBlocklistPath resolves symlinks in the longest existing prefix of p
+// and follows dangling symlink components so blocklist targets stay protected
+// before those targets exist.
+func resolveBlocklistPath(p string) string {
+	curPath := filepath.Clean(p)
+	if !filepath.IsAbs(curPath) {
+		return curPath
+	}
+	for hop := 0; hop < maxSymlinkHops; hop++ {
+		if resolved, err := filepath.EvalSymlinks(curPath); err == nil {
+			return filepath.Clean(resolved)
+		}
+		advanced := false
+		cur := curPath
+		for cur != "/" && cur != "." {
+			if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+				rel, rErr := filepath.Rel(cur, curPath)
+				if rErr == nil {
+					return filepath.Clean(filepath.Join(resolved, rel))
+				}
+				return curPath
+			}
+			if info, lErr := os.Lstat(cur); lErr == nil && info.Mode()&os.ModeSymlink != 0 {
+				target, rErr := os.Readlink(cur)
+				if rErr != nil {
+					return curPath
+				}
+				if !filepath.IsAbs(target) {
+					parentDir := filepath.Dir(cur)
+					if resolvedParent, pErr := filepath.EvalSymlinks(parentDir); pErr == nil {
+						parentDir = resolvedParent
+					}
+					target = filepath.Join(parentDir, target)
+				}
+				rel, relErr := filepath.Rel(cur, curPath)
+				if relErr != nil {
+					return curPath
+				}
+				if rel == "." {
+					curPath = filepath.Clean(target)
+				} else {
+					curPath = filepath.Clean(filepath.Join(target, rel))
+				}
+				advanced = true
+				break
+			}
+			parent := filepath.Dir(cur)
+			if parent == cur {
+				break
+			}
+			cur = parent
+		}
+		if !advanced {
+			return curPath
+		}
+	}
+	return curPath
+}
+
 // ValidateShare resolves symlinks on rawPath and validates containment, blocklists,
 // characters, VCS names, and hardlink counts.
 func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
@@ -458,7 +519,11 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 		return ShareTarget{}, fmt.Errorf("refusing path containing control character: %q", rawPath)
 	}
 
-	resolved, err := filepath.EvalSymlinks(rawPath)
+	absPath, err := filepath.Abs(rawPath)
+	if err != nil {
+		return ShareTarget{}, fmt.Errorf("resolve share path %s: %w", rawPath, err)
+	}
+	resolved, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
 		return ShareTarget{}, fmt.Errorf("resolve share path %s: %w", rawPath, err)
 	}
@@ -487,9 +552,9 @@ func ValidateShare(rawPath string, pol Policy) (ShareTarget, error) {
 		if IsSubpath(resolved, cleanItem) || IsSubpath(cleanItem, resolved) {
 			return ShareTarget{}, fmt.Errorf("refusing to share a sensitive path: %s (matches blocklist entry %s)", resolved, cleanItem)
 		}
-		// Block the resolved target and its parents when a blocklisted entry is a symlink.
-		if evalItem, err := filepath.EvalSymlinks(cleanItem); err == nil {
-			evalItem = filepath.Clean(evalItem)
+		// Block the resolved target and its parents when a blocklist entry or ancestor is a symlink.
+		evalItem := resolveBlocklistPath(cleanItem)
+		if evalItem != "" && evalItem != cleanItem {
 			if IsSubpath(resolved, evalItem) || IsSubpath(evalItem, resolved) {
 				return ShareTarget{}, fmt.Errorf("refusing to share a sensitive path: %s (matches symlinked blocklist entry %s -> %s)", resolved, cleanItem, evalItem)
 			}

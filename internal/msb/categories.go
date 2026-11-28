@@ -356,7 +356,7 @@ su - agent -c '
   set -euo pipefail
   if [ ! -x /home/agent/.cargo/bin/rustup ]; then
     echo "[agbox]   -> Installing rustup stable toolchain..."
-    curl --proto "=https" --proto-redir "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    curl --proto "=https" --proto-redir "=https" --tlsv1.2 -sSfL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
   fi
   . "/home/agent/.cargo/env"
   rustup update
@@ -563,11 +563,11 @@ apt-get install -y -qq --no-install-recommends \
 
 arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 hugo_ver="$(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL https://api.github.com/repos/gohugoio/hugo/releases/latest 2>/dev/null | grep -oE '"tag_name": *"v[^"]+"' | head -1 | sed -E 's/.*"v([^"]+)".*/\1/' || true)"
-if [[ "${hugo_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]] && [[ "${arch}" =~ ^[a-z0-9_]+$ ]] && curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "https://github.com/gohugoio/hugo/releases/download/v${hugo_ver}/hugo_extended_${hugo_ver}_linux-${arch}.tar.gz" -o /tmp/hugo.tgz; then
-  tar -C /usr/local/bin -xzf /tmp/hugo.tgz hugo
+if [[ "${hugo_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]] && [[ "${arch}" =~ ^[a-z0-9_]+$ ]] && curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL "https://github.com/gohugoio/hugo/releases/download/v${hugo_ver}/hugo_extended_${hugo_ver}_linux-${arch}.tar.gz" -o /tmp/hugo.tgz && tar -C /usr/local/bin -xzf /tmp/hugo.tgz hugo; then
   chmod 0755 /usr/local/bin/hugo
   rm -f /tmp/hugo.tgz
 else
+  rm -f /tmp/hugo.tgz
   apt-get install -y -qq --no-install-recommends hugo >/dev/null
 fi
 `

@@ -82,7 +82,10 @@ type hubControlResponse struct {
 }
 
 func openWritableHandlesError(name string, count int) error {
-	return fmt.Errorf("share %q has %d open writable file handles. Close them in the sandbox or use --force.", name, count)
+	if count == 1 {
+		return fmt.Errorf("share %q has 1 open writable file handle. Close it in the sandbox or pass --force", name)
+	}
+	return fmt.Errorf("share %q has %d open writable file handles. Close them in the sandbox or pass --force", name, count)
 }
 
 // fileShareNode exposes a single host regular file at /workspace/<name>.
@@ -183,6 +186,9 @@ func (n *fileShareNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, 
 	if n.slot == nil || n.slot.root == nil {
 		return nil, 0, syscall.EIO
 	}
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	if n.slot.isRevoked() {
 		return nil, 0, syscall.ESTALE
 	}
@@ -205,6 +211,9 @@ func (n *fileShareNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.S
 	if n.slot == nil || n.slot.root == nil {
 		return syscall.EIO
 	}
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	if n.slot.isRevoked() {
 		return syscall.ESTALE
 	}
@@ -275,6 +284,12 @@ func (n *fileShareNode) Listxattr(ctx context.Context, dest []byte) (uint32, sys
 
 func (n *fileShareNode) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
 	_ = ctx
+	if n.slot == nil || n.slot.root == nil {
+		return syscall.EIO
+	}
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	if n.slot.isRevoked() {
 		return syscall.ESTALE
 	}
@@ -289,11 +304,24 @@ func (n *fileShareNode) Setxattr(ctx context.Context, attr string, data []byte, 
 		return errno
 	}
 	defer unix.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return fs.ToErrno(err)
+	}
+	if st.Nlink != 1 {
+		return syscall.EPERM
+	}
 	return fs.ToErrno(unix.Setxattr(fmt.Sprintf("/proc/self/fd/%d", fd), attr, data, int(flags)))
 }
 
 func (n *fileShareNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	_ = ctx
+	if n.slot == nil || n.slot.root == nil {
+		return syscall.EIO
+	}
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	if n.slot.isRevoked() {
 		return syscall.ESTALE
 	}
@@ -308,6 +336,13 @@ func (n *fileShareNode) Removexattr(ctx context.Context, attr string) syscall.Er
 		return errno
 	}
 	defer unix.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return fs.ToErrno(err)
+	}
+	if st.Nlink != 1 {
+		return syscall.EPERM
+	}
 	return fs.ToErrno(unix.Removexattr(fmt.Sprintf("/proc/self/fd/%d", fd), attr))
 }
 
@@ -376,7 +411,13 @@ func NewWorkspaceHubWithOptions(initial []HubShareConfig, opts HubOptions) (*Wor
 	}
 
 	dataDir := strings.TrimSpace(opts.DataDir)
-	if dataDir != "" {
+	if dataDir == "" {
+		if envData := strings.TrimSpace(os.Getenv("AGBOX_DATA_DIR")); envData != "" && filepath.IsAbs(envData) {
+			dataDir = filepath.Clean(envData)
+		} else if homeReal != "" {
+			dataDir = filepath.Join(homeReal, ".local", "share", "agbox")
+		}
+	} else {
 		dataDir = filepath.Clean(dataDir)
 	}
 
@@ -413,9 +454,13 @@ func (h *WorkspaceHub) CloseAll() {
 	h.slots = make(map[string]*shareSlot)
 	h.mu.Unlock()
 
+	var batch revocationBatch
 	for _, s := range slots {
-		s.revokeAll(syscall.EBADF)
+		s.lockRename()
+		batch.merge(s.detachAll(syscall.EBADF))
+		s.unlockRename()
 	}
+	batch.apply()
 }
 
 func (h *WorkspaceHub) validateAndPrepareSlot(cfg HubShareConfig) (*shareSlot, fs.InodeEmbedder, syscall.Stat_t, syscall.Timespec, error) {
@@ -433,6 +478,12 @@ func (h *WorkspaceHub) validateAndPrepareSlot(cfg HubShareConfig) (*shareSlot, f
 	}
 	if cfg.ReadOnly && policy == config.VCSAllowHooks {
 		return nil, nil, syscall.Stat_t{}, syscall.Timespec{}, errors.New("conflicting share options: read-only share cannot enable vcs-hooks")
+	}
+	if cfg.HostPath == "" {
+		return nil, nil, syscall.Stat_t{}, syscall.Timespec{}, errors.New("share path must not be empty")
+	}
+	if !filepath.IsAbs(cfg.HostPath) {
+		return nil, nil, syscall.Stat_t{}, syscall.Timespec{}, fmt.Errorf("share path %q must be an absolute path", cfg.HostPath)
 	}
 
 	target, err := pathsec.ValidateShare(cfg.HostPath, pathsec.Policy{
@@ -501,6 +552,10 @@ func (h *WorkspaceHub) validateAndPrepareSlot(cfg HubShareConfig) (*shareSlot, f
 	if err != nil {
 		return nil, nil, syscall.Stat_t{}, syscall.Timespec{}, fmt.Errorf("open directory share %q: %w", resolvedHost, err)
 	}
+	if sErr := pr.statRoot(&st, &btime); sErr != nil {
+		pr.Close()
+		return nil, nil, syscall.Stat_t{}, syscall.Timespec{}, fmt.Errorf("stat directory share %q: %w", resolvedHost, sErr)
+	}
 	slot := newShareSlotWithIDMap(slotID, guestName, resolvedHost, false, "", pr, h.hidden, cfg.ReadOnly, policy, h.idMap)
 	slot.initDev = uint64(st.Dev)
 	slot.initIno = st.Ino
@@ -556,8 +611,8 @@ func (h *WorkspaceHub) addSlotLocked(cfg HubShareConfig, mounted bool) (HubShare
 }
 
 func (h *WorkspaceHub) OnAdd(ctx context.Context) {
+	var revocations revocationBatch
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.mounted.Store(true)
 	for name, slot := range h.slots {
 		slot.inodeMu.RLock()
@@ -573,7 +628,7 @@ func (h *WorkspaceHub) OnAdd(ctx context.Context) {
 			fd, err := slot.root.openat2(slot.fileName, unix.O_PATH|unix.O_NOFOLLOW, 0)
 			if err != nil {
 				delete(h.slots, name)
-				slot.revokeAll(syscall.ESTALE)
+				revocations.merge(slot.detachAll(syscall.ESTALE))
 				fmt.Fprintf(os.Stderr, "[vcsfuse] ERROR: open file share %q on mount: %v\n", name, err)
 				continue
 			}
@@ -581,7 +636,7 @@ func (h *WorkspaceHub) OnAdd(ctx context.Context) {
 			_ = unix.Close(fd)
 			if sErr != nil || (st.Mode&syscall.S_IFMT) != syscall.S_IFREG || (!slot.isReadOnly() && st.Nlink != 1) {
 				delete(h.slots, name)
-				slot.revokeAll(syscall.ESTALE)
+				revocations.merge(slot.detachAll(syscall.ESTALE))
 				fmt.Fprintf(os.Stderr, "[vcsfuse] ERROR: invalid file share %q on mount\n", name)
 				continue
 			}
@@ -590,7 +645,7 @@ func (h *WorkspaceHub) OnAdd(ctx context.Context) {
 			fd, err := slot.root.openat2(".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 			if err != nil {
 				delete(h.slots, name)
-				slot.revokeAll(syscall.ESTALE)
+				revocations.merge(slot.detachAll(syscall.ESTALE))
 				fmt.Fprintf(os.Stderr, "[vcsfuse] ERROR: open directory share %q on mount: %v\n", name, err)
 				continue
 			}
@@ -598,7 +653,7 @@ func (h *WorkspaceHub) OnAdd(ctx context.Context) {
 			_ = unix.Close(fd)
 			if sErr != nil || (st.Mode&syscall.S_IFMT) != syscall.S_IFDIR {
 				delete(h.slots, name)
-				slot.revokeAll(syscall.ESTALE)
+				revocations.merge(slot.detachAll(syscall.ESTALE))
 				fmt.Fprintf(os.Stderr, "[vcsfuse] ERROR: invalid directory share %q on mount\n", name)
 				continue
 			}
@@ -606,6 +661,8 @@ func (h *WorkspaceHub) OnAdd(ctx context.Context) {
 		}
 		h.attachSlotInode(ctx, slot, ops, &st, &btime)
 	}
+	h.mu.Unlock()
+	revocations.apply()
 }
 
 func (h *WorkspaceHub) listShares() []HubShareStatus {
@@ -644,6 +701,7 @@ func (h *WorkspaceHub) setShare(name string, readOnly *bool, vcsPolicy *config.V
 		h.mu.Unlock()
 		return HubShareStatus{}, fmt.Errorf("share %q is not mounted in /workspace", name)
 	}
+	slot.lockRename()
 
 	nextRO := slot.isReadOnly()
 	if readOnly != nil {
@@ -653,16 +711,19 @@ func (h *WorkspaceHub) setShare(name string, readOnly *bool, vcsPolicy *config.V
 	if vcsPolicy != nil {
 		parsed, err := config.ParseVCSPolicy(string(*vcsPolicy))
 		if err != nil {
+			slot.unlockRename()
 			h.mu.Unlock()
 			return HubShareStatus{}, err
 		}
 		nextPolicy = parsed
 	}
 	if slot.isFile && nextPolicy != config.VCSMask {
+		slot.unlockRename()
 		h.mu.Unlock()
 		return HubShareStatus{}, fmt.Errorf("single-file share %q accepts only the mask VCS policy, not %q", name, nextPolicy)
 	}
 	if nextRO && nextPolicy == config.VCSAllowHooks {
+		slot.unlockRename()
 		h.mu.Unlock()
 		return HubShareStatus{}, errors.New("conflicting share options: read-only share cannot enable vcs-hooks")
 	}
@@ -670,6 +731,7 @@ func (h *WorkspaceHub) setShare(name string, readOnly *bool, vcsPolicy *config.V
 	if slot.isFile && slot.isReadOnly() && !nextRO {
 		fd, oErr := slot.root.openat2(slot.fileName, unix.O_PATH|unix.O_NOFOLLOW, 0)
 		if oErr != nil {
+			slot.unlockRename()
 			h.mu.Unlock()
 			return HubShareStatus{}, fmt.Errorf("open single-file share %q: %w", name, oErr)
 		}
@@ -677,14 +739,17 @@ func (h *WorkspaceHub) setShare(name string, readOnly *bool, vcsPolicy *config.V
 		sErr := syscall.Fstat(fd, &st)
 		_ = unix.Close(fd)
 		if sErr != nil {
+			slot.unlockRename()
 			h.mu.Unlock()
 			return HubShareStatus{}, fmt.Errorf("stat single-file share %q: %w", name, sErr)
 		}
 		if (st.Mode & syscall.S_IFMT) != syscall.S_IFREG {
+			slot.unlockRename()
 			h.mu.Unlock()
 			return HubShareStatus{}, fmt.Errorf("share %q is not a regular file", slot.hostPath)
 		}
 		if st.Nlink != 1 {
+			slot.unlockRename()
 			h.mu.Unlock()
 			return HubShareStatus{}, fmt.Errorf("refusing writable single-file share with multiple hard links (nlink=%d): %s", st.Nlink, slot.hostPath)
 		}
@@ -695,17 +760,20 @@ func (h *WorkspaceHub) setShare(name string, readOnly *bool, vcsPolicy *config.V
 	downgradingPolicy := !slot.isFile && isVCSPolicyMoreRestrictive(prevPolicy, nextPolicy)
 	if downgradingToRO {
 		if openW := slot.openWritableCount(); openW > 0 && !force {
+			slot.unlockRename()
 			h.mu.Unlock()
 			return HubShareStatus{}, openWritableHandlesError(name, openW)
 		}
 	} else if downgradingPolicy {
 		if nextPolicy == config.VCSMask {
 			if openW := slot.openWritableVCSCount(); openW > 0 && !force {
+				slot.unlockRename()
 				h.mu.Unlock()
 				return HubShareStatus{}, openWritableHandlesError(name, openW)
 			}
 		} else if nextPolicy == config.VCSAllow {
 			if openW := slot.openWritableHookCount(); openW > 0 && !force {
+				slot.unlockRename()
 				h.mu.Unlock()
 				return HubShareStatus{}, openWritableHandlesError(name, openW)
 			}
@@ -714,19 +782,23 @@ func (h *WorkspaceHub) setShare(name string, readOnly *bool, vcsPolicy *config.V
 
 	slot.setReadOnly(nextRO)
 	slot.setVCSPolicy(nextPolicy)
+	var revocations revocationBatch
 	if downgradingPolicy {
 		if nextPolicy == config.VCSMask {
-			slot.revokeVCSDescriptors(syscall.ESTALE)
+			revocations.merge(slot.detachVCSDescriptors(syscall.ESTALE))
 		} else if nextPolicy == config.VCSAllow {
-			slot.revokeWritableHookFiles(syscall.EROFS)
+			revocations.merge(slot.detachWritableHookFiles(syscall.EROFS))
 		}
 	}
 	if downgradingToRO {
-		slot.revokeWritableFiles(syscall.EROFS)
+		revocations.merge(slot.detachWritableFiles(syscall.EROFS))
 	}
 
 	status := slotToStatus(slot)
+	slot.unlockRename()
 	h.mu.Unlock()
+
+	revocations.apply()
 
 	if h.mounted.Load() {
 		h.invalidateSlotKernelCache(slot)
@@ -749,13 +821,20 @@ func (h *WorkspaceHub) invalidateSlotKernelCache(slot *shareSlot) {
 	}
 	_ = ch.NotifyContent(0, 0)
 	maskNow := slot.getVCSPolicy() == config.VCSMask
+	invalidateInodeSubtree(ch, slot.hidden, maskNow)
 	for _, vcsName := range defaultHiddenEntries() {
-		if maskNow {
-			ch.RmChild(vcsName)
-		}
 		_ = ch.NotifyEntry(vcsName)
 	}
-	invalidateInodeSubtree(ch, slot.hidden, maskNow)
+}
+
+func invalidateContentSubtree(ino *fs.Inode) {
+	if ino == nil {
+		return
+	}
+	_ = ino.NotifyContent(0, 0)
+	for _, child := range ino.Children() {
+		invalidateContentSubtree(child)
+	}
 }
 
 func invalidateInodeSubtree(parent *fs.Inode, hidden map[string]struct{}, maskVCS bool) {
@@ -765,6 +844,7 @@ func invalidateInodeSubtree(parent *fs.Inode, hidden map[string]struct{}, maskVC
 	for childName, childIno := range parent.Children() {
 		if maskVCS && isHiddenEntry(childName, hidden) {
 			if childIno != nil {
+				invalidateContentSubtree(childIno)
 				childIno.RmAllChildren()
 				parent.RmChild(childName)
 				_ = parent.NotifyDelete(childName, childIno)
@@ -789,7 +869,9 @@ func (h *WorkspaceHub) removeShare(name string, force bool) error {
 		h.mu.Unlock()
 		return fmt.Errorf("share %q is not mounted in /workspace", name)
 	}
+	slot.lockRename()
 	if openW := slot.openWritableCount(); openW > 0 && !force {
+		slot.unlockRename()
 		h.mu.Unlock()
 		return openWritableHandlesError(name, openW)
 	}
@@ -801,12 +883,15 @@ func (h *WorkspaceHub) removeShare(name string, force bool) error {
 	if mounted && ch != nil && h.GetChild(name) == ch {
 		h.RmChild(name)
 	}
+	revocations := slot.detachAll(syscall.ESTALE)
+	slot.unlockRename()
 	h.mu.Unlock()
 
-	slot.revokeAll(syscall.ESTALE)
+	revocations.apply()
 
 	if mounted {
 		if ch != nil {
+			invalidateContentSubtree(ch)
 			ch.RmAllChildren()
 			_ = h.NotifyDelete(name, ch)
 		}
@@ -894,6 +979,14 @@ func (h *WorkspaceHub) Lookup(ctx context.Context, name string, out *fuse.EntryO
 	ch := slot.inode
 	slot.inodeMu.RUnlock()
 	if ch != nil {
+		h.mu.RLock()
+		cur, stillOK := h.slots[name]
+		h.mu.RUnlock()
+		if !stillOK || cur != slot || slot.isRevoked() {
+			out.SetEntryTimeout(0)
+			out.SetAttrTimeout(0)
+			return nil, syscall.ENOENT
+		}
 		return ch, 0
 	}
 
@@ -902,6 +995,7 @@ func (h *WorkspaceHub) Lookup(ctx context.Context, name string, out *fuse.EntryO
 	cur, stillOK := h.slots[name]
 	if !stillOK || cur != slot || slot.isRevoked() {
 		out.SetEntryTimeout(0)
+		out.SetAttrTimeout(0)
 		return nil, syscall.ENOENT
 	}
 	slot.inodeMu.RLock()
@@ -1079,6 +1173,9 @@ func listenVerifiedUnixSocket(sockPath string, hub *WorkspaceHub) (net.Listener,
 	if sockPath == "" {
 		return nil, errors.New("hub socket path must not be empty")
 	}
+	if hub == nil {
+		return nil, errors.New("workspace hub must not be nil")
+	}
 	if err := config.EnsurePrivateDir(filepath.Dir(sockPath)); err != nil {
 		return nil, fmt.Errorf("prepare hub socket dir: %w", err)
 	}
@@ -1110,10 +1207,7 @@ func listenVerifiedUnixSocket(sockPath string, hub *WorkspaceHub) (net.Listener,
 	}
 	ul.SetUnlinkOnClose(true)
 
-	expectedUID := uint32(os.Geteuid())
-	if hub != nil {
-		expectedUID = hub.euid
-	}
+	expectedUID := hub.euid
 	go serveHubControlSocket(ul, hub, expectedUID)
 	return ul, nil
 }
@@ -1385,10 +1479,6 @@ const defaultHubControlTimeout = 10 * time.Second
 
 func callHubSocket(sockPath string, req hubControlRequest) (hubControlResponse, error) {
 	return callHubSocketWithUIDAndTimeout(sockPath, req, uint32(os.Geteuid()), defaultHubControlTimeout)
-}
-
-func callHubSocketWithUID(sockPath string, req hubControlRequest, expectedUID uint32) (hubControlResponse, error) {
-	return callHubSocketWithUIDAndTimeout(sockPath, req, expectedUID, defaultHubControlTimeout)
 }
 
 func callHubSocketWithUIDAndTimeout(sockPath string, req hubControlRequest, expectedUID uint32, timeout time.Duration) (hubControlResponse, error) {

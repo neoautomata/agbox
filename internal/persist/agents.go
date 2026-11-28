@@ -74,7 +74,7 @@ func lockAgentsCache(agentsDir string) (*os.File, error) {
 			return nil, fmt.Errorf("refusing non-regular agents lock %s", lockPath)
 		}
 	}
-	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("refusing symlinked agents lock %s", lockPath)
@@ -82,7 +82,45 @@ func lockAgentsCache(agentsDir string) (*os.File, error) {
 		return nil, fmt.Errorf("open agents lock %s: %w", lockPath, err)
 	}
 	f := os.NewFile(uintptr(fd), lockPath)
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat agents lock %s: %w", lockPath, err)
+	}
+	if !st.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("refusing non-regular agents lock %s", lockPath)
+	}
 	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("lock agents cache: %w", err)
+	}
+	return f, nil
+}
+
+func lockAgentsCacheSharedIfExists(agentsDir string) (*os.File, error) {
+	lockPath := filepath.Join(filepath.Dir(agentsDir), ".agents.lock")
+	fd, err := syscall.Open(lockPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return nil, nil
+		}
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("refusing symlinked agents lock %s", lockPath)
+		}
+		return nil, fmt.Errorf("open agents lock %s: %w", lockPath, err)
+	}
+	f := os.NewFile(uintptr(fd), lockPath)
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat agents lock %s: %w", lockPath, err)
+	}
+	if !st.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("refusing non-regular agents lock %s", lockPath)
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_SH); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("lock agents cache: %w", err)
 	}
@@ -151,6 +189,12 @@ func InspectAgentsDir(agentsDir string) ([]CachedAgentInfo, error) {
 	if !rootInfo.IsDir() {
 		return nil, fmt.Errorf("agents path %q is not a directory", agentsDir)
 	}
+
+	lockFile, err := lockAgentsCacheSharedIfExists(agentsDir)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockAgentsCache(lockFile)
 
 	rootEntries, err := os.ReadDir(agentsDir)
 	if err != nil {
@@ -303,6 +347,7 @@ func verifyAgentBinaryFile(path string) (string, int64, error) {
 // It enforces maxAgentBinaryBytes and computes the SHA-256 digest.
 type AgentBinaryCaptureWriter struct {
 	Now       func() time.Time
+	syncDir   func(string) error
 	agentsDir string
 	agent     string
 	binName   string
@@ -469,16 +514,11 @@ func (w *AgentBinaryCaptureWriter) Commit(version string) (CachedAgentInfo, erro
 		}
 		backupPath = filepath.Join(w.stageDir, ".backup-"+w.binName)
 		if err := copyBinaryForBackup(dstPath, backupPath); err != nil {
-			return CachedAgentInfo{}, fmt.Errorf("back up existing %s binary: %w", w.agent, err)
+			return CachedAgentInfo{}, fmt.Errorf("save backup of existing %s binary: %w", w.agent, err)
 		}
 	}
 
-	if err := os.Rename(w.tmpPath, dstPath); err != nil {
-		return CachedAgentInfo{}, fmt.Errorf("install %s binary: %w", w.agent, err)
-	}
-	w.tmpPath = ""
-
-	if err := saveAgentsManifestAtomic(w.agentsDir, manifest); err != nil {
+	rollbackBinary := func(err error) error {
 		outErr := err
 		if dstExisted {
 			if rbErr := os.Rename(backupPath, dstPath); rbErr != nil {
@@ -489,7 +529,23 @@ func (w *AgentBinaryCaptureWriter) Commit(version string) (CachedAgentInfo, erro
 				outErr = errors.Join(outErr, fmt.Errorf("remove uncommitted %s binary: %w", w.agent, rmErr))
 			}
 		}
-		return CachedAgentInfo{}, outErr
+		return outErr
+	}
+
+	if err := os.Rename(w.tmpPath, dstPath); err != nil {
+		return CachedAgentInfo{}, fmt.Errorf("install %s binary: %w", w.agent, err)
+	}
+	w.tmpPath = ""
+	syncFn := w.syncDir
+	if syncFn == nil {
+		syncFn = syncParentDir
+	}
+	if err := syncFn(filepath.Dir(dstPath)); err != nil {
+		return CachedAgentInfo{}, rollbackBinary(err)
+	}
+
+	if err := saveAgentsManifestAtomic(w.agentsDir, manifest); err != nil {
+		return CachedAgentInfo{}, rollbackBinary(err)
 	}
 	return info, nil
 }
@@ -517,6 +573,10 @@ func copyBinaryForBackup(srcPath, dstPath string) error {
 		_ = out.Close()
 		return err
 	}
+	if err := out.Chmod(0o755); err != nil {
+		_ = out.Close()
+		return err
+	}
 	if err := out.Sync(); err != nil {
 		_ = out.Close()
 		return err
@@ -537,7 +597,7 @@ func installAgentBinaryFromReader(agentsDir, agent, version string, r io.Reader)
 }
 
 // RemoveCachedAgent deletes one ("antigravity" or "opencode") or "all" cached binaries
-// from $DATA_DIR/agents while keeping $DATA_DIR/agents/bin intact.
+// from $DATA_DIR/agents without recreating $DATA_DIR/agents/bin.
 func RemoveCachedAgent(agentsDir, target string) error {
 	var targets []string
 	switch {
@@ -551,12 +611,34 @@ func RemoveCachedAgent(agentsDir, target string) error {
 	if agentsDir == "" {
 		return nil
 	}
-	if _, err := os.Lstat(agentsDir); os.IsNotExist(err) {
-		return nil
-	}
-	if err := EnsureAgentsDir(agentsDir); err != nil {
+	if err := validateMountDir(agentsDir, "agents"); err != nil {
 		return err
 	}
+	rootInfo, err := os.Lstat(agentsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat agents dir %q: %w", agentsDir, err)
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlinked agents directory %q", agentsDir)
+	}
+	if !rootInfo.IsDir() {
+		return fmt.Errorf("agents path %q is not a directory", agentsDir)
+	}
+	binDir := filepath.Join(agentsDir, "bin")
+	if binInfo, bErr := os.Lstat(binDir); bErr == nil {
+		if binInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlinked agents bin directory %q", binDir)
+		}
+		if !binInfo.IsDir() {
+			return fmt.Errorf("agents bin path %q is not a directory", binDir)
+		}
+	} else if !os.IsNotExist(bErr) {
+		return fmt.Errorf("stat agents bin dir %q: %w", binDir, bErr)
+	}
+
 	lockFile, err := lockAgentsCache(agentsDir)
 	if err != nil {
 		return err
@@ -573,16 +655,30 @@ func RemoveCachedAgent(agentsDir, target string) error {
 
 	for _, ag := range targets {
 		binName, _ := agentBinName(ag)
-		binPath := filepath.Join(agentsDir, "bin", binName)
-		if err := os.Remove(binPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove %s: %w", binPath, err)
+		binPath := filepath.Join(binDir, binName)
+		if info, lErr := os.Lstat(binPath); lErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return fmt.Errorf("refusing non-regular cached binary %s", binPath)
+			}
+			if err := os.Remove(binPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove %s: %w", binPath, err)
+			}
+		} else if !os.IsNotExist(lErr) {
+			return fmt.Errorf("stat %s: %w", binPath, lErr)
 		}
 		delete(manifest.Agents, ag)
 	}
 	if len(manifest.Agents) == 0 {
 		mPath := filepath.Join(agentsDir, "manifest.json")
-		if err := os.Remove(mPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove %s: %w", mPath, err)
+		if info, lErr := os.Lstat(mPath); lErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return fmt.Errorf("refusing non-regular agents manifest %s", mPath)
+			}
+			if err := os.Remove(mPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove %s: %w", mPath, err)
+			}
+		} else if !os.IsNotExist(lErr) {
+			return fmt.Errorf("stat %s: %w", mPath, lErr)
 		}
 		return nil
 	}
@@ -692,8 +788,12 @@ if [ -L /usr/local/bin/agy ] && [ ! -e /usr/local/bin/agy ]; then
   rm -f /usr/local/bin/agy
 fi
 
-if [ -f /usr/local/bin/opencode ] && [ ! -L /usr/local/bin/opencode ] && [ ! -s /usr/local/bin/opencode ] && [ -x /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe ]; then
-  ln -sfn ../lib/node_modules/opencode-ai/bin/opencode.exe /usr/local/bin/opencode
+if [ -f /usr/local/bin/opencode ] && [ ! -L /usr/local/bin/opencode ] && [ ! -s /usr/local/bin/opencode ]; then
+  if [ -x /usr/local/lib/node_modules/opencode-ai/bin/opencode ]; then
+    ln -sfn ../lib/node_modules/opencode-ai/bin/opencode /usr/local/bin/opencode
+  elif [ -x /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe ]; then
+    ln -sfn ../lib/node_modules/opencode-ai/bin/opencode.exe /usr/local/bin/opencode
+  fi
 fi
 
 if [ -f "$src/bin/agy" ] && [ ! -L "$src/bin/agy" ]; then

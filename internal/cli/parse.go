@@ -63,6 +63,20 @@ func parseGlobalArgs(args []string) (globalOpts, error) {
 	return opts, errHelp
 }
 
+func parseVersionArgs(args []string) error {
+	for _, a := range args {
+		switch a {
+		case "-h", "--help":
+			return errHelp
+		case "--allow-root":
+			continue
+		default:
+			return fmt.Errorf("unknown version argument: %s (expected no arguments)", a)
+		}
+	}
+	return nil
+}
+
 func checkRootExecution(euid int, envAllowRoot, flagAllowRoot bool) (string, error) {
 	if euid != 0 {
 		return "", nil
@@ -179,6 +193,7 @@ type editBaseOpts struct {
 func parseEditBaseArgs(args []string) (editBaseOpts, error) {
 	var opts editBaseOpts
 	var catSpecs []string
+	sawCmd := false
 	for i := 0; i < len(args); i++ {
 		if val, ok, err := consumeFlagValue(args, &i, "--add", "--categories"); ok {
 			if err != nil || val == "" {
@@ -191,6 +206,10 @@ func parseEditBaseArgs(args []string) (editBaseOpts, error) {
 			if err != nil || val == "" {
 				return editBaseOpts{}, errors.New("--cmd requires a non-empty shell command")
 			}
+			if sawCmd {
+				return editBaseOpts{}, errors.New("duplicate --cmd flag")
+			}
+			sawCmd = true
 			opts.Cmd = val
 			continue
 		}
@@ -211,6 +230,9 @@ func parseEditBaseArgs(args []string) (editBaseOpts, error) {
 			}
 			catSpecs = append(catSpecs, args[i])
 		}
+	}
+	if opts.ListOnly && (len(catSpecs) > 0 || opts.Cmd != "" || opts.Shell || opts.NoSnap) {
+		return editBaseOpts{}, errors.New("conflicting options: cannot combine --list with --add, --cmd, --shell, or --no-snap")
 	}
 	if len(catSpecs) > 0 {
 		cats, err := msb.ResolveCategories(catSpecs)
@@ -331,6 +353,7 @@ type runOpts struct {
 	LockAccess      bool
 	DefaultVCS      config.VCSPolicy
 	LockVCS         bool
+	ExplicitMask    bool
 	Detach          bool
 	Serve           bool
 	Probe           bool
@@ -374,6 +397,13 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	sawNoMask := false
 	sawVCS := false
 	sawVCSHooks := false
+	sawName := false
+	sawProfile := false
+	sawSession := false
+	sawPort := false
+	sawCmd := false
+	sawCPUs := false
+	sawMemory := false
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -392,10 +422,14 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			if err != nil {
 				return runOpts{}, errors.New("--name requires a non-empty sandbox name")
 			}
+			if sawName {
+				return runOpts{}, errors.New("duplicate --name flag")
+			}
 			validName, nErr := validateRunName(val)
 			if nErr != nil {
 				return runOpts{}, nErr
 			}
+			sawName = true
 			opts.Name = validName
 			continue
 		}
@@ -413,10 +447,14 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			if err != nil {
 				return runOpts{}, errors.New("--profile requires a profile name")
 			}
+			if sawProfile {
+				return runOpts{}, errors.New("duplicate --profile flag")
+			}
 			profName, pErr := persist.ValidateProfileName(val)
 			if pErr != nil {
 				return runOpts{}, pErr
 			}
+			sawProfile = true
 			opts.Profile = profName
 			continue
 		}
@@ -424,10 +462,14 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			if err != nil {
 				return runOpts{}, fmt.Errorf("%s requires a session or conversation ID", arg)
 			}
+			if sawSession {
+				return runOpts{}, errors.New("duplicate --session flag")
+			}
 			sid, sErr := persist.ValidateSessionID(val)
 			if sErr != nil {
 				return runOpts{}, sErr
 			}
+			sawSession = true
 			opts.ContinueSession = sid
 			continue
 		}
@@ -435,10 +477,14 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			if err != nil {
 				return runOpts{}, errors.New("--port requires a port number")
 			}
+			if sawPort {
+				return runOpts{}, errors.New("duplicate --port flag")
+			}
 			p, pErr := strconv.Atoi(val)
 			if pErr != nil || !isDigits(val) || p < 1 || p > 65535 {
 				return runOpts{}, errors.New("--port must be an integer between 1 and 65535")
 			}
+			sawPort = true
 			opts.Port = p
 			opts.Serve = true
 			continue
@@ -447,6 +493,10 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			if err != nil || val == "" {
 				return runOpts{}, errors.New("--cmd requires a shell command string")
 			}
+			if sawCmd {
+				return runOpts{}, errors.New("duplicate --cmd flag")
+			}
+			sawCmd = true
 			opts.Cmd = val
 			continue
 		}
@@ -461,10 +511,14 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			if err != nil {
 				return runOpts{}, errors.New("--cpus requires a positive integer")
 			}
+			if sawCPUs {
+				return runOpts{}, errors.New("duplicate --cpus flag")
+			}
 			n, cErr := strconv.Atoi(val)
 			if cErr != nil || !isDigits(val) || n < 1 {
 				return runOpts{}, errors.New("--cpus must be a positive integer")
 			}
+			sawCPUs = true
 			opts.CPUs = strconv.Itoa(n)
 			continue
 		}
@@ -472,9 +526,13 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			if err != nil || val == "" {
 				return runOpts{}, errors.New("--memory requires a size value (for example, 2G or 2048M)")
 			}
+			if sawMemory {
+				return runOpts{}, errors.New("duplicate --memory flag")
+			}
 			if !isValidMemorySpec(val) {
 				return runOpts{}, fmt.Errorf("invalid --memory %q: expected a positive size in M or G (for example, 2G or 2048M)", val)
 			}
+			sawMemory = true
 			opts.Memory = strings.ToUpper(strings.TrimSpace(val))
 			continue
 		}
@@ -562,13 +620,14 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	}
 	opts.LockAccess = sawRO || sawRW
 	opts.LockVCS = sawMaskVCS || sawVCS || sawVCSHooks
+	opts.ExplicitMask = sawMaskVCS || sawNoMask || sawVCS || sawVCSHooks
 
 	allRawShares := make([]string, 0, len(opts.ShareSpecs)+len(opts.Paths))
 	allRawShares = append(allRawShares, opts.ShareSpecs...)
 	allRawShares = append(allRawShares, opts.Paths...)
 	for _, raw := range allRawShares {
 		if raw == "" {
-			continue
+			return runOpts{}, errors.New("share path must not be empty")
 		}
 		spec, sErr := pathsec.ParseShareSpec(raw)
 		if sErr != nil {
@@ -586,6 +645,9 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 		}
 		effVCS := opts.DefaultVCS
 		if spec.HasVCSOpt {
+			if opts.MaskMode == config.MaskAuto {
+				opts.MaskMode = config.MaskStrict
+			}
 			if opts.LockVCS && spec.VCSPolicy != opts.DefaultVCS {
 				return runOpts{}, fmt.Errorf("conflicting VCS options for %q: flag (%s) and modifier (%s) disagree", raw, opts.DefaultVCS, spec.VCSPolicy)
 			}
@@ -611,6 +673,9 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 	if opts.RemoteControl && opts.Agent == "opencode" {
 		return runOpts{}, errors.New("--remote-control supports only the antigravity agent")
 	}
+	if opts.Detach && opts.Probe {
+		return runOpts{}, errors.New("--detach (-d) and --probe are mutually exclusive")
+	}
 	if opts.Detach && !opts.Serve && !opts.RemoteControl {
 		return runOpts{}, errors.New("--detach (-d) requires --remote-control or --serve")
 	}
@@ -634,6 +699,9 @@ func parseRunArgs(args []string, defaultMask config.MaskMode, pathExists func(st
 			return runOpts{}, errors.New("cannot combine --continue or --session with detached --remote-control")
 		}
 	}
+	if err := msb.ValidateNetArgs(opts.NoNet, opts.NetSpecs); err != nil {
+		return runOpts{}, err
+	}
 
 	return opts, nil
 }
@@ -643,7 +711,7 @@ func selectEffectiveAgent(baseAgent string, opts runOpts) (string, error) {
 		baseAgent = "both"
 	}
 	if opts.Agent != "" && baseAgent != "both" && opts.Agent != baseAgent {
-		return "", fmt.Errorf("the base snapshot contains only agent=%s. Run 'agbox create-base %s' or 'agbox create-base both'", baseAgent, opts.Agent)
+		return "", fmt.Errorf("the base snapshot contains only agent=%s. Run 'agbox create-base --force %s' or 'agbox create-base --force both'", baseAgent, opts.Agent)
 	}
 	if opts.Serve {
 		if opts.Agent == "antigravity" || (baseAgent != "opencode" && baseAgent != "both") {
@@ -722,16 +790,21 @@ type resumeOpts struct {
 func parseResumeArgs(args []string) (resumeOpts, error) {
 	var opts resumeOpts
 	var pos []string
+	sawSession := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if val, ok, err := consumeFlagValue(args, &i, "--session", "--conversation", "-s"); ok {
 			if err != nil {
 				return resumeOpts{}, fmt.Errorf("%s requires a session or conversation ID", arg)
 			}
+			if sawSession {
+				return resumeOpts{}, errors.New("duplicate --session flag")
+			}
 			sid, sErr := persist.ValidateSessionID(val)
 			if sErr != nil {
 				return resumeOpts{}, sErr
 			}
+			sawSession = true
 			opts.ContinueSession = sid
 			continue
 		}
@@ -763,7 +836,7 @@ func parseResumeArgs(args []string) (resumeOpts, error) {
 		return resumeOpts{}, errors.New("--continue (-c) and --session/--conversation are mutually exclusive")
 	}
 	if len(pos) != 1 {
-		return resumeOpts{}, errors.New("usage: agbox resume [--allow-root] [-d|--detach] [-c|--continue] [--session ID] [--no-auth] [--no-skills] [--no-rules] [--no-agent-cache] <sandbox>")
+		return resumeOpts{}, errors.New("usage: agbox resume [--allow-root] [-d|--detach] [-c|--continue] [-s|--session ID] [--no-auth] [--no-skills] [--no-rules] [--no-agent-cache] <sandbox>")
 	}
 	name, err := validateTargetRunSandbox(pos[0], "resume")
 	if err != nil {
@@ -1407,7 +1480,11 @@ func isValidMemorySpec(spec string) bool {
 	if num[0] == '0' {
 		return false
 	}
-	return isDigits(num)
+	if !config.IsValidSizeSpec(s) {
+		return false
+	}
+	_, ok := parseSizeBytes(s)
+	return ok
 }
 
 func parseSizeBytes(spec string) (int64, bool) {

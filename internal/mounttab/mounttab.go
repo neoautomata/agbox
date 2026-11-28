@@ -121,7 +121,11 @@ func resolvePathWithAncestor(absPath string) string {
 					return p
 				}
 				if !filepath.IsAbs(target) {
-					target = filepath.Join(filepath.Dir(cur), target)
+					parentDir := filepath.Dir(cur)
+					if resolvedParent, pErr := filepath.EvalSymlinks(parentDir); pErr == nil {
+						parentDir = resolvedParent
+					}
+					target = filepath.Join(parentDir, target)
 				}
 				rel, relErr := filepath.Rel(cur, p)
 				if relErr != nil {
@@ -295,23 +299,55 @@ func isFilterCmdlineForDir(cmdline []byte, cleanDir, resolvedDir string, allowTe
 	return false
 }
 
+func isFilterValueFlag(arg string) bool {
+	switch arg {
+	case "-src", "--src",
+		"-sock", "--sock",
+		"-spec-fd", "--spec-fd",
+		"-spec", "--spec",
+		"-guest-uid", "--guest-uid",
+		"-guest-gid", "--guest-gid":
+		return true
+	default:
+		return false
+	}
+}
+
 func extractFilterMountArg(args []string) string {
+	// Trim the trailing empty token produced by splitting a NUL-terminated cmdline.
+	if len(args) > 0 && args[len(args)-1] == "" {
+		args = args[:len(args)-1]
+	}
+	var mnt string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if arg == "" {
+		if arg == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			break
+		}
+		if arg == "-mnt" || arg == "--mnt" {
+			if i+1 < len(args) {
+				mnt = args[i+1]
+				i++
+			}
 			continue
 		}
-		if (arg == "-mnt" || arg == "--mnt") && i+1 < len(args) {
-			return args[i+1]
+		if val, ok := strings.CutPrefix(arg, "-mnt="); ok {
+			mnt = val
+			continue
 		}
-		if strings.HasPrefix(arg, "-mnt=") {
-			return strings.TrimPrefix(arg, "-mnt=")
+		if val, ok := strings.CutPrefix(arg, "--mnt="); ok {
+			mnt = val
+			continue
 		}
-		if strings.HasPrefix(arg, "--mnt=") {
-			return strings.TrimPrefix(arg, "--mnt=")
+		if isFilterValueFlag(arg) {
+			i++
+			continue
 		}
 	}
-	return ""
+	return mnt
 }
 
 // OSController implements Controller with /proc/self/mountinfo, kill(2), and fusermount3.
@@ -464,9 +500,12 @@ func UnmountFilterDir(dir string, ctl Controller) error {
 	if err != nil {
 		return fmt.Errorf("read mount table: %w", err)
 	}
+	var lastUnmountErr error
 	mps := mountsMatchingDir(entries, cleanDir, resolvedDir)
 	for i := len(mps) - 1; i >= 0; i-- {
-		_ = ctl.Unmount(mps[i], false)
+		if uErr := ctl.Unmount(mps[i], false); uErr != nil {
+			lastUnmountErr = uErr
+		}
 	}
 
 	// Poll the mount table up to 20 times at 100 ms intervals.
@@ -486,7 +525,9 @@ func UnmountFilterDir(dir string, ctl Controller) error {
 		if cur, err := ctl.ListMounts(); err == nil {
 			curMps := mountsMatchingDir(cur, cleanDir, resolvedDir)
 			for i := len(curMps) - 1; i >= 0; i-- {
-				_ = ctl.Unmount(curMps[i], true)
+				if uErr := ctl.Unmount(curMps[i], true); uErr != nil {
+					lastUnmountErr = uErr
+				}
 			}
 		}
 		for i := 0; i < 20; i++ {
@@ -504,7 +545,14 @@ func UnmountFilterDir(dir string, ctl Controller) error {
 		return fmt.Errorf("verify mount table after unmount: %w", err)
 	}
 	if remaining := mountsMatchingDir(finalEntries, cleanDir, resolvedDir); len(remaining) > 0 {
-		return fmt.Errorf("%d mounts remain active under %s (%s)", len(remaining), cleanDir, strings.Join(remaining, ", "))
+		noun := "mounts remain"
+		if len(remaining) == 1 {
+			noun = "mount remains"
+		}
+		if lastUnmountErr != nil {
+			return fmt.Errorf("%d %s active under %s (%s): %w", len(remaining), noun, cleanDir, strings.Join(remaining, ", "), lastUnmountErr)
+		}
+		return fmt.Errorf("%d %s active under %s (%s)", len(remaining), noun, cleanDir, strings.Join(remaining, ", "))
 	}
 
 	removePIDFiles(resolvedDir)
@@ -536,7 +584,11 @@ func TeardownFilterDir(dir string, ctl Controller) error {
 		return fmt.Errorf("refusing to remove %s: verify mount table: %w", cleanDir, err)
 	}
 	if remaining := mountsMatchingDir(finalEntries, cleanDir, resolvedDir); len(remaining) > 0 {
-		return fmt.Errorf("refusing to remove %s: %d mounts remain active", cleanDir, len(remaining))
+		noun := "mounts remain"
+		if len(remaining) == 1 {
+			noun = "mount remains"
+		}
+		return fmt.Errorf("refusing to remove %s: %d %s active", cleanDir, len(remaining), noun)
 	}
 	if err := os.RemoveAll(resolvedDir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove filter dir %s: %w", cleanDir, err)

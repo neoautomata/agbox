@@ -74,6 +74,7 @@ type TemplateUnitOpts struct {
 	MSBHome          string
 	PathEnv          string
 	AllowOutsideHome bool
+	AllowRoot        bool
 }
 
 // UnitState describes the live systemd state of one agbox@<name>.service instance.
@@ -145,9 +146,39 @@ func SpecPath(dataDir, name string) string {
 	return filepath.Join(ServicesDir(dataDir), name+".json")
 }
 
+func validateSpec(spec Spec) error {
+	if _, err := ValidateName(spec.Name); err != nil {
+		return err
+	}
+	switch spec.Mode {
+	case config.RunModeServe:
+		if spec.Port < 1 || spec.Port > 65535 {
+			return fmt.Errorf("service %q serve mode requires port in 1..65535, got %d", spec.Name, spec.Port)
+		}
+	case config.RunModeCmd:
+		if strings.TrimSpace(spec.Cmd) == "" {
+			return fmt.Errorf("service %q cmd mode requires a non-empty command", spec.Name)
+		}
+	case config.RunModeRemoteControl:
+	default:
+		return fmt.Errorf("service %q has invalid mode %q (expected: serve, remote-control, or cmd)", spec.Name, spec.Mode)
+	}
+	switch spec.MaskMode {
+	case "", config.MaskStrict, config.MaskAuto, config.MaskOff:
+	default:
+		return fmt.Errorf("service %q has invalid mask mode %q (expected: strict, auto, or off)", spec.Name, spec.MaskMode)
+	}
+	switch spec.DefaultVCS {
+	case "", config.VCSMask, config.VCSAllow, config.VCSAllowHooks:
+	default:
+		return fmt.Errorf("service %q has invalid default VCS policy %q (expected: mask, vcs, or vcs-hooks)", spec.Name, spec.DefaultVCS)
+	}
+	return nil
+}
+
 // SaveSpec writes a service Spec atomically at mode 0600 inside $DATA_DIR/services.
 func SaveSpec(dataDir string, spec Spec) error {
-	if _, err := ValidateName(spec.Name); err != nil {
+	if err := validateSpec(spec); err != nil {
 		return err
 	}
 	if err := config.EnsurePrivateDir(dataDir); err != nil {
@@ -180,6 +211,9 @@ func LoadSpec(dataDir, name string) (Spec, error) {
 	}
 	if spec.Name != name {
 		return Spec{}, fmt.Errorf("service spec name mismatch: got %q, want %q", spec.Name, name)
+	}
+	if err := validateSpec(spec); err != nil {
+		return Spec{}, err
 	}
 	return spec, nil
 }
@@ -266,7 +300,7 @@ func ParseEnvFile(path string) (map[string]string, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("env file path %q must be absolute", path)
 	}
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("refusing symlinked env file %q", path)
@@ -282,6 +316,9 @@ func ParseEnvFile(path string) (map[string]string, error) {
 	}
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("env file %q must be a regular file", path)
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid != uint32(os.Geteuid()) {
+		return nil, fmt.Errorf("env file %q is not owned by the current user (uid %d)", path, st.Uid)
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
 		return nil, fmt.Errorf("env file %q has insecure permissions %04o (run 'chmod 600 %s')", path, perm, path)
@@ -303,6 +340,7 @@ func ParseEnvFile(path string) (map[string]string, error) {
 
 	values := make(map[string]string)
 	sc := bufio.NewScanner(bytes.NewReader(raw))
+	sc.Buffer(make([]byte, 0, 4096), maxEnvFileBytes+1)
 	lineNum := 0
 	for sc.Scan() {
 		lineNum++
@@ -383,7 +421,7 @@ func RenderTemplateUnit(opts TemplateUnitOpts) (string, error) {
 	b.WriteString("[Service]\n")
 	b.WriteString("Type=notify\n")
 	b.WriteString("NotifyAccess=main\n")
-	fmt.Fprintf(&b, "ExecStart=%s %s %%i\n", FormatSystemdQuote(opts.ExePath), SubcommandName)
+	fmt.Fprintf(&b, "ExecStart=%s %s %%i\n", formatSystemdExecArg(opts.ExePath), SubcommandName)
 	if opts.PathEnv != "" {
 		fmt.Fprintf(&b, "Environment=%s\n", FormatSystemdQuote("PATH="+opts.PathEnv))
 	}
@@ -391,6 +429,9 @@ func RenderTemplateUnit(opts TemplateUnitOpts) (string, error) {
 	fmt.Fprintf(&b, "Environment=%s\n", FormatSystemdQuote("MSB_HOME="+opts.MSBHome))
 	if opts.AllowOutsideHome {
 		b.WriteString("Environment=\"AGBOX_ALLOW_OUTSIDE_HOME=1\"\n")
+	}
+	if opts.AllowRoot {
+		b.WriteString("Environment=\"AGBOX_ALLOW_ROOT=1\"\n")
 	}
 	b.WriteString("Restart=on-failure\n")
 	b.WriteString("RestartSec=5s\n")
@@ -443,6 +484,27 @@ func FormatSystemdQuote(s string) string {
 	return b.String()
 }
 
+// formatSystemdExecArg formats an ExecStart argument and doubles '$' to prevent environment expansion.
+func formatSystemdExecArg(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\', '"':
+			b.WriteByte('\\')
+			b.WriteByte(s[i])
+		case '%':
+			b.WriteString("%%")
+		case '$':
+			b.WriteString("$$")
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
 // InstallTemplateUnit writes agbox@.service atomically and rejects symlinked directories or targets.
 func InstallTemplateUnit(unitPath, content string) error {
 	unitDir := filepath.Dir(unitPath)
@@ -472,21 +534,36 @@ func ensureUnitDirNoSymlink(dir string) error {
 	if !filepath.IsAbs(clean) {
 		return fmt.Errorf("unit directory %q must be absolute", dir)
 	}
+	parent := filepath.Dir(clean)
+	for _, check := range []string{parent, clean} {
+		info, err := os.Lstat(check)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("refusing symlinked or non-directory unit path %q", check)
+		}
+	}
 	if err := os.MkdirAll(clean, 0o755); err != nil {
 		return fmt.Errorf("create unit directory %s: %w", clean, err)
 	}
-	info, err := os.Lstat(clean)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("refusing symlinked or non-directory unit path %q", clean)
+	for _, check := range []string{parent, clean} {
+		info, err := os.Lstat(check)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("refusing symlinked or non-directory unit path %q", check)
+		}
 	}
 	return nil
 }
 
 func readRegularNoFollow(path string, maxBytes int64) ([]byte, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("refusing symlinked file %q", path)
@@ -556,6 +633,18 @@ func writeFileAtomicNoFollow(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	cleanup = false
+	return syncParentDir(dir)
+}
+
+func syncParentDir(dir string) error {
+	dirFD, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open parent directory %q for sync: %w", dir, err)
+	}
+	defer syscall.Close(dirFD)
+	if err := syscall.Fsync(dirFD); err != nil && !errors.Is(err, syscall.EINVAL) {
+		return fmt.Errorf("sync parent directory %q: %w", dir, err)
+	}
 	return nil
 }
 
@@ -602,19 +691,28 @@ func isValidEnvKey(k string) bool {
 }
 
 func unquoteEnvValue(raw string) (string, error) {
-	if len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'' {
-		return raw[1 : len(raw)-1], nil
+	if raw == "'" || raw == "\"" {
+		return "", errors.New("unterminated quote")
 	}
-	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+	if strings.HasPrefix(raw, "'") {
+		if !strings.HasSuffix(raw, "'") {
+			return "", errors.New("unterminated quote")
+		}
+		inner := raw[1 : len(raw)-1]
+		if strings.ContainsRune(inner, '\'') {
+			return "", errors.New("invalid single-quoted value: unescaped interior single quote")
+		}
+		return inner, nil
+	}
+	if strings.HasPrefix(raw, "\"") {
+		if !strings.HasSuffix(raw, "\"") {
+			return "", errors.New("unterminated quote")
+		}
 		unq, err := strconv.Unquote(raw)
 		if err != nil {
 			return "", fmt.Errorf("invalid double-quoted value: %w", err)
 		}
 		return unq, nil
-	}
-	if (strings.HasPrefix(raw, "'") && !strings.HasSuffix(raw, "'")) ||
-		(strings.HasPrefix(raw, "\"") && !strings.HasSuffix(raw, "\"")) {
-		return "", errors.New("unterminated quote")
 	}
 	return raw, nil
 }
@@ -709,12 +807,27 @@ func (OSController) Logs(ctx context.Context, unit string, follow bool, lines in
 	return nil
 }
 
+func validateUsername(username string) error {
+	if username == "" {
+		return errors.New("username must not be empty")
+	}
+	if username == "." || username == ".." || strings.HasPrefix(username, "-") || strings.ContainsAny(username, "/\\") {
+		return fmt.Errorf("invalid username %q", username)
+	}
+	for _, r := range username {
+		if r <= 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid username %q", username)
+		}
+	}
+	return nil
+}
+
 // LingerEnabled reports whether systemd-logind linger is active for username.
 func (OSController) LingerEnabled(ctx context.Context, username string) (bool, error) {
-	if username == "" {
-		return false, errors.New("username must not be empty")
+	if err := validateUsername(username); err != nil {
+		return false, err
 	}
-	cmd := exec.CommandContext(ctx, "loginctl", "show-user", username, "-p", "Linger", "--value")
+	cmd := exec.CommandContext(ctx, "loginctl", "show-user", "-p", "Linger", "--value", "--", username)
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		val := strings.ToLower(strings.TrimSpace(string(out)))
@@ -738,10 +851,10 @@ func (OSController) LingerEnabled(ctx context.Context, username string) (bool, e
 
 // EnableLinger activates systemd-logind linger for username.
 func (OSController) EnableLinger(ctx context.Context, username string) error {
-	if username == "" {
-		return errors.New("username must not be empty")
+	if err := validateUsername(username); err != nil {
+		return err
 	}
-	cmd := exec.CommandContext(ctx, "loginctl", "enable-linger", username)
+	cmd := exec.CommandContext(ctx, "loginctl", "enable-linger", "--", username)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))

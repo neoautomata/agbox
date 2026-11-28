@@ -9,10 +9,18 @@ func BashScript() string {
 _agbox_ltrim_wordbreak_completions() {
   local cur="$1"
   local prefix=""
+  local cand=""
   if [[ "${cur}" == *:* && "${COMP_WORDBREAKS}" == *:* ]]; then
-    prefix="${cur%"${cur##*:}"}"
-  elif [[ "${cur}" == *=* && "${COMP_WORDBREAKS}" == *=* ]]; then
-    prefix="${cur%"${cur##*=}"}"
+    cand="${cur%"${cur##*:}"}"
+    if (( ${#cand} > ${#prefix} )); then
+      prefix="${cand}"
+    fi
+  fi
+  if [[ "${cur}" == *=* && "${COMP_WORDBREAKS}" == *=* ]]; then
+    cand="${cur%"${cur##*=}"}"
+    if (( ${#cand} > ${#prefix} )); then
+      prefix="${cand}"
+    fi
   fi
   if [[ -n "${prefix}" ]]; then
     local i="${#COMPREPLY[@]}"

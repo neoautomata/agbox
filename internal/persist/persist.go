@@ -162,16 +162,42 @@ func buildAuthCaptureScriptForHome(agent, guestHome string) (string, error) {
 	if guestHome == "" {
 		return "", errors.New("guest home path must not be empty")
 	}
+	cleanHome := filepath.Clean(guestHome)
+	qHome := msb.ShellQuote(cleanHome)
 	limitPlusOne := maxAuthFileBytes + 1
+
 	var b strings.Builder
 	b.WriteString("set -eu\n")
+	fmt.Fprintf(&b, "if [ -L %s ]; then echo 'agbox rejects symlinked guest home' >&2; exit 1; fi\n", qHome)
+
+	checkedDirs := map[string]bool{cleanHome: true}
 	for _, sp := range specs {
-		full := filepath.Clean(filepath.Join(guestHome, sp.RelPath))
+		relDir := filepath.Dir(filepath.Clean(sp.RelPath))
+		cur := cleanHome
+		for _, part := range strings.Split(relDir, string(filepath.Separator)) {
+			if part == "" || part == "." {
+				continue
+			}
+			cur = filepath.Join(cur, part)
+			if !checkedDirs[cur] {
+				qCur := msb.ShellQuote(cur)
+				fmt.Fprintf(&b, "if [ -L %s ]; then echo 'agbox rejects symlinked credential directory' >&2; exit 1; fi\n", qCur)
+				checkedDirs[cur] = true
+			}
+		}
+	}
+
+	for _, sp := range specs {
+		full := filepath.Clean(filepath.Join(cleanHome, sp.RelPath))
 		qPath := msb.ShellQuote(full)
-		fmt.Fprintf(&b, "if [ -L %s ]; then echo 'SYMLINK %s %s'; exit 1; fi\n", qPath, sp.Agent, sp.Name)
-		fmt.Fprintf(&b, "if [ -f %s ] && [ -s %s ]; then\n", qPath, qPath)
-		fmt.Fprintf(&b, "  b64=$(head -c %d %s | base64 | tr -d '\\n\\r ')\n", limitPlusOne, qPath)
-		fmt.Fprintf(&b, "  printf 'FILE %s %s %%s\\n' \"$b64\"\n", sp.Agent, sp.Name)
+		fmt.Fprintf(&b, "if [ -L %s ]; then echo 'SYMLINK %s %s' >&2; exit 1; fi\n", qPath, sp.Agent, sp.Name)
+		fmt.Fprintf(&b, "if [ -f %s ]; then\n", qPath)
+		fmt.Fprintf(&b, "  if [ ! -r %s ]; then echo 'agbox cannot read credential file %s/%s' >&2; exit 1; fi\n", qPath, sp.Agent, sp.Name)
+		fmt.Fprintf(&b, "  if [ -s %s ]; then\n", qPath)
+		fmt.Fprintf(&b, "    b64=$(exec 3>&1; (head -c %d %s || printf '!' >&3) | (base64 || printf '!' >&3) | tr -d '\\n\\r ')\n", limitPlusOne, qPath)
+		fmt.Fprintf(&b, "    case \"$b64\" in *'!'*) echo 'agbox failed to read credential file %s/%s' >&2; exit 1 ;; esac\n", sp.Agent, sp.Name)
+		fmt.Fprintf(&b, "    printf 'FILE %s %s %%s\\n' \"$b64\"\n", sp.Agent, sp.Name)
+		b.WriteString("  fi\n")
 		b.WriteString("fi\n")
 	}
 	return b.String(), nil
@@ -342,6 +368,22 @@ func SaveAuthBundle(dataDir string, bundle AuthBundle) error {
 			}
 		}
 		byAgent[f.Agent] = append(byAgent[f.Agent], f)
+	}
+
+	for agent, files := range byAgent {
+		specs, err := specsForAgent(agent)
+		if err != nil {
+			return err
+		}
+		present := make(map[string]bool, len(files))
+		for _, f := range files {
+			present[f.Name] = true
+		}
+		for _, sp := range specs {
+			if sp.Required && !present[sp.Name] {
+				return fmt.Errorf("auth bundle for %s is missing required file %q", agent, sp.Name)
+			}
+		}
 	}
 
 	for agent, files := range byAgent {
@@ -726,7 +768,7 @@ func InstallSkill(skillsDir, srcPath string, force bool) (string, error) {
 	if dstExists {
 		backupDir = filepath.Join(workDir, "backup")
 		if err := os.Rename(dstDir, backupDir); err != nil {
-			return "", fmt.Errorf("back up existing skill %q: %w", skillName, err)
+			return "", fmt.Errorf("save backup of existing skill %q: %w", skillName, err)
 		}
 	}
 	if err := os.Rename(stageDir, dstDir); err != nil {
@@ -771,11 +813,11 @@ func BuildGuestSkillsMountScript() string {
 mkdir -p /home/agent/.gemini/config/skills /home/agent/.config/opencode/skills
 chown 1000:1000 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.config /home/agent/.config/opencode
 chmod 0700 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.config /home/agent/.config/opencode
-if ! grep -qs ' /home/agent/.gemini/config/skills ' /proc/self/mountinfo; then
+if ! grep -Fqs ' /home/agent/.gemini/config/skills ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-skills /home/agent/.gemini/config/skills
   mount -o remount,ro,bind /home/agent/.gemini/config/skills
 fi
-if ! grep -qs ' /home/agent/.config/opencode/skills ' /proc/self/mountinfo; then
+if ! grep -Fqs ' /home/agent/.config/opencode/skills ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-skills /home/agent/.config/opencode/skills
   mount -o remount,ro,bind /home/agent/.config/opencode/skills
 fi
@@ -1002,12 +1044,12 @@ const defaultEnvRuleMarkdown = "" +
 	"- When `git` commands fail, search and read files directly with `rg` instead of running `git init`.\n" +
 	"- Stop and tell the user if `/workspace` returns `EROFS` (read-only share), `EPERM` (protected VCS path), or `ESTALE` (detached share).\n" +
 	"- Ask the user to grant access from the host with `agbox share add` or `agbox share set --rw`.\n" +
-	"- Never mount overlays or bind-mounts over `/workspace`, and never write project deliverables to `/tmp` or `/home/agent`.\n" +
+	"- Never mount overlays or bind-mounts over `/workspace`. Never write project deliverables to `/tmp` or `/home/agent`.\n" +
 	"- Keep symlinks relative and inside the same share. Host confinement rejects symlinks that escape a share root.\n\n" +
 	"## Host Mounts, Hardware, and Network Boundaries\n\n" +
-	"- Treat `/home/agent/.agbox-*`, global skills, and global `AGENTS.md` files as read-only host mounts. Never unmount or shadow them.\n" +
+	"- Treat `/home/agent/.agbox-*` mounts, global skills, and global `AGENTS.md` files as host-managed mounts. Never unmount or shadow them.\n" +
 	"- `/dev/kvm` and host `msb` commands do not exist inside the microVM. Do not run nested microVM workloads.\n" +
-	"- Run unprivileged FUSE mount tests with `fusermount3`, or use `sudo` when `/dev/fuse` requires root access.\n" +
+	"- Use `fusermount3` for unprivileged FUSE tests. Use `sudo` when `/dev/fuse` requires root access.\n" +
 	"- Outbound DNS and public internet work by default unless the host starts the sandbox with `--no-net`.\n" +
 	"- The default firewall blocks host, private LAN, link-local, multicast, and cloud metadata addresses. Stop and tell the user if a task needs `--net` changes.\n" +
 	"- Never print, log, or copy credentials from `/home/agent/.agbox-keys.sh` or environment variables into `/workspace`.\n"
@@ -1059,14 +1101,15 @@ process_rule() {
   fi
   [ -f "$f" ] || return 0
   first_line=$(sed -n '1p' "$f" | tr -d '\r')
-  if [ "$first_line" = "---" ]; then
-    fm=$(awk 'NR==1{next} /^---\r?$/{exit} {print}' "$f")
-    if printf '%%s\n' "$fm" | grep -Eq '^[[:space:]]*trigger:[[:space:]]*(glob|model_decision|manual)([[:space:]]|$)'; then
+  has_close=$(awk '{sub(/\r$/, "")} NR>1 && $0=="---"{found=1; exit} END{print found+0}' "$f")
+  if [ "$first_line" = "---" ] && [ "$has_close" = "1" ]; then
+    fm=$(awk '{sub(/\r$/, "")} NR==1{next} $0=="---"{exit} {print}' "$f")
+    if printf '%%s\n' "$fm" | grep -Eq '^[[:space:]]*trigger:[[:space:]]*(glob|model_decision|manual|"(glob|model_decision|manual)"|'\''(glob|model_decision|manual)'\'')([[:space:]]|$)'; then
       cp "$f" "$stage/rules/$(basename "$f")"
       chmod 0444 "$stage/rules/$(basename "$f")"
       return 0
     fi
-    body=$(awk 'NR==1{in_fm=1; next} in_fm && /^---\r?$/{in_fm=0; next} !in_fm{print}' "$f")
+    body=$(awk 'NR==1{in_fm=1; next} in_fm{line=$0; sub(/\r$/, "", line); if(line=="---"){in_fm=0; next}} !in_fm{print}' "$f")
     if [ -s "$stage/AGENTS.md" ]; then
       printf '\n\n' >> "$stage/AGENTS.md"
     fi
@@ -1107,7 +1150,7 @@ chown 1000:1000 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.conf
 chmod 0700 /home/agent/.gemini /home/agent/.gemini/config /home/agent/.config /home/agent/.config/opencode
 
 for mp in /home/agent/.gemini/config/AGENTS.md /home/agent/.config/opencode/AGENTS.md /home/agent/.gemini/config/rules; do
-  if grep -qs " $mp " /proc/self/mountinfo; then
+  if grep -Fqs " $mp " /proc/self/mountinfo; then
     umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
   fi
 done
@@ -1120,6 +1163,12 @@ if [ -s /etc/agbox-global-rules/AGENTS.md ]; then
     chmod 0644 "$dst"
     mount --bind /etc/agbox-global-rules/AGENTS.md "$dst"
     mount -o remount,ro,bind "$dst"
+  done
+else
+  for dst in /home/agent/.gemini/config/AGENTS.md /home/agent/.config/opencode/AGENTS.md; do
+    if [ -f "$dst" ] && [ ! -L "$dst" ] && [ ! -s "$dst" ]; then
+      rm -f "$dst"
+    fi
   done
 fi
 if [ -n "$(ls -A /etc/agbox-global-rules/rules 2>/dev/null)" ]; then
@@ -1216,7 +1265,7 @@ func LockProfile(dataDir, rawName string) (*ProfileLock, error) {
 			return nil, fmt.Errorf("refusing non-regular profile lock %s", lockPath)
 		}
 	}
-	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("refusing symlinked profile lock %s", lockPath)
@@ -1224,6 +1273,15 @@ func LockProfile(dataDir, rawName string) (*ProfileLock, error) {
 		return nil, fmt.Errorf("open profile lock %s: %w", lockPath, err)
 	}
 	f := os.NewFile(uintptr(fd), lockPath)
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat profile lock %s: %w", lockPath, err)
+	}
+	if !st.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("refusing non-regular profile lock %s", lockPath)
+	}
 	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
@@ -1355,7 +1413,7 @@ func RemoveProfileDir(dataDir, rawName string) error {
 // /home/agent/.agbox-profile on ext4 and bind-mounts conversation directories.
 func BuildGuestProfileMountScript() string {
 	return `set -eu
-if ! grep -qs ' /home/agent/.agbox-profile ' /proc/self/mountinfo; then
+if ! grep -Fqs ' /home/agent/.agbox-profile ' /proc/self/mountinfo; then
   echo "agbox cannot find the profile disk at /home/agent/.agbox-profile" >&2
   exit 1
 fi
@@ -1378,7 +1436,7 @@ chmod 0700 \
   /home/agent/.agbox-profile/opencode-data \
   /home/agent/.agbox-profile/opencode-state
 
-if ! grep -qs ' /home/agent/.gemini/antigravity-cli ' /proc/self/mountinfo; then
+if ! grep -Fqs ' /home/agent/.gemini/antigravity-cli ' /proc/self/mountinfo; then
   for sub in bin builtin updater; do
     if [ -d "/home/agent/.gemini/antigravity-cli/${sub}" ]; then
       rm -rf "/home/agent/.agbox-profile/agy-cli/${sub}"
@@ -1407,16 +1465,16 @@ chown 1000:1000 \
   /home/agent/.local/state \
   /home/agent/.local/state/opencode
 
-if ! grep -qs ' /home/agent/.gemini/antigravity-cli ' /proc/self/mountinfo; then
+if ! grep -Fqs ' /home/agent/.gemini/antigravity-cli ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-profile/agy-cli /home/agent/.gemini/antigravity-cli
 fi
-if ! grep -qs ' /home/agent/.gemini/config/projects ' /proc/self/mountinfo; then
+if ! grep -Fqs ' /home/agent/.gemini/config/projects ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-profile/agy-projects /home/agent/.gemini/config/projects
 fi
-if ! grep -qs ' /home/agent/.local/share/opencode ' /proc/self/mountinfo; then
+if ! grep -Fqs ' /home/agent/.local/share/opencode ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-profile/opencode-data /home/agent/.local/share/opencode
 fi
-if ! grep -qs ' /home/agent/.local/state/opencode ' /proc/self/mountinfo; then
+if ! grep -Fqs ' /home/agent/.local/state/opencode ' /proc/self/mountinfo; then
   mount --bind /home/agent/.agbox-profile/opencode-state /home/agent/.local/state/opencode
 fi
 sync
@@ -1570,6 +1628,18 @@ func writeModeFileAtomic(path string, content []byte, mode fs.FileMode) error {
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("commit file %s: %w", path, err)
+	}
+	return syncParentDir(dir)
+}
+
+func syncParentDir(dir string) error {
+	dirFD, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open parent directory %q for sync: %w", dir, err)
+	}
+	defer syscall.Close(dirFD)
+	if err := syscall.Fsync(dirFD); err != nil && !errors.Is(err, syscall.EINVAL) {
+		return fmt.Errorf("sync parent directory %q: %w", dir, err)
 	}
 	return nil
 }

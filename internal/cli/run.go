@@ -80,6 +80,9 @@ func (a *appRuntime) run(ctx context.Context, args []string) error {
 }
 
 func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
+	if err := msb.ValidateNetArgs(opts.NoNet, opts.NetSpecs); err != nil {
+		return err
+	}
 	if err := a.requireSetup(opts.AllowRoot); err != nil {
 		return err
 	}
@@ -213,7 +216,6 @@ func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
 	keepAlive := false
 	suspendAfter := false
 	sandboxCreated := false
-	mountsActive := false
 	var meta config.RunMeta
 	var cleanupOnce sync.Once
 	cleanup := func() {
@@ -228,11 +230,6 @@ func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
 				return
 			}
 			cancelRun()
-			if mountsActive {
-				if uErr := mounttab.UnmountFilterDir(runFilterDir, a.MountCtl); uErr != nil {
-					a.warnf("Could not unmount shares in %s: %v", runFilterDir, uErr)
-				}
-			}
 			if sandboxCreated {
 				if rmRes, rmErr := a.destroySandbox(context.Background(), runSandbox, opts.Profile != "", true); rmErr != nil {
 					a.warnf("Could not delete sandbox %s: %v", runSandbox, formatMSBError("msb rm", rmRes, rmErr))
@@ -318,7 +315,6 @@ func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
 				useMask = false
 			} else {
 				workspaceHub = true
-				mountsActive = true
 				volumes = append(volumes, msb.VolumeSpec{
 					HostPath:  wsDir,
 					GuestPath: msb.GuestWorkspace,
@@ -474,7 +470,7 @@ func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
 	}
 
 	detachedMarker := filepath.Join(runFilterDir, "detached")
-	execErr := a.execSession(runCtx, runSandbox, meta, willDetach, opts.Probe, opts.Supervised)
+	supervisedReady, execErr := a.execSession(runCtx, runSandbox, meta, willDetach, opts.Probe, opts.Supervised)
 	if hasMarker(filepath.Join(runFilterDir, "suspended")) || hasMarker(filepath.Join(runFilterDir, "deleting")) {
 		return nil
 	}
@@ -485,7 +481,7 @@ func (a *appRuntime) runWithOpts(ctx context.Context, opts runOpts) error {
 			}
 			return nil
 		}
-		if opts.Persist && !willDetach {
+		if opts.Persist && !willDetach && (!opts.Supervised || supervisedReady) {
 			suspendAfter = true
 		}
 		return execErr
@@ -539,7 +535,7 @@ func (a *appRuntime) pushKeys(ctx context.Context, sandbox string) error {
 	return nil
 }
 
-func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta config.RunMeta, willDetach bool, probe bool, supervised bool) error {
+func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta config.RunMeta, willDetach bool, probe bool, supervised bool) (bool, error) {
 	workDir := sessionWorkDir(meta.Shares)
 	envFlags := msb.GuestEnvFlags()
 
@@ -565,7 +561,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			Stderr:      a.Stderr,
 			Interactive: true,
 		})
-		return wrapPassthroughExit(res, err)
+		return true, wrapPassthroughExit(res, err)
 
 	case config.RunModeRemoteControl:
 		startInner := fmt.Sprintf(
@@ -586,7 +582,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			Stderr: a.Stderr,
 		})
 		if err != nil {
-			return formatMSBError("start Antigravity Remote Control", startRes, err)
+			return false, formatMSBError("start Antigravity Remote Control", startRes, err)
 		}
 		statusInner := fmt.Sprintf("%s cd %s && agy remote-control status", msb.KeyLoaderPrefix, msb.ShellQuote(workDir))
 		statusArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
@@ -608,7 +604,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			return a.superviseRemoteControl(ctx, sandbox, workDir, envFlags, initialHealthy)
 		}
 		fmt.Fprintf(a.Stdout, "[agbox] Suspend: agbox suspend %s | Stop: agbox stop %s\n", sandbox, sandbox)
-		return nil
+		return true, nil
 
 	case config.RunModeServe:
 		serveCmd := fmt.Sprintf(
@@ -645,7 +641,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			})
 			res, err := a.MSB.Run(ctx, msb.CommandRequest{Args: execArgs})
 			if err != nil {
-				return formatMSBError("start opencode serve", res, err)
+				return false, formatMSBError("start opencode serve", res, err)
 			}
 			waitFn := a.WaitServeUI
 			if waitFn == nil {
@@ -655,21 +651,21 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 				logRes, _ := a.runGuestRootScript(ctx, sandbox, "read serve log", "sh", "tail -n 30 /tmp/agbox-serve.log 2>/dev/null || true")
 				detail := strings.TrimSpace(logRes.Stdout)
 				if detail != "" {
-					return fmt.Errorf("opencode serve did not answer on http://127.0.0.1:%d (%s)", meta.Port, detail)
+					return false, fmt.Errorf("opencode serve did not answer on http://127.0.0.1:%d (%s)", meta.Port, detail)
 				}
-				return fmt.Errorf("opencode serve did not answer on http://127.0.0.1:%d", meta.Port)
+				return false, fmt.Errorf("opencode serve did not answer on http://127.0.0.1:%d", meta.Port)
 			}
 			if probe {
 				fmt.Fprintf(a.Stdout, "[agbox] OpenCode web UI: http://127.0.0.1:%d\n", meta.Port)
 				fmt.Fprintf(a.Stdout, "[agbox] --probe: UI verified at http://127.0.0.1:%d.\n", meta.Port)
-				return nil
+				return true, nil
 			}
 			if a.Getenv == nil || a.Getenv("OPENCODE_SERVER_PASSWORD") == "" {
 				a.warnf("Loopback TCP (127.0.0.1:%d) accepts connections from any local user on this host. Set OPENCODE_SERVER_PASSWORD before 'agbox run --serve' on multi-user systems.", meta.Port)
 			}
 			fmt.Fprintf(a.Stdout, "[agbox] OpenCode web UI: http://127.0.0.1:%d\n", meta.Port)
 			fmt.Fprintf(a.Stdout, "[agbox] Suspend: agbox suspend %s | Stop: agbox stop %s\n", sandbox, sandbox)
-			return nil
+			return true, nil
 		}
 
 		if a.Getenv == nil || a.Getenv("OPENCODE_SERVER_PASSWORD") == "" {
@@ -679,7 +675,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 		if meta.Persist {
 			fmt.Fprintf(a.Stdout, "[agbox] Press Ctrl-C to stop and persist %s.\n", sandbox)
 		} else {
-			fmt.Fprintln(a.Stdout, "[agbox] Press Ctrl-C to stop and delete this microVM.")
+			fmt.Fprintln(a.Stdout, "[agbox] Press Ctrl-C to stop and delete this sandbox.")
 		}
 		execArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
 			Sandbox: sandbox,
@@ -692,7 +688,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			Args:        execArgs,
 			Interactive: true,
 		})
-		return wrapPassthroughExit(res, err)
+		return true, wrapPassthroughExit(res, err)
 
 	default:
 		inner := fmt.Sprintf("%s cd %s && exec %s", msb.KeyLoaderPrefix, msb.ShellQuote(workDir), buildTUIInvokeCommand(meta))
@@ -707,7 +703,7 @@ func (a *appRuntime) execSession(ctx context.Context, sandbox string, meta confi
 			Args:        execArgs,
 			Interactive: true,
 		})
-		return wrapPassthroughExit(res, err)
+		return true, wrapPassthroughExit(res, err)
 	}
 }
 
@@ -784,7 +780,7 @@ func (a *appRuntime) resolveRunShareTargets(opts runOpts) ([]pathsec.ShareTarget
 	specs := make([]pathsec.ShareSpec, 0, len(allRaw))
 	for _, raw := range allRaw {
 		if raw == "" {
-			continue
+			return nil, errors.New("share path must not be empty")
 		}
 		sp, err := pathsec.ParseShareSpec(raw)
 		if err != nil {
@@ -805,10 +801,8 @@ func (a *appRuntime) resolveRunShareTargets(opts runOpts) ([]pathsec.ShareTarget
 }
 
 func isSafeGuestShareName(name string) bool {
-	if name == "" || name == "." || name == ".." {
-		return false
-	}
-	return !strings.ContainsAny(name, "/:,")
+	_, err := pathsec.ValidateGuestAlias(name)
+	return err == nil
 }
 
 func summarizeShareModes(shares []config.ShareRecord) string {

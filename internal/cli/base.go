@@ -166,14 +166,6 @@ func (a *appRuntime) createBase(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
-		Args:   createArgs,
-		Stdout: a.Stdout,
-		Stderr: a.Stderr,
-	}); err != nil {
-		return fmt.Errorf("create base sandbox: %w", err)
-	}
-
 	succeeded := false
 	defer func() {
 		if !succeeded {
@@ -185,6 +177,13 @@ func (a *appRuntime) createBase(ctx context.Context, args []string) error {
 			}
 		}
 	}()
+	if _, err := a.MSB.Run(ctx, msb.CommandRequest{
+		Args:   createArgs,
+		Stdout: a.Stdout,
+		Stderr: a.Stderr,
+	}); err != nil {
+		return fmt.Errorf("create base sandbox: %w", err)
+	}
 
 	a.logf("Provisioning guest (apt baseline, shellcheck, mdformat, and non-root %q user with passwordless sudo)...", config.GuestUser)
 	aptCmd := "apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git ripgrep less procps sudo shellcheck python3 python3-venv pipx >/dev/null"
@@ -365,6 +364,9 @@ func (a *appRuntime) editBase(ctx context.Context, args []string) error {
 		return err
 	}
 	if opts.ListOnly {
+		if err := a.verifyUser(opts.AllowRoot); err != nil {
+			return err
+		}
 		fmt.Fprint(a.Stdout, msb.FormatCategoriesTable())
 		return nil
 	}
@@ -395,19 +397,21 @@ func (a *appRuntime) editBase(ctx context.Context, args []string) error {
 		}
 		fmt.Fprintln(a.Stdout, "\nEnter categories to install (numbers or names, 'all', or press Enter for a shell):")
 		sc := bufio.NewScanner(a.Stdin)
-		if sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line == "" || strings.EqualFold(line, "s") || strings.EqualFold(line, "shell") {
-				opts.Shell = true
-			} else {
-				cats, cErr := msb.ResolveCategories([]string{line})
-				if cErr != nil {
-					return cErr
-				}
-				opts.Categories = cats
+		if !sc.Scan() {
+			if sErr := sc.Err(); sErr != nil {
+				return fmt.Errorf("read category selection: %w", sErr)
 			}
-		} else {
+			return errors.New("aborted")
+		}
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.EqualFold(line, "s") || strings.EqualFold(line, "shell") {
 			opts.Shell = true
+		} else {
+			cats, cErr := msb.ResolveCategories([]string{line})
+			if cErr != nil {
+				return cErr
+			}
+			opts.Categories = cats
 		}
 	}
 
@@ -552,6 +556,16 @@ func (a *appRuntime) ensureSparseRootDiskSize(ctx context.Context, isRunning boo
 		return nil
 	}
 
+	findTool := a.FindHostTool
+	if findTool == nil {
+		findTool = findHostAdminTool
+	}
+	r2fs, ok := findTool("resize2fs")
+	if !ok {
+		return errors.New("resize2fs is not installed. Install e2fsprogs to expand the base root disk")
+	}
+	e2fsck, hasE2fsck := findTool("e2fsck")
+
 	a.logf("Expanding sparse base disk (%s) to %s...", upperPath, a.Env.RootDisk)
 	if isRunning {
 		stopRes, stopErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"stop", config.BaseSandbox}})
@@ -582,24 +596,27 @@ func (a *appRuntime) ensureSparseRootDiskSize(ctx context.Context, isRunning boo
 			return exec.CommandContext(c, name, args...).CombinedOutput()
 		}
 	}
-	for _, dir := range []string{"/sbin", "/usr/sbin", "/bin", "/usr/bin"} {
-		r2fs := filepath.Join(dir, "resize2fs")
-		if _, sErr := os.Stat(r2fs); sErr == nil {
-			e2fsck := filepath.Join(dir, "e2fsck")
-			if _, fErr := os.Stat(e2fsck); fErr == nil {
-				if out, cErr := runCmd(ctx, e2fsck, "-fp", upperPath); cErr != nil {
-					// e2fsck exit code 1 indicates corrected filesystem errors.
-					var exitErr *exec.ExitError
-					if !errors.As(cErr, &exitErr) || exitErr.ExitCode() != 1 {
-						return fmt.Errorf("e2fsck %s: %w (%s)", upperPath, cErr, strings.TrimSpace(string(out)))
-					}
-				}
+	if hasE2fsck {
+		if out, cErr := runCmd(ctx, e2fsck, "-fp", upperPath); cErr != nil {
+			// e2fsck exit code 1 indicates corrected filesystem errors.
+			var exitErr *exec.ExitError
+			if !errors.As(cErr, &exitErr) || exitErr.ExitCode() != 1 {
+				return fmt.Errorf("e2fsck %s: %w (%s)", upperPath, cErr, strings.TrimSpace(string(out)))
 			}
-			if out, rErr := runCmd(ctx, r2fs, upperPath); rErr != nil {
-				return fmt.Errorf("resize2fs %s: %w (%s)", upperPath, rErr, strings.TrimSpace(string(out)))
-			}
-			break
 		}
 	}
+	if out, rErr := runCmd(ctx, r2fs, upperPath); rErr != nil {
+		return fmt.Errorf("resize2fs %s: %w (%s)", upperPath, rErr, strings.TrimSpace(string(out)))
+	}
 	return nil
+}
+
+func findHostAdminTool(name string) (string, bool) {
+	for _, dir := range []string{"/sbin", "/usr/sbin", "/bin", "/usr/bin"} {
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, true
+		}
+	}
+	return "", false
 }

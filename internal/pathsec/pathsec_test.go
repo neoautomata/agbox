@@ -380,7 +380,7 @@ func TestAllDefaultVCSNamesAndBlocklistCategories(t *testing.T) {
 		}
 	}
 
-	// Verify representative paths from every DefaultBlocklist category (including [L1] additions) are rejected.
+	// Verify representative paths from every DefaultBlocklist category are rejected.
 	blockedDirs := []string{
 		filepath.Join(home, ".ssh"),
 		filepath.Join(home, ".gnupg"),
@@ -727,5 +727,239 @@ func TestUnicodeBidiRejection(t *testing.T) {
 		if _, err := ValidateShare(p, Policy{AllowOutsideHome: true}); err == nil {
 			t.Errorf("expected ValidateShare to reject bidi path %q", p)
 		}
+	}
+}
+
+func TestValidateShareRelativePathsAndSymlinkContainment(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(home, ".local", "share", "agbox")
+	msbHome := filepath.Join(home, ".microsandbox")
+	pol := Policy{
+		HomeReal:  home,
+		Blocklist: DefaultBlocklist(home, dataDir, msbHome),
+		VCSNames:  DefaultVCSNames(),
+	}
+
+	projDir := filepath.Join(home, "proj")
+	sshDir := filepath.Join(home, ".ssh")
+	for _, d := range []string{projDir, sshDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projFile := filepath.Join(projDir, "app.go")
+	if err := os.WriteFile(projFile, []byte("package app\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	authKeys := filepath.Join(sshDir, "authorized_keys")
+	if err := os.WriteFile(authKeys, []byte("ssh-ed25519 AAAA\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Relative paths inside $HOME resolve to canonical absolute paths.
+	t.Chdir(home)
+	gotProj, err := ValidateShare("./proj", pol)
+	if err != nil || gotProj.HostPath != projDir || !gotProj.IsDir {
+		t.Fatalf("ValidateShare(./proj) = (%+v, %v), want %q", gotProj, err, projDir)
+	}
+	gotFile, err := ValidateShare("proj/app.go", pol)
+	if err != nil || gotFile.HostPath != projFile || gotFile.IsDir {
+		t.Fatalf("ValidateShare(proj/app.go) = (%+v, %v), want %q", gotFile, err, projFile)
+	}
+
+	t.Chdir(projDir)
+	gotDot, err := ValidateShare(".", pol)
+	if err != nil || gotDot.HostPath != projDir || !gotDot.IsDir {
+		t.Fatalf("ValidateShare(.) from projDir = (%+v, %v), want %q", gotDot, err, projDir)
+	}
+
+	// Relative paths inside ~/.ssh must remain blocked.
+	t.Chdir(sshDir)
+	if _, err := ValidateShare("authorized_keys", pol); err == nil || !strings.Contains(err.Error(), "sensitive path") {
+		t.Errorf("expected relative authorized_keys from ~/.ssh to be blocked, got %v", err)
+	}
+	if _, err := ValidateShare(".", pol); err == nil || !strings.Contains(err.Error(), "sensitive path") {
+		t.Errorf("expected relative '.' from ~/.ssh to be blocked, got %v", err)
+	}
+
+	// Relative paths under /etc must remain blocked even with AllowOutsideHome=true.
+	polOutside := pol
+	polOutside.AllowOutsideHome = true
+	t.Chdir("/etc")
+	if _, err := ValidateShare("passwd", polOutside); err == nil || !strings.Contains(err.Error(), "sensitive path") {
+		t.Errorf("expected relative passwd from /etc to be blocked, got %v", err)
+	}
+	if _, err := ValidateShare(".", polOutside); err == nil || !strings.Contains(err.Error(), "sensitive path") {
+		t.Errorf("expected relative '.' from /etc to be blocked, got %v", err)
+	}
+
+	// Symlink inside $HOME pointing outside $HOME fails when AllowOutsideHome=false.
+	t.Chdir(home)
+	outsideProj := filepath.Join(outside, "ext")
+	if err := os.MkdirAll(outsideProj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	escapeLink := filepath.Join(home, "escape-link")
+	if err := os.Symlink(outsideProj, escapeLink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateShare(escapeLink, pol); err == nil || !strings.Contains(err.Error(), "outside $HOME") {
+		t.Errorf("expected symlink pointing outside $HOME to fail, got %v", err)
+	}
+	if _, err := ValidateShare("./escape-link", pol); err == nil || !strings.Contains(err.Error(), "outside $HOME") {
+		t.Errorf("expected relative symlink pointing outside $HOME to fail, got %v", err)
+	}
+}
+
+func TestValidateShareDanglingAndPartialSymlinkBlocklistEntries(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(home, ".local", "share", "agbox")
+	msbHome := filepath.Join(home, ".microsandbox")
+	pol := Policy{
+		HomeReal:  home,
+		Blocklist: DefaultBlocklist(home, dataDir, msbHome),
+		VCSNames:  DefaultVCSNames(),
+	}
+
+	// Case 1: ~/.bashrc -> ~/dotfiles/bashrc before target file exists.
+	dotfilesDir := filepath.Join(home, "dotfiles")
+	if err := os.MkdirAll(dotfilesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dotfilesDir, "bashrc"), filepath.Join(home, ".bashrc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateShare(dotfilesDir, pol); err == nil || !strings.Contains(err.Error(), "symlinked blocklist entry") {
+		t.Errorf("expected ~/dotfiles to be blocked by dangling ~/.bashrc symlink, got %v", err)
+	}
+
+	// Case 2: ~/.config -> ~/cfgstore/config where ~/cfgstore/config exists,
+	// while blocklisted child ~/.config/gcloud does not exist yet.
+	cfgStore := filepath.Join(home, "cfgstore")
+	cfgTarget := filepath.Join(cfgStore, "config")
+	if err := os.MkdirAll(cfgTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(cfgTarget, filepath.Join(home, ".config")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateShare(cfgTarget, pol); err == nil || !strings.Contains(err.Error(), "symlinked blocklist entry") {
+		t.Errorf("expected ~/cfgstore/config to be blocked via symlinked ~/.config ancestor, got %v", err)
+	}
+	if _, err := ValidateShare(cfgStore, pol); err == nil || !strings.Contains(err.Error(), "symlinked blocklist entry") {
+		t.Errorf("expected ~/cfgstore parent to be blocked via symlinked ~/.config ancestor, got %v", err)
+	}
+
+	// Case 3: dangling relative symlink loop in blocklist terminates cleanly.
+	loopA := filepath.Join(home, ".zshrc")
+	loopB := filepath.Join(home, ".zprofile")
+	_ = os.Symlink(".zprofile", loopA)
+	_ = os.Symlink(".zshrc", loopB)
+	cleanProj := filepath.Join(home, "clean-proj")
+	if err := os.MkdirAll(cleanProj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateShare(cleanProj, pol); err != nil {
+		t.Errorf("expected unrelated project to succeed despite blocklist symlink loop, got %v", err)
+	}
+}
+
+func TestCheckDisjointHostPathsEdges(t *testing.T) {
+	// Identical paths fail.
+	if err := CheckDisjointHostPaths([]ShareTarget{
+		{HostPath: "/home/u/app"},
+		{HostPath: "/home/u/app"},
+	}); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("expected duplicate path error, got %v", err)
+	}
+
+	// Parent before child fails.
+	if err := CheckDisjointHostPaths([]ShareTarget{
+		{HostPath: "/home/u/app"},
+		{HostPath: "/home/u/app/sub"},
+	}); err == nil || !strings.Contains(err.Error(), "overlapping") {
+		t.Errorf("expected parent/child overlap error, got %v", err)
+	}
+
+	// Child before parent fails.
+	if err := CheckDisjointHostPaths([]ShareTarget{
+		{HostPath: "/home/u/app/sub"},
+		{HostPath: "/home/u/app"},
+	}); err == nil || !strings.Contains(err.Error(), "overlapping") {
+		t.Errorf("expected child/parent overlap error, got %v", err)
+	}
+
+	// Sibling prefixes (/app vs /app2) succeed.
+	if err := CheckDisjointHostPaths([]ShareTarget{
+		{HostPath: "/app"},
+		{HostPath: "/app2"},
+		{HostPath: "/home/u/proj"},
+		{HostPath: "/home/u/proj-2"},
+	}); err != nil {
+		t.Errorf("expected sibling prefixes to be disjoint, got %v", err)
+	}
+}
+
+func TestParseShareSpecMalformedModifierEdges(t *testing.T) {
+	cases := []string{
+		"/home/u/proj:ro,",
+		"/home/u/proj:,ro",
+		"/home/u/proj:ro,,vcs",
+		"/home/u/proj:ro\x07",
+		"/home/u/proj\x00:ro",
+		"/home/u/proj:as=app\x1f",
+		"/home/u/proj:as=",
+		"/home/u/proj:vcs,ro,",
+	}
+	for _, raw := range cases {
+		if _, err := ParseShareSpec(raw); err == nil {
+			t.Errorf("ParseShareSpec(%q) succeeded, want error", raw)
+		}
+	}
+}
+
+func TestValidateShareRelativeDanglingSymlinkUnderSymlinkedParent(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(home, ".local", "share", "agbox")
+	msbHome := filepath.Join(home, ".microsandbox")
+	pol := Policy{
+		HomeReal:  home,
+		Blocklist: DefaultBlocklist(home, dataDir, msbHome),
+		VCSNames:  DefaultVCSNames(),
+	}
+
+	dotfilesConfig := filepath.Join(home, "dotfiles", "config")
+	ghSecrets := filepath.Join(home, "dotfiles", "gh-secrets")
+	for _, d := range []string{dotfilesConfig, ghSecrets} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(dotfilesConfig, filepath.Join(home, ".config")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../gh-secrets/missing", filepath.Join(dotfilesConfig, "gh")); err != nil {
+		t.Fatal(err)
+	}
+
+	wantResolved := filepath.Join(ghSecrets, "missing")
+	if got := resolveBlocklistPath(filepath.Join(home, ".config", "gh")); got != wantResolved {
+		t.Errorf("resolveBlocklistPath(~/.config/gh) = %q, want %q", got, wantResolved)
+	}
+	if _, err := ValidateShare(ghSecrets, pol); err == nil || !strings.Contains(err.Error(), "symlinked blocklist entry") {
+		t.Errorf("ValidateShare(~/dotfiles/gh-secrets) = %v, want symlinked blocklist error", err)
 	}
 }

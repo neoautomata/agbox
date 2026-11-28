@@ -3,7 +3,7 @@ package cli
 func usageText() string {
 	return `Usage: agbox [--allow-root] <mode> [arguments...]
 
-agbox runs OpenCode or Google Antigravity CLI inside an isolated microVM.
+agbox runs OpenCode or Google Antigravity CLI inside an isolated Linux microVM (a sandbox).
 
 Global options:
   --allow-root
@@ -11,27 +11,27 @@ Global options:
 
 Modes:
   agbox setup [--allow-root]
-      Check host prerequisites (msb, /dev/kvm, FUSE, and microVM smoke test).
+      Check host prerequisites (msb, /dev/kvm, FUSE, and a smoke-test sandbox).
 
   agbox version (or agbox --version)
-      Print agbox version and exit.
+      Print the agbox version and exit.
 
   agbox completion [--allow-root] bash
       Print the bash completion script to stdout.
 
   agbox create-base [--force] [--allow-root] [--add <categories>] <opencode|antigravity|both>
-      Create the base microVM and save snapshot agbox:vN.
+      Create the base sandbox and save snapshot agbox:vN.
 
   agbox edit-base [--allow-root] [--add <categories>] [--list] [--shell] [--cmd "shell"] [--no-snap] [categories...]
-      Start the base microVM and install categories or run custom updates.
+      Start the base sandbox to install categories or run custom updates.
       Save snapshot agbox:v<N+1> unless you pass --no-snap.
 
   agbox update [--allow-root] [antigravity|opencode|both|status|clear [antigravity|opencode|all]]
-      Update agent binaries inside a disposable zero-share microVM.
+      Update agent binaries inside a disposable zero-share sandbox.
       Cache checked ELF binaries in $DATA_DIR/agents without rebuilding the base snapshot.
 
   agbox auth [--allow-root] [antigravity|opencode|status|logout]
-      Sign in inside a disposable microVM and save credentials in $DATA_DIR/auth.
+      Sign in inside a disposable sandbox and save credentials in $DATA_DIR/auth.
 
   agbox skills [--allow-root] [list|add [--force] <path>|rm <name>]
       Manage global skills mounted read-only into sandboxes from $DATA_DIR/skills.
@@ -47,22 +47,22 @@ Modes:
       agbox share add defaults to ro,mask.
 
   agbox service [--allow-root] <list|add|enable|disable|start|stop|restart|logs|rm|linger> [...]
-      Manage systemd user services (agbox@.service) that start at boot and survive logout.
+      Manage systemd user services (agbox@.service) that start at boot and stay active after logout.
 
   agbox run [options] [opencode|antigravity] [path[:opts]...]
-      Restore a microVM and mask VCS files and directories.
+      Restore a sandbox and mask VCS files and directories.
       Block local, private, multicast, and cloud metadata IPs by default.
-      Delete the microVM on exit unless you pass --persist or suspend it.
+      Delete the sandbox on exit unless you pass --persist or suspend it.
       Options (must precede paths):
         --name NAME          Name the sandbox agbox-NAME instead of agbox-run-PID
-        --persist            Keep the named microVM on exit and resume it on repeat runs
+        --persist            Keep the named sandbox on exit. Resume it on repeat runs
         --profile NAME       Mount ext4 profile volume agbox-profile-NAME for conversations
         -c, --continue       Continue the most recent conversation in TUI mode
         -s, --session ID     Continue conversation ID in TUI mode (alias: --conversation)
         --no-auth            Skip saved login credentials from $DATA_DIR/auth
         --no-skills          Skip global skills from $DATA_DIR/skills
         --no-rules           Skip global rules from $DATA_DIR/rules
-        --no-agent-cache     Skip cached agent binary updates from $DATA_DIR/agents
+        --no-agent-cache     Skip cached agent binaries from $DATA_DIR/agents
         --allow-root         Allow agbox to run as the root user
         --share PATH[:OPTS]  Share a host path with modifiers (ro,rw,mask,vcs,vcs-hooks,as=NAME)
         --share-hub          Mount an empty /workspace FUSE hub to add shares live
@@ -72,30 +72,31 @@ Modes:
         --vcs-hooks          Allow VCS metadata and writable hooks inside writable shares
         --no-mask            Disable the FUSE VCS filter (exposes .git to guest)
         --serve              Run 'opencode serve' and bind the web UI on 127.0.0.1
-        --port N             Use fixed loopback TCP port N for --serve
+        --port N             Use fixed loopback port N for --serve
         --probe              With --serve: wait for the web UI, then exit
         --remote-control     Run 'agy' with Remote Control for https://antigravity.google.com
         -d, --detach         Keep --remote-control or --serve running in the background
-        --cmd "shell"        Run one command in the microVM and exit
+        --cmd "shell"        Run one command in the sandbox and exit
         --no-net             Disable guest network access
         --net SPEC           Set network profile (public|none|private|host|all) or rule
         --cpus N             Override vCPU count for this run
         --memory SIZE        Override RAM size for this run (for example, 4G)
 
   agbox suspend [--allow-root] <sandbox>
-      Stop a run microVM, keep its root disk, and unmount host FUSE shares.
+      Stop a run sandbox, keep its root disk, and unmount host FUSE shares.
 
-  agbox resume [--allow-root] [-d|--detach] [-c|--continue] [--session ID] [--no-auth] [--no-skills] [--no-rules] [--no-agent-cache] <sandbox>
-      Check shares, mount FUSE filters, start a suspended microVM, and restart its agent.
+  agbox resume [--allow-root] [-d|--detach] [-c|--continue] [-s|--session ID] [--no-auth] [--no-skills] [--no-rules] [--no-agent-cache] <sandbox>
+      Check shares and mount FUSE filters. Start the suspended sandbox and restart its agent.
 
   agbox stop [--allow-root] <sandbox>
-      Delete a running or suspended run microVM and unmount its FUSE shares.
+      Delete a running or suspended run sandbox and unmount its FUSE shares.
 
   agbox remove [--allow-root] [-y|--yes]
-      Delete all agbox microVMs, snapshots, profile volumes, FUSE mounts, and $DATA_DIR.
+      Delete all agbox-* sandboxes, snapshots, and profile volumes.
+      Delete managed systemd user services (agbox@.service, agbox@*.service), FUSE mounts, and $DATA_DIR.
 
   agbox status [--allow-root]
-      Show base settings, persistence state, microVMs, snapshots, and disk usage.
+      Show base settings, persistence state, sandboxes, snapshots, and disk usage.
 `
 }
 
@@ -103,14 +104,14 @@ func runUsageText() string {
 	return `Usage: agbox run [options] [agent] [path[:opts]...]
 
   --name NAME          Name the sandbox agbox-NAME instead of agbox-run-PID
-  --persist            Keep the named microVM on exit and resume it on repeat runs
+  --persist            Keep the named sandbox on exit. Resume it on repeat runs
   --profile NAME       Mount ext4 profile volume agbox-profile-NAME for conversations
   -c, --continue       Continue the most recent conversation in TUI mode
   -s, --session ID     Continue conversation ID in TUI mode (alias: --conversation)
   --no-auth            Skip saved login credentials from $DATA_DIR/auth
   --no-skills          Skip global skills from $DATA_DIR/skills
   --no-rules           Skip global rules from $DATA_DIR/rules
-  --no-agent-cache     Skip cached agent binary updates from $DATA_DIR/agents
+  --no-agent-cache     Skip cached agent binaries from $DATA_DIR/agents
   --allow-root         Allow agbox to run as the root user
   --share PATH[:OPTS]  Share a host path with modifiers (ro,rw,mask,vcs,vcs-hooks,as=NAME)
   --share-hub          Mount an empty /workspace FUSE hub to add shares live
@@ -120,11 +121,11 @@ func runUsageText() string {
   --vcs-hooks          Allow VCS metadata and writable hooks inside writable shares
   --no-mask            Disable the FUSE VCS filter (exposes .git to guest)
   --serve              Run 'opencode serve' and bind the web UI on 127.0.0.1
-  --port N             Use fixed loopback TCP port N for --serve (default: random)
+  --port N             Use fixed loopback port N for --serve (default: random)
   --probe              With --serve: wait for the web UI, then exit
   --remote-control     Run 'agy' with Remote Control for https://antigravity.google.com
   -d, --detach         Keep --remote-control or --serve running in the background
-  --cmd 'shell'        Run one command in the microVM and exit
+  --cmd 'shell'        Run one command in the sandbox and exit
   --no-net             Disable guest network access
   --net SPEC           Set network profile (public|none|private|host|all) or rule
   --cpus N / --memory S   Override vCPU count or RAM size for this run
@@ -136,7 +137,7 @@ func runUsageText() string {
 func authUsageText() string {
 	return `Usage:
   agbox auth [--allow-root] [antigravity|opencode]
-      Sign in inside a disposable microVM and save credentials in $DATA_DIR/auth.
+      Sign in inside a disposable sandbox and save credentials in $DATA_DIR/auth.
   agbox auth [--allow-root] status
       Show saved login status for antigravity and opencode.
   agbox auth [--allow-root] logout [antigravity|opencode|all]
@@ -193,7 +194,7 @@ func shareUsageText() string {
       A change from rw to ro fails on open writable handles unless you pass --force.
 
   agbox share [--allow-root] rm [--force] <sandbox> <guest-name-or-path>
-      Detach a share and revoke open host file descriptors immediately.
+      Detach a share and revoke open file descriptors on the host immediately.
       Detaching fails on open writable handles unless you pass --force.
 `
 }
@@ -201,12 +202,12 @@ func shareUsageText() string {
 func updateUsageText() string {
 	return `Usage:
   agbox update [--allow-root] [antigravity|opencode|both]
-      Update agent binaries inside a disposable zero-share microVM.
+      Update agent binaries inside a disposable zero-share sandbox.
       Cache checked ELF binaries in $DATA_DIR/agents for read-only sandbox mounts.
   agbox update [--allow-root] status
       Show cached agent versions and SHA-256 digests in $DATA_DIR/agents.
   agbox update [--allow-root] clear [antigravity|opencode|all]
-      Delete cached agent updates and use base snapshot binaries on new runs.
+      Delete cached agent binaries and use base snapshot binaries on new runs.
 `
 }
 
@@ -225,31 +226,31 @@ func serviceUsageText() string {
       List configured agbox systemd user services and show user linger state.
 
   agbox service [--allow-root] add [service-opts] <name> [run-opts] [agent] [path[:opts]...]
-      Save a headless service spec in $DATA_DIR/services/<name>.json and install agbox@.service.
+      Save a headless service spec in $DATA_DIR/services/<name>.json. Install agbox@.service.
       Requires --remote-control, --serve --port N, or --cmd "shell".
       Service options:
         --force              Overwrite an existing service spec with the same name
         --env-file PATH      Load passthrough secrets from a mode 0600 KEY=VALUE file at start
         --enable             Enable agbox@<name>.service at boot after adding it
         --now                With --enable: start the service immediately
-        --no-linger          Skip enabling systemd-logind user linger
+        --no-linger          Skip enabling user linger in systemd-logind
 
   agbox service [--allow-root] enable [--now] [--no-linger] <name>
-      Install agbox@.service, enable user linger for boot-without-login, and enable the unit.
+      Install agbox@.service. Enable user linger for boot without login and enable the unit.
 
   agbox service [--allow-root] disable [--now] <name>
-      Disable agbox@<name>.service at boot (and stop it with --now).
+      Disable agbox@<name>.service at boot. Stop it when you pass --now.
 
   agbox service [--allow-root] start|stop|restart <name>
-      Control the running agbox@<name>.service systemd user unit.
+      Control the running systemd user unit agbox@<name>.service.
 
   agbox service [--allow-root] logs [-f|--follow] [-n|--lines N] <name>
-      Show systemd user journal logs for agbox@<name>.service.
+      Show journal logs for agbox@<name>.service.
 
   agbox service [--allow-root] rm [--force] <name>
-      Stop and disable agbox@<name>.service and delete its service spec.
+      Stop and disable agbox@<name>.service. Delete its service spec.
 
   agbox service [--allow-root] linger [status|enable]
-      Show or enable systemd-logind user linger so services start at boot and survive logout.
+      Show or enable user linger in systemd-logind. Services then start at boot and stay active after logout.
 `
 }

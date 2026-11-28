@@ -12,11 +12,14 @@ flowchart TD
     DISK --> VM
 ```
 
-Each run boots a sandbox from a local base snapshot. A sandbox is one microVM. `agbox` mounts only the host paths that you pass on the command line. By default, `agbox` masks version-control entries through FUSE. It also blocks private, multicast, and cloud metadata network ranges. If a check fails, `agbox` stops and deletes partial state.
+Each run boots a sandbox from a local base snapshot. A sandbox is one microVM. `agbox` mounts only the host paths that you pass on the command line. By default, `agbox` masks version-control entries through FUSE. It also blocks private, multicast, and cloud metadata ranges. If a check fails, `agbox` stops and deletes partial state.
 
 The [User Guide](USER_GUIDE.md) describes workflows, package categories, share options, persistence, CLI flags, and environment variables. [AGENTS.md](AGENTS.md) describes the architecture and the rules for contributors.
 
 ## Quick Start
+
+> [!NOTE]
+> Host requirements: Linux with `/dev/kvm` (Debian or Ubuntu target), `glibc` 2.28 or newer, Go, and `fuse3`.
 
 ### 1. Install and check the host
 
@@ -28,7 +31,7 @@ Run the installer as your normal user. Pass `--allow-root` when you run it as `r
 
 The installer runs these steps:
 
-1. It checks `glibc` (2.28 or newer), `go`, and `fusermount3`.
+1. It checks `glibc` (2.28 or newer), `go`, and `fusermount3` (or `fusermount`).
 1. It downloads the `msb` installer over HTTPS (TLS 1.2 or newer) if `msb` is missing.
 1. It builds a static `agbox` binary and installs it atomically in `~/.local/bin` (`/usr/local/bin` for `root`).
 1. It installs the default sandbox rules (`AGBOX_ENV_RULES.md`) into `~/.local/share/agbox/rules`.
@@ -137,7 +140,7 @@ With `--serve`, `agbox` also adds `--net-rule allow:ingress@loopback:tcp:3000` a
 `agbox` mounts no host path and starts no FUSE daemon unless you pass a path or `--share-hub`.
 
 1. **Workspace Hub.** An embedded FUSE Workspace Hub mounts each share at `/workspace/<name>` with `nosuid,nodev`. All host access uses `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`.
-1. **VCS masking.** The default policy is `:mask`. It hides 22 VCS directory and control file names (`ENOENT`). It blocks writes to them at every depth (`EPERM`). Matching is case-insensitive.
+1. **VCS masking.** The default policy is `:mask`. It hides 22 VCS directory names and control files (`ENOENT`). It blocks writes to them at every depth (`EPERM`). Matching is case-insensitive.
 1. **VCS hooks.** The `:vcs` policy exposes VCS metadata. It write-protects hooks and executable config files (`EPERM`). Writable hooks need `:vcs-hooks` on a writable share.
 1. **Path checks.** `pathsec.ValidateShare` resolves symlinks and rejects missing paths, overlapping paths, and control characters. Paths outside `$HOME` fail unless you set `AGBOX_ALLOW_OUTSIDE_HOME=1`.
 1. **Blocklist.** `agbox` rejects shares of VCS paths, credentials, agent state, shell configs, `DATA_DIR`, `MSB_HOME`, and system paths. It also rejects their parent directories, including `$HOME`.
@@ -183,6 +186,7 @@ With `--serve`, `agbox` also adds `--net-rule allow:ingress@loopback:tcp:3000` a
 | PID reuse | `mounttab.IsFilterCmdline` | Checks `/proc/<pid>/cmdline` for `agbox __filter` and the target directory before sending a signal. |
 | Safe deletion | `mounttab.TeardownFilterDir` | Checks for zero active mounts in `/proc/self/mountinfo` before `os.RemoveAll`. |
 | Resume checks | `cli`, `install.sh` | Checks FUSE, KVM, and an offline sandbox during setup. Checks shares, caches, and profiles again on resume. |
+| User services | `service`, `cli` | Saves mode `0600` specs. Requires a regular `--env-file` (mode `0600` or stricter, no symlinks). Keeps secrets out of `agbox@.service`. Stops the microVM before FUSE unmount (`KillMode=mixed`). |
 
 </details>
 
@@ -199,6 +203,7 @@ agbox/
 │   ├── msb/           Argument builders, network rules, categories, Runner interface.
 │   ├── pathsec/       Path validation, share parsing, blocklists, alias checks.
 │   ├── persist/       Credential capture, agent cache, skills, rules, profiles.
+│   ├── service/       Template unit for systemd --user, mode 0600 specs, env-file parser.
 │   └── vcsfuse/       Workspace Hub, VCS and hook filter, control socket.
 ├── AGBOX_ENV_RULES.md Default guest rules that install.sh and agbox setup install.
 ├── install.sh         Idempotent host check, static build, and atomic install.

@@ -47,8 +47,11 @@ func parseCompletionArgs(args []string) (shell string, allowRoot bool, err error
 }
 
 func (a *appRuntime) completion(args []string) error {
-	shell, _, err := parseCompletionArgs(args)
+	shell, allowRoot, err := parseCompletionArgs(args)
 	if err != nil {
+		return err
+	}
+	if err := a.verifyUser(allowRoot); err != nil {
 		return err
 	}
 	if shell == "bash" {
@@ -190,7 +193,7 @@ func listCompletionSandboxes(dataDir string, filter complete.SandboxFilter) []st
 		hasSuspended := isRegularNoFollow(filepath.Join(runDir, "suspended"))
 		switch filter {
 		case complete.SandboxRunning:
-			if hasRunning {
+			if hasRunning && !hasSuspended {
 				out = append(out, sandbox)
 			}
 		case complete.SandboxSuspended:
@@ -232,7 +235,7 @@ func listCompletionShares(dataDir, sandbox string, timeout time.Duration) []stri
 		return names
 	}
 
-	for _, metaName := range []string{"run.meta", "suspended"} {
+	for _, metaName := range []string{"suspended", "run.meta"} {
 		meta, mErr := config.LoadRunMeta(filepath.Join(runDir, metaName))
 		if mErr != nil {
 			continue

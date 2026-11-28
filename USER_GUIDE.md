@@ -4,6 +4,19 @@ This guide describes each `agbox` workflow in order. It covers installation, bas
 
 For architecture and security properties, see [README.md](README.md).
 
+## Contents
+
+1. [Install and check the host](#1-install-and-check-the-host)
+1. [Create the base snapshot](#2-create-the-base-snapshot)
+1. [Authenticate agents](#3-authenticate-agents)
+1. [Add global skills and rules](#4-add-global-skills-and-rules)
+1. [Run agents and share project directories](#5-run-agents-and-share-project-directories)
+1. [Persist conversations and manage sandboxes](#6-persist-conversations-and-manage-sandboxes)
+1. [Connect by web interface or Remote Control](#7-connect-by-web-interface-or-remote-control)
+1. [Update agents and customize the base image](#8-update-agents-and-customize-the-base-image)
+1. [CLI reference, environment variables, and deletion](#9-cli-reference-environment-variables-and-deletion)
+1. [Troubleshooting](#10-troubleshooting)
+
 ## 1. Install and check the host
 
 Run the installer from the repository root as your normal user:
@@ -69,7 +82,7 @@ Run `agbox edit-base --list` to print the categories. You can also read the tabl
 | `core` | `base`, `cli` | `build-essential`, `pkg-config`, `cmake`, `ninja-build`, `ccache`, `fuse3`, `libffi-dev`, `libssl-dev`, `libsqlite3-dev`, `sqlite3`, `ca-certificates`, `curl`, `wget`, `git`, `htop`, `ncdu`, `net-tools`, `iproute2`, `dnsutils`, `rsync`, `unzip`, `zip`, `vim`, `jq`, `ripgrep`, `fd-find`, `shellcheck`, `less`, `procps`, `psmisc`, `lsof`, `strace`, `tree`, `file`, `openssh-client`, `poppler-utils`, `qpdf`, `python3-pypdf`, `python3`, `python3-pip`, `python3-setuptools`, `python3-venv`, `python3-wheel`, `pipx`, `uv` (`/usr/local/bin/uv`), and `mdformat` with `mdformat-gfm` (through `pipx`). Sets `CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CXX_COMPILER_LAUNCHER` to `/usr/bin/ccache`. |
 | `go` | `golang` | The upstream Go toolchain in `/usr/local/go` (fallback: `golang-go`), `protobuf-compiler`, and `dlv`, `gopls`, `golangci-lint`, `goimports`, `staticcheck`, `govulncheck`, `protoc-gen-go`, and `protoc-gen-go-grpc` in `/home/agent/go/bin`. |
 | `rust` | `cargo`, `rustup` | The `rustup` stable toolchain with `clippy`, `rustfmt`, `rust-analyzer`, and `rust-src`. Also `clang`, `lld`, `pkg-config`, `libssl-dev`, `libudev-dev`, `libusb-1.0-0-dev`, `protobuf-compiler`, and `sccache`. |
-| `esphome` | `esp` | `esphome` (with `pio`, `platformio`, and `piodebuggdb` symlinked from its venv) and `esptool` through `pipx`. Also `libudev-dev`, `libusb-1.0-0-dev`, `udev`, `usbutils`, `cmake`, `ninja-build`, `gperf`, `ccache`, `dfu-util`, `picocom`, and `minicom`. Pre-warms `~/.platformio` and `~/.platformio/penv` for ESP32 and ESP32-S3 (`esp-idf` and `arduino`), applies `ccache` patches to `espressif32` builder scripts, adds PlatformIO toolchains to `PATH`, and sets `ESPHOME_DATA_DIR`, `ESPHOME_NOGITIGNORE`, and `CMAKE_*_COMPILER_LAUNCHER`. |
+| `esphome` | `esp` | `esphome` (with `pio`, `platformio`, and `piodebuggdb` symlinked from its venv) and `esptool` through `pipx`. Also `libudev-dev`, `libusb-1.0-0-dev`, `udev`, `usbutils`, `cmake`, `ninja-build`, `gperf`, `ccache`, `dfu-util`, `picocom`, and `minicom`. Pre-warms `~/.platformio` and `~/.platformio/penv` for ESP32 and ESP32-S3 (`esp-idf` and `arduino`). Patches `espressif32` builder scripts for `ccache`. Adds PlatformIO toolchains to `PATH`. Sets `ESPHOME_DATA_DIR`, `ESPHOME_NOGITIGNORE`, and `CMAKE_*_COMPILER_LAUNCHER`. |
 | `embedded-rust` | `esp-rust` | The `riscv32imc-unknown-none-elf` and `riscv32imac-unknown-none-elf` Rust targets. Also `espflash`, `cargo-espflash`, and `ldproxy`. Includes `rust`. |
 | `chrome` | `browser`, `chromium`, `devtools` | `chromium`, `chromium-driver`, `xvfb`, `fonts-liberation`, `fonts-noto-color-emoji`, `libnss3`, `libatk-bridge2.0-0`, `libdrm2`, `libxkbcommon0`, and `libgbm1`. Sets headless flags (`--no-sandbox --disable-dev-shm-usage`) and `google-chrome` and `chrome` symlinks. |
 | `hugo` | `static-site` | The Hugo Extended binary (`/usr/local/bin/hugo`) with Sass and SCSS support. |
@@ -186,6 +199,7 @@ When `$DATA_DIR/rules` holds `.md` files (64 KiB maximum each), `agbox run` moun
 - `agbox` bind-mounts that file read-only onto `/home/agent/.gemini/config/AGENTS.md` and `/home/agent/.config/opencode/AGENTS.md`. Both `agy` and `opencode` read it.
 - Antigravity rule files with YAML frontmatter (`trigger: glob`, `model_decision`, or `manual`) go to `/etc/agbox-global-rules/rules/*.md` (mode `0444`). `agbox` bind-mounts that directory read-only onto `/home/agent/.gemini/config/rules`.
 - Host edits to `$DATA_DIR/rules` apply on the next `agbox run` or `agbox resume`. You do not rebuild `agbox:vN`.
+- Antigravity truncates any single rule file larger than 24,000 bytes inline. Keep each rule file concise or split large rules.
 
 ### Project skills and instructions
 
@@ -196,7 +210,7 @@ When you share one project directory, `agbox` starts the agent in `/workspace/<n
 - `.agents/skills/<skill>/SKILL.md`
 - `.opencode/skills/<skill>/SKILL.md`
 
-When you share several directories with `antigravity`, `agbox` passes `--add-dir /workspace/<name>` for each directory.
+When you share one directory with `antigravity` under the Workspace Hub, `agbox` passes `--add-dir /workspace`. When you share several directories with `antigravity`, `agbox` passes `--add-dir /workspace/<name>` for each directory.
 
 ## 5. Run agents and share project directories
 
@@ -227,7 +241,7 @@ If `agbox-<name>` exists, `agbox run` fails and leaves it unchanged. One excepti
 
 ### Network profiles
 
-Pass `--net <spec>` (alias `--net-rule`) to change network access for one run:
+Pass `--net <spec>` (alias `--net-rule`) one or more times to change network access for one run:
 
 | Value | Effect |
 |---|---|
@@ -238,7 +252,7 @@ Pass `--net <spec>` (alias `--net-rule`) to change network access for one run:
 | `allow@api.anthropic.com:tcp:443` | Permits only the listed endpoint. Accepts comma-separated rules. |
 | `all` | Permits all outbound traffic. |
 
-Every profile except `all` keeps the deny rules for loopback, link-local, multicast, and cloud metadata ranges. The `private` profile permits private ranges. The `host` profile permits the host.
+Every active profile except `all` keeps the deny rules for loopback, link-local, multicast, and cloud metadata ranges. The `private` profile permits private ranges. The `host` profile permits host services and keeps `allow@dns` active. It accepts explicit non-metadata IP or CIDR allow rules while cloud metadata ranges stay blocked.
 
 > [!WARNING]
 > `--net all` disables the network protections. Use it only for trusted code.
@@ -257,7 +271,7 @@ agbox run antigravity \
 
 | Modifier | Effect |
 |---|---|
-| `ro` | Read-only. Writes fail with `EROFS`. Write permission bits are hidden. |
+| `ro` | Read-only. Writes fail with `EROFS`. The filter hides write permission bits. |
 | `rw` | Read-write. This is the default for `agbox run` unless you pass `--ro`. |
 | `mask` | Hides and write-protects 22 VCS names. This is the default. Alias: `mask-vcs`. |
 | `vcs` | Allows VCS tools (`git`, `jj`, `hg`, `svn`, `bzr`, `sl`). Write-protects hooks, executable config files, and admin entries. |
@@ -267,7 +281,7 @@ agbox run antigravity \
 `agbox` rejects conflicting options. Examples are `--ro` with `--rw`, `:ro,rw` on one share, `:ro` with `:vcs-hooks`, and `:vcs` on a single-file share.
 
 > [!WARNING]
-> `--no-mask` turns off the FUSE VCS filter. The guest then sees `.git` and its hooks. Use it only for trusted agents.
+> `--no-mask` disables the FUSE VCS filter. The guest then sees `.git` and its hooks. Use it only for trusted agents.
 
 ### Add, change, or delete shares live (`agbox share`)
 
@@ -307,6 +321,12 @@ Rules for `agbox share`:
 
 By default, `agbox run` is disposable. It deletes conversation history on exit. Use `--persist`, `--profile`, or `agbox suspend` for longer work.
 
+| Mechanism | What persists | Fresh root disk each run? | Best for |
+|---|---|---|---|
+| `--persist --name <name>` | Full root disk, installed `apt` packages, build caches, and agent conversations | No | Long-lived workspaces with custom packages or warm build caches |
+| `--profile <name>` | Agent conversations and history on an `ext4` volume (`agbox-profile-<name>`) | Yes | Clean ephemeral root disks with shared conversation history |
+| `agbox suspend` and `agbox resume` | Full root disk and recorded shares for an existing sandbox | No | Pausing an active sandbox to free host CPU, RAM, and FUSE processes |
+
 ```mermaid
 stateDiagram-v2
     direction TB
@@ -340,6 +360,8 @@ agbox stop agbox-myapp
 
 `--persist` keeps conversation databases, artifacts, `apt` packages, and build caches in `agbox-<name>`. A stopped `agbox-<name>` uses no host CPU, RAM, or FUSE processes.
 
+Resuming a suspended sandbox with `agbox run --persist` rejects non-default network, CPU, RAM, port, share access, or VCS mask flags. It also rejects sandboxes that use `--profile`.
+
 ### Conversation profile (`--profile`)
 
 Use `--profile <name>` to keep conversations on a dedicated `ext4` disk (`agbox-profile-<name>`). Each run still boots a fresh root filesystem from `agbox:vN`:
@@ -367,7 +389,7 @@ A profile name has 48 characters or fewer. `--profile` bind-mounts these guest d
 - `~/.local/share/opencode`
 - `~/.local/state/opencode`
 
-Before it mounts `~/.gemini/antigravity-cli`, `agbox` copies `bin`, `builtin`, `updater`, and `settings.json` from the snapshot onto the profile disk. Global skills, rules, and system binaries stay on the snapshot root disk.
+Before it mounts `~/.gemini/antigravity-cli`, `agbox` copies `bin`, `builtin`, and `updater` from the snapshot onto the profile disk. It copies `settings.json` only when that file does not exist on the profile disk. Global skills, rules, and system binaries stay on the snapshot root disk.
 
 A host `flock` on `$DATA_DIR/profiles/.<name>.lock` stops two sandboxes from mounting one profile at the same time.
 
@@ -383,8 +405,8 @@ agbox suspend agbox-feature-auth
 
 `agbox suspend` runs these steps:
 
-1. It writes `$DATA_DIR/run/<id>/suspended` with the share paths and run mode.
-1. It runs `msb stop <sandbox>`. This stops the guest kernel and keeps the root disk.
+1. It runs `msb stop <sandbox>` (with `-t 10` for `--profile` sandboxes). This stops the guest kernel and keeps the root disk.
+1. It writes `$DATA_DIR/run/<id>/suspended` with the share paths and run mode, then deletes `detached`.
 1. It unmounts all host FUSE filters. Zero background processes remain.
 
 If you suspend from a second terminal, the foreground `agbox` process exits and skips `msb rm -f`.
@@ -413,7 +435,7 @@ Delete a running or suspended sandbox and its `$DATA_DIR/run/<id>` state:
 agbox stop agbox-feature-auth
 ```
 
-Run `agbox status` to list sandboxes, snapshots, skills, rules, and profiles.
+Run `agbox status` to show base config, `auth`, `cached_agents`, skills, rules, profiles, `services` (with linger state), sandboxes, snapshots, and storage.
 
 ## 7. Connect by web interface or Remote Control
 
@@ -424,12 +446,14 @@ Instead of a terminal UI, you can serve OpenCode over local HTTP (`--serve`). Yo
 `agbox` runs `opencode serve` in the sandbox. It binds the host port to `127.0.0.1` only.
 
 ```bash
-# Start on a random free loopback port. agbox waits for /doc and prints the URL.
+# Start in the foreground on a random free loopback port
 agbox run --serve ~/projects/myapp
 
 # Start on the fixed host port 127.0.0.1:4096
 agbox run --name web --serve --port 4096 ~/projects/myapp
 ```
+
+With `-d`, `--probe`, or `agbox service`, `agbox` probes `http://127.0.0.1:<port>/doc` until the server answers. Do not combine `-d` and `--probe`.
 
 Local host processes can connect to `127.0.0.1:<port>`. To require HTTP Basic Authentication, set `OPENCODE_SERVER_PASSWORD`. You can also set `OPENCODE_SERVER_USERNAME` (default: `opencode`):
 
@@ -447,11 +471,11 @@ Suspend with `agbox suspend agbox-web`. Resume with `agbox resume -d agbox-web`.
 
 Remote Control connects an `agy` session in the sandbox to `https://antigravity.google.com`. `agy` opens an outbound reverse tunnel over the default `public` profile. You need no `--port` and no inbound firewall rule.
 
+1. Run `agbox auth antigravity` once before you start a detached Remote Control sandbox.
 1. Start a named detached sandbox. Add `--persist` to keep its disk after a stop:
    ```bash
    agbox run --persist --name work -d --remote-control ~/projects/myapp
    ```
-1. If `agy` needs a login and you did not run `agbox auth antigravity`, `agbox` opens `agy` interactively. Open the printed URL, paste the code, and run `/exit`.
 1. `agbox` starts `agy remote-control start --name agbox-work` in the sandbox. Then it returns your shell prompt.
 1. Open `https://antigravity.google.com`. Select `agbox-work` in the instance switcher.
 1. Suspend with `agbox suspend agbox-work`. Delete with `agbox stop agbox-work`.
@@ -466,9 +490,32 @@ Inside any interactive `agy` session, `/remote-control` and `/remote-control off
 
 ### Auto-start with `systemd --user` (`agbox service`)
 
-Use `agbox service` to run headless sandboxes at machine boot without login and keep them running after logout. `agbox` installs one shared user template unit (`~/.config/systemd/user/agbox@.service`) and stores each service spec in `$DATA_DIR/services/<name>.json` (mode `0600`).
+Use `agbox service` to start headless sandboxes at boot without login. Services stay active after logout. `agbox` installs one template unit (`agbox@.service`) in `${XDG_CONFIG_HOME:-~/.config}/systemd/user`. It stores each service spec in `$DATA_DIR/services/<name>.json` (mode `0600`).
 
-Each service runs under a foreground supervisor (`agbox __service-run <name>`). The template unit sets `Type=notify`, `WatchdogSec=90s`, `KillMode=mixed`, and `TimeoutStopSec=30`. The supervisor sends `READY=1` once the agent answers health checks, sends `WATCHDOG=1` on each healthy poll, and exits non-zero after 3 consecutive failed checks so `systemd` restarts the service (`opencode serve` probes `http://127.0.0.1:<port>/doc`, and `agy` runs `msb ping` plus `agy remote-control status`). On stop or host reboot, the supervisor stops the microVM first, flushes any `--persist` or `--profile` disk, and then unmounts FUSE shares.
+```mermaid
+flowchart LR
+    SD["systemd --user (agbox@.service)"] -->|"Type=notify, WatchdogSec=90s"| SUP["agbox __service-run"]
+    SUP -->|"Health poll (15s)"| VM["msb microVM + FUSE Hub"]
+    SUP -->|"READY=1 / WATCHDOG=1"| SD
+    SUP -->|"Stop (KillMode=mixed): stop VM, flush disk, unmount FUSE"| VM
+```
+
+The supervisor sends `READY=1` after the first healthy check and `WATCHDOG=1` on each healthy poll. After 3 failed checks in a row, it exits non-zero so `systemd` restarts the unit:
+
+- **`opencode serve` (`--serve --port N`):** Probes `http://127.0.0.1:<port>/doc`.
+- **`agy remote-control` (`--remote-control`):** Runs `msb ping` and checks `agy remote-control status`.
+- **Command mode (`--cmd`):** Sends `READY=1` after the sandbox starts. It runs `msb ping` every 15 seconds while the command stays active. It exits non-zero after 3 consecutive failed `msb ping` checks.
+
+| Subcommand | Flags and behavior |
+|---|---|
+| `add <name> [run-opts] ...` | Saves a headless spec. Accepts `--force`, `--enable`, `--now`, `--no-linger`, and `--env-file PATH`. |
+| `list`, `status` | Lists configured services and prints `systemd-logind` user linger state. |
+| `enable <name>` | Installs `agbox@.service`, enables user linger (unless `--no-linger`), and enables the unit. Pass `--now` to start it. |
+| `disable <name>` | Disables `agbox@<name>.service` at boot. Pass `--now` to stop it immediately. |
+| `start\|stop\|restart <name>` | Starts, stops, or restarts `agbox@<name>.service`. |
+| `logs <name>` | Prints journal logs for `agbox@<name>.service`. Accepts `-f` (`--follow`) and `-n N` (`--lines N`). |
+| `rm <name>` | Stops and disables `agbox@<name>.service`, then deletes its spec. Pass `--force` to ignore unit errors. |
+| `linger [status\|enable]` | Prints or enables `systemd-logind` user linger for boot without login. |
 
 ```bash
 # Save a persistent Remote Control service and enable it at boot
@@ -492,10 +539,10 @@ agbox service rm work
 
 Rules for `agbox service`:
 
-- Services require a headless mode: `--remote-control`, `--serve --port N`, or `--cmd "shell"`. Interactive TUI runs are rejected.
-- `agbox service enable` activates `systemd-logind` user linger (`loginctl enable-linger <user>`) unless you pass `--no-linger`. If polkit blocks unprivileged linger, run `sudo loginctl enable-linger <user>` once so services start at boot without login and survive logout.
-- Saved `agbox auth` credentials stream automatically at boot. Optional `--env-file` paths must be regular files with mode `0600` or stricter and zero symlinks. `agbox` never writes secrets into `agbox@.service`.
-- On startup after an unclean host reboot, the supervisor recovers stopped `--persist` sandboxes and cleans stale ephemeral sandboxes before starting.
+- Services require a headless mode: `--remote-control`, `--serve --port N`, or `--cmd "shell"`. `agbox` rejects interactive TUI runs.
+- `agbox service enable` activates `systemd-logind` user linger (`loginctl enable-linger <user>`) unless you pass `--no-linger`. If polkit blocks unprivileged linger, run `sudo loginctl enable-linger <user>` once. Services then start at boot without login and survive logout.
+- Saved `agbox auth` credentials stream automatically at boot. Every `--env-file` must be a regular file with mode `0600` or stricter and zero symlinks. `agbox` never writes secrets into `agbox@.service`.
+- After an unclean host reboot, the supervisor recovers stopped `--persist` sandboxes and deletes stale ephemeral sandboxes before startup.
 
 ## 8. Update agents and customize the base image
 
@@ -563,20 +610,20 @@ Run `agbox <mode> --help` for the flags of each mode. Run `agbox --help` for the
 | `agbox version` | Prints the version. `agbox --version` does the same. |
 | `agbox completion bash` | Prints the bash completion script to `stdout`. |
 | `agbox create-base [--force] [--add <categories>] <opencode\|antigravity\|both>` | Creates the base sandbox and saves `agbox:vN`. |
-| `agbox edit-base [--add <categories>] [--list] [--shell] [--cmd "shell"] [--no-snap]` | Changes the base sandbox. Saves `agbox:v<N+1>` unless you pass `--no-snap`. |
-| `agbox update [antigravity\|opencode\|both\|status\|clear]` | Caches checked agent binaries in `$DATA_DIR/agents`. |
-| `agbox auth [antigravity\|opencode\|status\|logout]` | Signs in inside a disposable sandbox and saves credentials. |
+| `agbox edit-base [--add <categories>] [--list] [--shell] [--cmd "shell"] [--no-snap] [categories...]` | Changes the base sandbox. Saves `agbox:v<N+1>` unless you pass `--no-snap`. |
+| `agbox update [antigravity\|opencode\|both\|status\|clear [antigravity\|opencode\|all]]` | Caches checked agent binaries in `$DATA_DIR/agents`. |
+| `agbox auth [antigravity\|opencode\|status\|logout [antigravity\|opencode\|all]]` | Signs in inside a disposable sandbox and saves credentials. |
 | `agbox skills [list\|add [--force] <path>\|rm <name>]` | Manages global skills. |
 | `agbox rules [list\|add [--force] [--name NAME] <file.md>\|show [<name>]\|rm <name\|--all>]` | Manages global rules. |
 | `agbox profile [list\|create [--size SIZE] <name>\|rm [--force] <name>]` | Manages `ext4` conversation profiles. |
 | `agbox share <list\|add\|set\|rm> <sandbox> [...]` | Manages `/workspace` shares on a running or suspended sandbox. |
-| `agbox service <list\|add\|enable\|disable\|start\|stop\|restart\|logs\|rm\|linger> [...]` | Manages `systemd --user` services (`agbox@.service`) that start at boot and survive logout. |
+| `agbox service <list\|add\|enable\|disable\|start\|stop\|restart\|logs\|rm\|linger> [...]` | Manages `systemd --user` services (`agbox@.service`) that start at boot and stay active after logout. |
 | `agbox run [options] [opencode\|antigravity] [path[:opts]...]` | Restores a sandbox and runs an agent or command. |
 | `agbox suspend <sandbox>` | Stops a sandbox, keeps its root disk, and unmounts its shares. |
-| `agbox resume [-d] [-c] [-s ID] [--no-auth] [--no-skills] [--no-rules] [--no-agent-cache] <sandbox>` | Checks shares, mounts FUSE, starts the sandbox, and restarts its agent. |
+| `agbox resume [-d] [-c] [-s\|--session ID] [--no-auth] [--no-skills] [--no-rules] [--no-agent-cache] <sandbox>` | Checks shares, mounts FUSE, starts the sandbox, and restarts its agent. |
 | `agbox stop <sandbox>` | Deletes a running or suspended sandbox and unmounts its shares. |
 | `agbox remove [-y]` | Deletes all `agbox` state. See [Delete all state](#delete-all-state-agbox-remove). |
-| `agbox status` | Shows base settings, persistence state, sandboxes, snapshots, and disk use. |
+| `agbox status` | Shows base config, `auth`, `cached_agents`, skills, rules, profiles, `services` (with linger state), sandboxes, snapshots, and storage. |
 
 Every mode accepts `--allow-root` (or `AGBOX_ALLOW_ROOT=1`) for host `root`.
 
@@ -601,15 +648,15 @@ Place all options before the agent name and the paths.
 | `--mask-vcs` | Masks VCS metadata in directory shares. This is the default. |
 | `--vcs` | Allows VCS metadata and write-protects hooks. |
 | `--vcs-hooks` | Allows VCS metadata and writable hooks on writable shares. |
-| `--no-mask` | Turns off the FUSE VCS filter and exposes `.git` to the guest. |
+| `--no-mask` | Disables the FUSE VCS filter and exposes `.git` to the guest. |
 | `--serve` | Runs `opencode serve` and binds the web UI to `127.0.0.1`. |
 | `--port N` | Uses the fixed loopback port `N` for `--serve`. The default is random. |
-| `--probe` | With `--serve`: waits for the web UI, then exits. |
+| `--probe` | With `--serve`: waits for `/doc`, then exits. Do not combine with `-d` or `--persist`. |
 | `--remote-control` | Runs `agy` with Remote Control for `antigravity.google.com`. |
 | `-d`, `--detach` | Keeps `--serve` or `--remote-control` running in the background. |
 | `--cmd "shell"` | Runs one command in the sandbox and exits. |
 | `--no-net` | Disables guest networking. |
-| `--net SPEC` | Sets the network profile or rule. See [Network profiles](#network-profiles). |
+| `--net SPEC` | Sets a network profile or rule. Repeatable. See [Network profiles](#network-profiles). |
 | `--cpus N`, `--memory SIZE` | Overrides the vCPU count or RAM size for this run. |
 
 Options also accept the `--name=NAME` form. A `--` argument ends option parsing.
@@ -621,8 +668,10 @@ Options also accept the `--name=NAME` form. A `--` argument ends option parsing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config`, `auth`, `agents`, `skills`, `rules`, `profiles`, and `run/<id>`. |
+| `AGBOX_DATA_DIR` | `~/.local/share/agbox` | Host directory for `config`, `auth`, `agents`, `skills`, `rules`, `profiles`, `services`, and `run/<id>`. |
 | `MSB_HOME` | `~/.microsandbox` | Host directory for `msb` runtime state, base snapshots, and profile volumes. |
+| `XDG_CONFIG_HOME` | `~/.config` | Base directory for systemd user units (`$XDG_CONFIG_HOME/systemd/user/agbox@.service`). Must be an absolute path. |
+| `XDG_DATA_HOME` | `~/.local/share` | Base directory for default bash completion installs. |
 | `AGBOX_INSTALL_DIR` | `~/.local/bin` (`/usr/local/bin` for `root`) | Directory where `install.sh` installs the binary. |
 | `AGBOX_COMPLETION_DIR` | `~/.local/share/bash-completion/completions` (`/usr/share/bash-completion/completions` for `root`) | Directory where `install.sh` installs the bash completion script. |
 | `AGBOX_ALLOW_ROOT` | `0` | Set to `1` to let `install.sh` and `agbox` run as `root`. |
@@ -635,22 +684,21 @@ Options also accept the `--name=NAME` form. A `--` argument ends option parsing.
 | `AGBOX_OPENCODE_VERSION` | `latest` | The npm version or tag of `opencode-ai` for `create-base` and `update`. |
 | `AGBOX_AGY_INSTALLER_URL` | `https://antigravity.google/cli/install.sh` | The `agy` installer URL for `create-base` and `update`. It must use HTTPS. |
 | `OPENCODE_SERVER_PASSWORD` | unset | HTTP Basic Auth password for `agbox run --serve`. |
-| `OPENCODE_SERVER_USERNAME` | `opencode` | HTTP Basic Auth user name for `agbox run --serve`. |
+| `OPENCODE_SERVER_USERNAME` | `opencode` | HTTP Basic Auth username for `agbox run --serve`. |
 
 The values `1`, `true`, and `yes` mean `strict` for `AGBOX_MASK_VCS`. The values `0`, `false`, and `no` mean `off`.
 
 `strict` fails when the Workspace Hub cannot start. `DATA_DIR` must not contain whitespace or backslashes in that case.
 
 > [!WARNING]
-> `AGBOX_MASK_VCS=auto` mounts shares directly when the Workspace Hub cannot start. The mount has no VCS masking. `agbox` prints a warning. `off` always mounts directly.
-
-> [!WARNING]
-> `AGBOX_ALLOW_OUTSIDE_HOME=1` lets you share paths outside `$HOME`. Check each path before you share it.
+>
+> - `AGBOX_MASK_VCS=auto` mounts shares directly with no VCS masking when the Workspace Hub cannot start. `agbox` prints a warning. `off` always mounts directly.
+> - `AGBOX_ALLOW_OUTSIDE_HOME=1` lets you share paths outside `$HOME`. Check each path before you share it.
 
 ### Delete all state (`agbox remove`)
 
 > [!CAUTION]
-> `agbox remove` deletes all `agbox` sandboxes, snapshots, profile volumes, FUSE mounts, and `$DATA_DIR`. You cannot undo it.
+> `agbox remove` deletes all `agbox-*` sandboxes (including named sandboxes), snapshots, and profile volumes. It also stops and disables managed systemd user units (`agbox@.service` and `agbox@*.service`), unmounts FUSE shares, and deletes `$DATA_DIR`. You cannot undo it.
 
 ```bash
 # Ask for confirmation first
@@ -659,3 +707,17 @@ agbox remove
 # Skip the confirmation (for automation)
 agbox remove --yes
 ```
+
+## 10. Troubleshooting
+
+| Symptom or error | Cause | Fix |
+|---|---|---|
+| `/dev/kvm` permission denied | Your host user lacks read-write access to `/dev/kvm`. | Add your user to the `kvm` group (`sudo usermod -aG kvm "$USER"`), then start a new login session. |
+| `EROFS` on `/workspace` or a share | `/workspace` itself rejects direct file creation, or the share is `:ro`. | Create files inside `/workspace/<name>`. Run `agbox share set --rw <sandbox> <name>` for a read-only share. |
+| `EPERM` on `.git` or hooks | The default `:mask` policy blocks VCS paths, and `:vcs` blocks hooks and config files. | Pass `:vcs` for normal Git workflows, or `:rw,vcs-hooks` when you need writable hooks. |
+| Share rejected (`$HOME` or blocklist) | `pathsec.ValidateShare` blocks paths outside `$HOME` and sensitive directories or their parents. | Move or share a specific subdirectory under `$HOME`. Set `AGBOX_ALLOW_OUTSIDE_HOME=1` only for intentional non-`$HOME` paths. |
+| `share rm` or `share set --ro` fails on open handles | Guest processes hold open writable file descriptors inside that share. | Close the guest processes first, or pass `--force` to revoke open handles immediately. |
+| `run --persist` rejects flags or a `--profile` sandbox | Resuming with `run --persist` forbids flag changes and refuses `--profile` sandboxes. | Use `agbox resume <sandbox>` for an existing sandbox, or run `agbox stop <sandbox>` before recreating it. |
+| `resume` warns about new skills, rules, or updates | `agbox` created the sandbox before those host directories held files. | Run `agbox stop <sandbox>` and start a new sandbox to mount the new directories. |
+| `service enable` linger blocked or `--env-file` rejected | Polkit blocked unprivileged `loginctl`, or the env file is a symlink or wider than mode `0600`. | Run `sudo loginctl enable-linger "$USER"` once. Store `--env-file` as a regular file with `chmod 600`. |
+| Antigravity truncates a global rule | Antigravity caps inline loading at 24,000 bytes per rule file. | Shorten the rule file or split it into smaller `.md` files under `$DATA_DIR/rules`. |

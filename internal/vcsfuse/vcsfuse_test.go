@@ -2633,7 +2633,7 @@ func TestH1VCSAllowConfigPointerSubtreeAndWhiteoutProtection(t *testing.T) {
 	}
 	_ = delFH.(fs.FileReleaser).Release(ctx)
 
-	// 1. Executable VCS config files are write-protected under VCSAllow, and safeFile.Getattr masks 0o222 ([L1]).
+	// 1. Executable VCS config files are write-protected under VCSAllow, and safeFile.Getattr masks 0o222.
 	for _, cfgParts := range [][]string{
 		{".git", "config"},
 		{".git", "commondir"},
@@ -2832,7 +2832,7 @@ func TestH4RegisterRaceAndOpenFDRenameRevocation(t *testing.T) {
 
 	slot := hub.slots["repo"]
 
-	// 1. Direct registerFile and registerDir policy checks ([H4] part 1).
+	// 1. Direct registerFile and registerDir policy checks.
 	slot.setVCSPolicy(config.VCSMask)
 	vcsSF := &safeFile{writable: false}
 	vcsSF.isVCS.Store(true)
@@ -2852,7 +2852,7 @@ func TestH4RegisterRaceAndOpenFDRenameRevocation(t *testing.T) {
 		t.Errorf("registerFile(writable isHook under VCSAllow) = %v, want EROFS", regErr)
 	}
 
-	// 2. Open normal.txt writable (isVCS=false), rename to .git/HEAD, then downgrade to VCSMask ([H4] part 2).
+	// 2. Open normal.txt writable (isVCS=false), rename to .git/HEAD, then downgrade to VCSMask.
 	var sySt syscall.Stat_t
 	_ = syscall.Stat(repoDir, &sySt)
 	repoRoot := buildRootFilteredNode(repoDir, slot.root, sySt, slot)
@@ -3022,7 +3022,7 @@ func TestH8AndM4ConcurrentRevokeReaddirentAndCopyFileRange(t *testing.T) {
 		}
 	}
 
-	// 1. [H8] Concurrent Readdirent / Seekdir / Fsyncdir vs revoke under -race.
+	// 1. Concurrent Readdirent / Seekdir / Fsyncdir vs revoke under -race.
 	for round := 0; round < 10; round++ {
 		fh, _, odErr := root.OpendirHandle(ctx, 0)
 		if odErr != 0 {
@@ -3050,7 +3050,7 @@ func TestH8AndM4ConcurrentRevokeReaddirentAndCopyFileRange(t *testing.T) {
 		d.Releasedir(ctx, 0)
 	}
 
-	// 2. [M4] Concurrent opposite-direction CopyFileRange (A->B and B->A) + revoke without AB-BA deadlock.
+	// 2. Concurrent opposite-direction CopyFileRange (A->B and B->A) + revoke without AB-BA deadlock.
 	var eOut fuse.EntryOut
 	inoA, errNo := root.Lookup(ctx, "f00.txt", &eOut)
 	if errNo != 0 {
@@ -3157,7 +3157,7 @@ func TestM1M2HubContainmentDecodeSpecAndNodeOperations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. [M2] NewWorkspaceHubWithOptions enforces AllowOutsideHome=false, MSBHome blocklist, and writable single-file Nlink==1.
+	// 1. NewWorkspaceHubWithOptions enforces AllowOutsideHome=false, MSBHome blocklist, and writable single-file Nlink==1.
 	hub, err := NewWorkspaceHubWithOptions([]HubShareConfig{
 		{GuestName: "repo", HostPath: repoDir, ReadOnly: false, VCSPolicy: config.VCSAllow},
 	}, HubOptions{
@@ -3182,7 +3182,7 @@ func TestM1M2HubContainmentDecodeSpecAndNodeOperations(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Reject non-socket path and already-active socket in listenVerifiedUnixSocket (#8 §1).
+	// Reject non-socket path and already-active socket in listenVerifiedUnixSocket.
 	nonSock := filepath.Join(base, "not-a-sock")
 	_ = os.WriteFile(nonSock, []byte("x"), 0o600)
 	if _, err := listenVerifiedUnixSocket(nonSock, hub); err == nil {
@@ -3202,7 +3202,7 @@ func TestM1M2HubContainmentDecodeSpecAndNodeOperations(t *testing.T) {
 		t.Errorf("expected writable multi-hardlink single-file rejection, got %v", err)
 	}
 
-	// 2. Readdir fallback Ino matches Lookup Ino (#8 §1), and RemoveShare + AddShare under same alias replaces child inode cleanly (#13 §2G).
+	// 2. Readdir fallback Ino matches Lookup Ino, and RemoveShare + AddShare under same alias replaces child inode cleanly.
 	rdStream, rdErrno := hub.Readdir(ctx)
 	if rdErrno != 0 {
 		t.Fatalf("hub.Readdir: %v", rdErrno)
@@ -3223,7 +3223,7 @@ func TestM1M2HubContainmentDecodeSpecAndNodeOperations(t *testing.T) {
 		t.Errorf("Readdir fallback Ino (%d) != Lookup Ino (%d)", readdirIno, repoIno.StableAttr().Ino)
 	}
 
-	// 3. [M1] Populate uppercase .GIT and nested sub/.git + sub/.gitignore in child inode tree, then downgrade to VCSMask.
+	// 3. Populate uppercase .GIT and nested sub/.git + sub/.gitignore in child inode tree, then downgrade to VCSMask.
 	hub.mounted.Store(true)
 	repoRoot := repoIno.Operations().(*filteredNode)
 	upperGitIno, lErrno := repoRoot.Lookup(ctx, ".GIT", &eOut)
@@ -3259,7 +3259,7 @@ func TestM1M2HubContainmentDecodeSpecAndNodeOperations(t *testing.T) {
 		t.Error("expected invalidateSlotKernelCache to remove nested sub/.git and sub/.gitignore child inodes")
 	}
 
-	// 4. FilteredNode Link, Unlink, Rmdir, Setattr truncate, xattr round-trip, and revoked safeFile methods (#13 §2G).
+	// 4. FilteredNode Link, Unlink, Rmdir, Setattr truncate, xattr round-trip, and revoked safeFile methods.
 	fileIno, lErrno := repoRoot.Lookup(ctx, "file.txt", &eOut)
 	if lErrno != 0 {
 		t.Fatalf("Lookup(file.txt): %v", lErrno)
@@ -3386,7 +3386,7 @@ func TestM1M2HubContainmentDecodeSpecAndNodeOperations(t *testing.T) {
 		t.Errorf("expected new generation inode after Remove+Add under same alias, err=%v same=%v", lErrno, newRepoIno == repoIno)
 	}
 
-	// 5. decodeHubBootstrapSpec, writePIDFileNoFollow, and RunMain flag validation (#13 §2G, [M2], [M6]).
+	// 5. decodeHubBootstrapSpec, writePIDFileNoFollow, and RunMain flag validation.
 	specPath := filepath.Join(base, "spec.json")
 	validSpecJSON := `{"home_real":"/home/u","data_dir":"/home/u/d","msb_home":"/home/u/m","allow_outside_home":false,"map_guest_ids":true,"guest_uid":0,"guest_gid":0,"shares":[]}`
 	if err := os.WriteFile(specPath, []byte(validSpecJSON), 0o600); err != nil {
@@ -3475,7 +3475,7 @@ func TestLiveKernelFUSESecurityFixesAndOnAddFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. OnAdd fails closed when a single-file share was replaced on disk before mount (#8 §1).
+	// 1. OnAdd fails closed when a single-file share was replaced on disk before mount.
 	hubOnAdd, err := NewWorkspaceHubWithOptions([]HubShareConfig{
 		{GuestName: "vanishing.txt", HostPath: badFile, ReadOnly: false, VCSPolicy: config.VCSMask},
 	}, HubOptions{HomeReal: base, DataDir: dataDir})
@@ -3490,7 +3490,7 @@ func TestLiveKernelFUSESecurityFixesAndOnAddFailClosed(t *testing.T) {
 		t.Errorf("expected OnAdd to revoke and remove corrupted file share, got %+v", hubOnAdd.listShares())
 	}
 
-	// 2. Live kernel FUSE integration test for [H1], [H2], and [H7] when /dev/fuse is available.
+	// 2. Live kernel FUSE integration test for VCS config protection, symlink renames, and FIFOs when /dev/fuse is available.
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		t.Skipf("/dev/fuse unavailable: %v", err)
 	}
@@ -3531,7 +3531,7 @@ func TestLiveKernelFUSESecurityFixesAndOnAddFailClosed(t *testing.T) {
 
 	mountedRepo := filepath.Join(mntDir, "repo")
 
-	// [H1] Writing .git/config fails with EPERM under :vcs, while writing .git/HEAD succeeds.
+	// Writing .git/config fails with EPERM under :vcs, while writing .git/HEAD succeeds.
 	if err := os.WriteFile(filepath.Join(mountedRepo, ".git", "config"), []byte("evil\n"), 0o644); !errors.Is(err, syscall.EPERM) {
 		t.Errorf("live WriteFile(.git/config) = %v, want EPERM", err)
 	}
@@ -3542,7 +3542,7 @@ func TestLiveKernelFUSESecurityFixesAndOnAddFailClosed(t *testing.T) {
 		t.Errorf("live subtree Rename(stage -> .git/modules/planted) = %v, want EPERM", err)
 	}
 
-	// [H2] Symlink valid at depth 3 cannot be renamed to depth 0 through live FUSE.
+	// Symlink valid at depth 3 cannot be renamed to depth 0 through live FUSE.
 	deepSym := filepath.Join(mountedRepo, "a", "b", "c", "esc")
 	if err := os.Symlink("../../../main.go", deepSym); err != nil {
 		t.Fatalf("live Symlink(deepSym): %v", err)
@@ -3551,7 +3551,7 @@ func TestLiveKernelFUSESecurityFixesAndOnAddFailClosed(t *testing.T) {
 		t.Errorf("live Rename(a/b/c/esc -> esc) = %v, want EPERM", err)
 	}
 
-	// [H7] Setattr and Setxattr on FIFO fail with EPERM, and a regular->FIFO swap on Open fails without blocking.
+	// Setattr and Setxattr on FIFO fail with EPERM, and a regular->FIFO swap on Open fails without blocking.
 	if err := os.Chmod(filepath.Join(mountedRepo, "live.fifo"), 0o644); !errors.Is(err, syscall.EPERM) {
 		t.Errorf("live Chmod(live.fifo) = %v, want EPERM", err)
 	}
@@ -3588,7 +3588,7 @@ func TestLiveKernelFUSESecurityFixesAndOnAddFailClosed(t *testing.T) {
 		t.Fatal("live Open(swapped FIFO) hung FUSE worker")
 	}
 
-	// [R-M1] .git/config.worktree and .git/modules/objects/config fail with EPERM through live FUSE.
+	// .git/config.worktree and .git/modules/objects/config fail with EPERM through live FUSE.
 	if err := os.WriteFile(filepath.Join(mountedRepo, ".git", "config.worktree"), []byte("evil\n"), 0o644); !errors.Is(err, syscall.EPERM) {
 		t.Errorf("live WriteFile(.git/config.worktree) = %v, want EPERM", err)
 	}
@@ -3603,7 +3603,7 @@ func TestLiveKernelFUSESecurityFixesAndOnAddFailClosed(t *testing.T) {
 		t.Errorf("live Mkdir(.jj) under :vcs = %v, want EPERM", err)
 	}
 
-	// [R2-H1] & [R-H1] Live FUSE rejects cross-boundary hardlinks and multi-link renames,
+	// Live FUSE rejects cross-boundary hardlinks and multi-link renames,
 	// allows same-boundary hardlinks, and promotes open descriptors on single-link directory Rename.
 	vcsHooks := config.VCSAllowHooks
 	vcsAllow := config.VCSAllow
@@ -3657,8 +3657,8 @@ func TestLiveKernelFUSESecurityFixesAndOnAddFailClosed(t *testing.T) {
 	_ = stageRefF.Close()
 }
 
-// TestRH1LinkAndDirectoryRenameHandlePromotion verifies [R2-H1] cross-boundary hardlink and multi-link
-// rename rejection alongside [R-H1] open-FD and filteredDir promotion across subtree renames and RENAME_EXCHANGE.
+// TestRH1LinkAndDirectoryRenameHandlePromotion checks cross-boundary hardlink and multi-link
+// rename rejection alongside open-FD and filteredDir promotion across subtree renames and RENAME_EXCHANGE.
 func TestRH1LinkAndDirectoryRenameHandlePromotion(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
@@ -3720,7 +3720,7 @@ func TestRH1LinkAndDirectoryRenameHandlePromotion(t *testing.T) {
 		return cur
 	}
 
-	// 1. [R2-H1] Cross-boundary hardlinks fail with EPERM, same-boundary hardlinks succeed,
+	// 1. Cross-boundary hardlinks fail with EPERM, same-boundary hardlinks succeed,
 	// and cross-boundary Rename (direct, subtree, and RENAME_EXCHANGE) of multi-link files fails with EPERM.
 	normalNode := lookupAttach(repoRoot, "normal.txt")
 	gitNode := lookupAttach(repoRoot, ".git")
@@ -3909,10 +3909,10 @@ func TestRH1LinkAndDirectoryRenameHandlePromotion(t *testing.T) {
 	wg.Wait()
 }
 
-// TestRM1WorktreeConfigAndSubmoduleNamesAndMkdirVCSAllow verifies [R-M1], Mkdir under VCSAllow,
-// [R-L1] single-file Setattr nlink check, and non-blocking FIFO opens in vcsfuse/hub helpers.
+// TestRM1WorktreeConfigAndSubmoduleNamesAndMkdirVCSAllow checks Git worktree and submodule config
+// protection, Mkdir under VCSAllow, single-file Setattr nlink checks, and non-blocking FIFO opens.
 func TestRM1WorktreeConfigAndSubmoduleNamesAndMkdirVCSAllow(t *testing.T) {
-	// 1. [R-M1] Table-driven verification of .git/config.worktree and modules/worktrees named refs/logs/objects.
+	// 1. Table-driven checks of .git/config.worktree and modules/worktrees named refs/logs/objects.
 	cases := []struct {
 		rel  string
 		want bool
@@ -3927,7 +3927,7 @@ func TestRM1WorktreeConfigAndSubmoduleNamesAndMkdirVCSAllow(t *testing.T) {
 		{".git/modules/refs/config", true},
 		{".git/modules/logs/config", true},
 		{".git/modules/objects/commondir", true},
-		{".git/modules/objects/refs/heads/config", false},
+		{".git/modules/objects/refs/heads/config", true},
 		{".git/refs/heads/config.worktree", false},
 		{".git/logs/refs/heads/config.worktree", false},
 	}
@@ -3992,7 +3992,7 @@ func TestRM1WorktreeConfigAndSubmoduleNamesAndMkdirVCSAllow(t *testing.T) {
 		t.Errorf("subNode.Mkdir(allowed_dir) = %v, want 0", mErr)
 	}
 
-	// 3. [R-L1] fileShareNode.Setattr rejects path-based mutation when host file gains a second hard link.
+	// 3. fileShareNode.Setattr rejects path-based mutation when host file gains a second hard link.
 	fileSlot := hub.slots["single.txt"]
 	fNode := &fileShareNode{slot: fileSlot}
 	hardPeer := filepath.Join(base, "single-hard.txt")
@@ -4011,7 +4011,7 @@ func TestRM1WorktreeConfigAndSubmoduleNamesAndMkdirVCSAllow(t *testing.T) {
 		t.Errorf("fileShareNode.Setattr with Nlink=1 = %v, want 0", sErr)
 	}
 
-	// 4. [R-L1] FIFO paths do not block decodeHubBootstrapSpec or appendDaemonStderr.
+	// 4. FIFO paths do not block decodeHubBootstrapSpec or appendDaemonStderr.
 	fifoPath := filepath.Join(base, "spec.fifo")
 	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
 		t.Fatalf("Mkfifo: %v", err)
@@ -4040,5 +4040,976 @@ func TestRM1WorktreeConfigAndSubmoduleNamesAndMkdirVCSAllow(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("appendDaemonStderr blocked on FIFO")
+	}
+}
+
+func TestHubAbsolutePathDataDirFallbackAndNilHub(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	envDataDir := filepath.Join(base, "env-agbox-data")
+	repoDir := filepath.Join(base, "repo")
+	for _, d := range []string{envDataDir, repoDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Empty opts.DataDir falls back to AGBOX_DATA_DIR and blocks sharing paths inside it.
+	t.Setenv("AGBOX_DATA_DIR", envDataDir)
+	hub, err := NewWorkspaceHubWithOptions(nil, HubOptions{HomeReal: base})
+	if err != nil {
+		t.Fatalf("NewWorkspaceHubWithOptions: %v", err)
+	}
+	defer hub.CloseAll()
+
+	if hub.dataDir != envDataDir {
+		t.Errorf("hub.dataDir = %q, want %q", hub.dataDir, envDataDir)
+	}
+	if _, err := hub.addShare(HubShareConfig{GuestName: "data", HostPath: envDataDir, ReadOnly: true, VCSPolicy: config.VCSMask}); err == nil {
+		t.Error("expected AGBOX_DATA_DIR fallback path to be blocked")
+	}
+
+	// Relative host paths fail in validateAndPrepareSlot.
+	t.Chdir(base)
+	for _, relPath := range []string{"", ".", "./repo", "repo"} {
+		if _, err := hub.addShare(HubShareConfig{GuestName: "rel", HostPath: relPath, ReadOnly: true, VCSPolicy: config.VCSMask}); err == nil {
+			t.Errorf("expected relative HostPath %q to fail in WorkspaceHub", relPath)
+		}
+	}
+
+	// ServeControlSocket rejects nil hub cleanly without creating a socket.
+	nilSock := filepath.Join(base, "nil.sock")
+	if ln, err := ServeControlSocket(nilSock, nil); err == nil {
+		_ = ln.Close()
+		t.Fatal("expected ServeControlSocket with nil hub to fail")
+	}
+	if _, err := os.Lstat(nilSock); !os.IsNotExist(err) {
+		t.Errorf("expected no socket created on nil hub error, stat err = %v", err)
+	}
+
+	// buildRootFilteredNode tolerates nil slot without panicking.
+	pr, st, err := newPinnedRoot(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	nilSlotRoot := buildRootFilteredNode(repoDir, pr, st, nil)
+	if nilSlotRoot == nil || !nilSlotRoot.isRoot {
+		t.Errorf("buildRootFilteredNode with nil slot returned unexpected root: %+v", nilSlotRoot)
+	}
+}
+
+func TestNestedSubmoduleAndNonColocatedJJProtection(t *testing.T) {
+	cases := []struct {
+		rel  string
+		want bool
+	}{
+		// Nested submodule directories named refs, objects, or logs must stay protected.
+		{".git/modules/vendor/refs/config", true},
+		{".git/modules/pkg/objects/config", true},
+		{".git/modules/src/logs/config", true},
+		{".git/modules/vendor/refs/config.worktree", true},
+		{".git/modules/vendor/refs/commondir", true},
+		{".git/modules/vendor/refs/gitdir", true},
+		{".git/modules/logs/refs/config", true},
+		// Files directly under refs/, logs/, or objects/ stay protected.
+		{".git/refs/config", true},
+		{".git/logs/config", true},
+		{".git/objects/config", true},
+		// Actual Git data subpaths remain writable for branches and objects.
+		{".git/refs/heads/config", false},
+		{".git/refs/tags/config", false},
+		{".git/refs/remotes/origin/config", false},
+		{".git/refs/notes/config", false},
+		{".git/refs/replace/config", false},
+		{".git/refs/bisect/config", false},
+		{".git/logs/refs/heads/config", false},
+		// Config files inside objects/ or submodule refs/ stay protected.
+		{".git/objects/pack/config", true},
+		{".git/objects/info/config", true},
+		{".git/objects/ab/config", true},
+		{".git/modules/vendor/refs/heads/config", true},
+		// Non-colocated Jujutsu Git metadata under .jj/repo/store/git/ must stay protected.
+		{".jj/repo/store/git/config", true},
+		{".jj/repo/store/git/config.worktree", true},
+		{".jj/repo/store/git/commondir", true},
+		{".jj/repo/store/git/gitdir", true},
+		{".jj/repo/store/git/hooks/pre-commit", true},
+		{".jj/repo/store/git/modules/vendor/refs/config", true},
+		{".jj/repo/store/git/refs/heads/config", false},
+		{".jj/repo/op_store/config", false},
+		// A nested .jj directory under Git refs must reset Git state.
+		{".git/refs/heads/x/.jj/config", true},
+	}
+	for _, tc := range cases {
+		if got := isProtectedVCSHookRelPath(tc.rel); got != tc.want {
+			t.Errorf("isProtectedVCSHookRelPath(%q) = %v, want %v", tc.rel, got, tc.want)
+		}
+	}
+
+	// Verify filteredNode enforces EPERM on nested submodule and non-colocated .jj Git configs.
+	ctx := context.Background()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(base, "data")
+	repoDir := filepath.Join(base, "repo")
+	for _, d := range []string{
+		dataDir,
+		filepath.Join(repoDir, ".git", "modules", "vendor", "refs"),
+		filepath.Join(repoDir, ".jj", "repo", "store", "git"),
+	} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = os.WriteFile(filepath.Join(repoDir, ".git", "modules", "vendor", "refs", "config"), []byte("[core]\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(repoDir, ".jj", "repo", "store", "git", "config.worktree"), []byte("[core]\n"), 0o644)
+
+	hub, err := NewWorkspaceHubWithOptions([]HubShareConfig{
+		{GuestName: "repo", HostPath: repoDir, ReadOnly: false, VCSPolicy: config.VCSAllow},
+	}, HubOptions{HomeReal: base, DataDir: dataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.CloseAll()
+
+	slot := hub.slots["repo"]
+	var sySt syscall.Stat_t
+	_ = syscall.Stat(repoDir, &sySt)
+	repoRoot := buildRootFilteredNode(repoDir, slot.root, sySt, slot)
+	_ = fs.NewNodeFS(repoRoot, &fs.Options{})
+
+	lookupAttach := func(parent *filteredNode, parts ...string) *filteredNode {
+		t.Helper()
+		cur := parent
+		var eOut fuse.EntryOut
+		for _, p := range parts {
+			ino, lErr := cur.Lookup(ctx, p, &eOut)
+			if lErr != 0 {
+				t.Fatalf("Lookup(%q): %v", p, lErr)
+			}
+			cur.AddChild(p, ino, true)
+			cur = ino.Operations().(*filteredNode)
+		}
+		return cur
+	}
+
+	for _, parts := range [][]string{
+		{".git", "modules", "vendor", "refs", "config"},
+		{".jj", "repo", "store", "git", "config.worktree"},
+	} {
+		node := lookupAttach(repoRoot, parts...)
+		if _, _, oErr := node.Open(ctx, syscall.O_RDWR); oErr != syscall.EPERM {
+			t.Errorf("Open(%v, O_RDWR) = %v, want EPERM", parts, oErr)
+		}
+	}
+}
+
+func TestFilteredDirConcurrentReaddirentNoPanic(t *testing.T) {
+	ctx := context.Background()
+	srcDir, root := newTestFilteredRoot(t)
+	for i := 0; i < 200; i++ {
+		name := fmt.Sprintf("entry-%04d-padding-filename.txt", i)
+		if err := os.WriteFile(filepath.Join(srcDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for round := 0; round < 5; round++ {
+		fh, _, odErr := root.OpendirHandle(ctx, 0)
+		if odErr != 0 {
+			t.Fatalf("OpendirHandle: %v", odErr)
+		}
+		d := fh.(*filteredDir)
+		var wg sync.WaitGroup
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for k := 0; k < 40; k++ {
+					_, _ = d.Readdirent(ctx)
+					if k%10 == 0 {
+						_ = d.Seekdir(ctx, 0)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		d.Releasedir(ctx, 0)
+	}
+}
+
+func TestSetShareMutationSerializationAndFailedRenameLinkNoPromote(t *testing.T) {
+	ctx := context.Background()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(base, "data")
+	repoDir := filepath.Join(base, "repo")
+	singleFile := filepath.Join(base, "solo.txt")
+	for _, d := range []string{
+		dataDir,
+		filepath.Join(repoDir, ".git", "hooks"),
+	} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = os.WriteFile(filepath.Join(repoDir, "normal.txt"), []byte("normal\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(repoDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(repoDir, "mut.txt"), []byte("mut\n"), 0o644)
+	_ = os.WriteFile(singleFile, []byte("solo\n"), 0o600)
+
+	hub, err := NewWorkspaceHubWithOptions([]HubShareConfig{
+		{GuestName: "repo", HostPath: repoDir, ReadOnly: false, VCSPolicy: config.VCSAllow},
+		{GuestName: "solo.txt", HostPath: singleFile, ReadOnly: false, VCSPolicy: config.VCSMask},
+	}, HubOptions{HomeReal: base, DataDir: dataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.CloseAll()
+
+	slot := hub.slots["repo"]
+	var sySt syscall.Stat_t
+	_ = syscall.Stat(repoDir, &sySt)
+	repoRoot := buildRootFilteredNode(repoDir, slot.root, sySt, slot)
+	_ = fs.NewNodeFS(repoRoot, &fs.Options{})
+
+	var eOut fuse.EntryOut
+	normIno, lErr := repoRoot.Lookup(ctx, "normal.txt", &eOut)
+	if lErr != 0 {
+		t.Fatal(lErr)
+	}
+	repoRoot.AddChild("normal.txt", normIno, true)
+	normNode := normIno.Operations().(*filteredNode)
+
+	gitIno, lErr := repoRoot.Lookup(ctx, ".git", &eOut)
+	if lErr != 0 {
+		t.Fatal(lErr)
+	}
+	repoRoot.AddChild(".git", gitIno, true)
+	gitNode := gitIno.Operations().(*filteredNode)
+
+	// 1. Failed Rename (RENAME_NOREPLACE onto existing .git/HEAD) must not promote open handle.
+	fh, _, oErr := normNode.Open(ctx, syscall.O_RDWR)
+	if oErr != 0 {
+		t.Fatalf("Open(normal.txt): %v", oErr)
+	}
+	sf := fh.(*safeFile)
+	rErr := repoRoot.Rename(ctx, "normal.txt", gitNode, "HEAD", unix.RENAME_NOREPLACE)
+	if rErr != syscall.EEXIST {
+		t.Fatalf("Rename(RENAME_NOREPLACE onto existing .git/HEAD) = %v, want EEXIST", rErr)
+	}
+	if sf.isVCS.Load() || slot.openWritableVCSCount() != 0 {
+		t.Errorf("failed Rename spuriously promoted handle: isVCS=%v openVCS=%d", sf.isVCS.Load(), slot.openWritableVCSCount())
+	}
+	// Downgrading to VCSMask must succeed without force and keep sf usable.
+	vcsMask := config.VCSMask
+	if _, err := hub.setShare("repo", nil, &vcsMask, false); err != nil {
+		t.Fatalf("setShare(VCSMask) failed after unsuccessful Rename: %v", err)
+	}
+	if _, wErr := sf.Write(ctx, []byte("still-ok\n"), 0); wErr != 0 {
+		t.Errorf("sf.Write after VCSMask downgrade = %v, want 0", wErr)
+	}
+	_ = sf.Release(ctx)
+
+	// 2. Failed Link onto existing destination inside .git/hooks must not promote open handle.
+	vcsHooks := config.VCSAllowHooks
+	if _, err := hub.setShare("repo", nil, &vcsHooks, true); err != nil {
+		t.Fatal(err)
+	}
+	gitIno2, _ := repoRoot.Lookup(ctx, ".git", &eOut)
+	repoRoot.AddChild(".git", gitIno2, true)
+	gitNode2 := gitIno2.Operations().(*filteredNode)
+	headIno, _ := gitNode2.Lookup(ctx, "HEAD", &eOut)
+	gitNode2.AddChild("HEAD", headIno, true)
+	headNode := headIno.Operations().(*filteredNode)
+	headFH, _, oErr := headNode.Open(ctx, syscall.O_RDWR)
+	if oErr != 0 {
+		t.Fatalf("Open(.git/HEAD): %v", oErr)
+	}
+	headSF := headFH.(*safeFile)
+	if _, lkErr := gitNode2.Link(ctx, headNode, "HEAD", &eOut); lkErr != syscall.EEXIST {
+		t.Errorf("Link(.git/HEAD -> existing .git/HEAD) = %v, want EEXIST", lkErr)
+	}
+	if headSF.isHook.Load() {
+		t.Error("failed Link spuriously set isHook on .git/HEAD handle")
+	}
+	_ = headSF.Release(ctx)
+
+	// 3. Concurrent setShare vs filteredNode and fileShareNode mutations under -race.
+	mutIno, _ := repoRoot.Lookup(ctx, "mut.txt", &eOut)
+	repoRoot.AddChild("mut.txt", mutIno, true)
+	mutNode := mutIno.Operations().(*filteredNode)
+	fileSlot := hub.slots["solo.txt"]
+	fNode := &fileShareNode{slot: fileSlot}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		roTrue, roFalse := true, false
+		for i := 0; i < 30; i++ {
+			if i%2 == 0 {
+				_, _ = hub.setShare("repo", &roTrue, nil, true)
+				_, _ = hub.setShare("solo.txt", &roTrue, nil, true)
+			} else {
+				_, _ = hub.setShare("repo", &roFalse, nil, true)
+				_, _ = hub.setShare("solo.txt", &roFalse, nil, true)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		var aOut fuse.AttrOut
+		setIn := fuse.SetAttrIn{}
+		setIn.Valid = fuse.FATTR_MODE
+		setIn.Mode = 0o644
+		for i := 0; i < 30; i++ {
+			_ = mutNode.Setattr(ctx, nil, &setIn, &aOut)
+			_ = mutNode.Setxattr(ctx, "user.race", []byte("1"), 0)
+			_ = mutNode.Removexattr(ctx, "user.race")
+			_ = repoRoot.Unlink(ctx, fmt.Sprintf("nonexistent-%d", i))
+			_ = repoRoot.Rmdir(ctx, fmt.Sprintf("nonexistent-dir-%d", i))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		var aOut fuse.AttrOut
+		setIn := fuse.SetAttrIn{}
+		setIn.Valid = fuse.FATTR_MODE
+		setIn.Mode = 0o600
+		for i := 0; i < 30; i++ {
+			_ = fNode.Setattr(ctx, nil, &setIn, &aOut)
+			_ = fNode.Setxattr(ctx, "user.race", []byte("1"), 0)
+			_ = fNode.Removexattr(ctx, "user.race")
+			if fh, _, oErr := fNode.Open(ctx, syscall.O_RDWR); oErr == 0 && fh != nil {
+				_ = fh.(*safeFile).Release(ctx)
+			}
+		}
+	}()
+	wg.Wait()
+}
+
+func TestCreateReadOnlyOpenAndRead(t *testing.T) {
+	ctx := context.Background()
+	srcDir, root := newTestFilteredRoot(t)
+	slot := newShareSlot(1, "rocreate", srcDir, false, "", root.root, root.hidden, false, config.VCSMask)
+	root.slot = slot
+
+	// Creating a new file with O_CREAT|O_RDONLY yields a readable, non-writable safeFile.
+	var eOut fuse.EntryOut
+	_, fh, _, cErr := root.Create(ctx, "new-ro.txt", syscall.O_CREAT|syscall.O_RDONLY, 0o644, &eOut)
+	if cErr != 0 {
+		t.Fatalf("Create(O_CREAT|O_RDONLY) new file = %v, want 0", cErr)
+	}
+	sf := fh.(*safeFile)
+	if sf.writable || slot.openWritableCount() != 0 {
+		t.Errorf("expected read-only Create handle: writable=%v openWritableCount=%d", sf.writable, slot.openWritableCount())
+	}
+	buf := make([]byte, 16)
+	res, rErr := sf.Read(ctx, buf, 0)
+	if rErr != 0 {
+		t.Errorf("Read on O_CREAT|O_RDONLY new file = %v, want 0", rErr)
+	}
+	if res != nil && res.Size() != 0 {
+		t.Errorf("Read size on empty new file = %d, want 0", res.Size())
+	}
+	_ = sf.Release(ctx)
+
+	// Opening an existing file via Create(O_CREAT|O_RDONLY) reads its contents cleanly.
+	if err := os.WriteFile(filepath.Join(srcDir, "exist-ro.txt"), []byte("hello-ro"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, fh2, _, cErr := root.Create(ctx, "exist-ro.txt", syscall.O_CREAT|syscall.O_RDONLY, 0o644, &eOut)
+	if cErr != 0 {
+		t.Fatalf("Create(O_CREAT|O_RDONLY) existing file = %v, want 0", cErr)
+	}
+	sf2 := fh2.(*safeFile)
+	if sf2.writable || slot.openWritableCount() != 0 {
+		t.Errorf("expected read-only Create handle on existing file: writable=%v openWritableCount=%d", sf2.writable, slot.openWritableCount())
+	}
+	res2, rErr := sf2.Read(ctx, buf, 0)
+	if rErr != 0 {
+		t.Fatalf("Read on O_CREAT|O_RDONLY existing file = %v, want 0", rErr)
+	}
+	data, _ := res2.Bytes(buf)
+	if string(data) != "hello-ro" {
+		t.Errorf("Read data = %q, want %q", string(data), "hello-ro")
+	}
+	_ = sf2.Release(ctx)
+}
+
+func TestInvalidateSlotKernelCacheLowercaseGitSubtree(t *testing.T) {
+	ctx := context.Background()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(base, "data")
+	repoDir := filepath.Join(base, "repo")
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git", "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(repoDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
+
+	hub, err := NewWorkspaceHubWithOptions([]HubShareConfig{
+		{GuestName: "repo", HostPath: repoDir, ReadOnly: false, VCSPolicy: config.VCSAllow},
+	}, HubOptions{HomeReal: base, DataDir: dataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.CloseAll()
+	_ = fs.NewNodeFS(hub, &fs.Options{})
+
+	var eOut fuse.EntryOut
+	repoIno, lErr := hub.Lookup(ctx, "repo", &eOut)
+	if lErr != 0 {
+		t.Fatalf("hub.Lookup(repo): %v", lErr)
+	}
+	repoRoot := repoIno.Operations().(*filteredNode)
+
+	gitIno, lErr := repoRoot.Lookup(ctx, ".git", &eOut)
+	if lErr != 0 {
+		t.Fatalf("Lookup(.git): %v", lErr)
+	}
+	repoRoot.AddChild(".git", gitIno, true)
+	gitNode := gitIno.Operations().(*filteredNode)
+
+	headIno, lErr := gitNode.Lookup(ctx, "HEAD", &eOut)
+	if lErr != 0 {
+		t.Fatalf("Lookup(.git/HEAD): %v", lErr)
+	}
+	gitNode.AddChild("HEAD", headIno, true)
+
+	vcsMask := config.VCSMask
+	if _, err := hub.setShare("repo", nil, &vcsMask, true); err != nil {
+		t.Fatalf("setShare(VCSMask): %v", err)
+	}
+
+	if repoIno.GetChild(".git") != nil {
+		t.Error("expected lowercase .git child to be removed from repoIno")
+	}
+	if gitIno.GetChild("HEAD") != nil {
+		t.Error("expected .git descendant HEAD to be removed by invalidateInodeSubtree")
+	}
+}
+
+func TestSetattrAndStatxOnUnlinkedAndTmpfileHandles(t *testing.T) {
+	ctx := context.Background()
+	srcDir, root := newTestFilteredRoot(t)
+	idMap := newGuestIDMap(true, config.GuestUID, config.GuestGID)
+	slot := newShareSlotWithIDMap(1, "unlinked", srcDir, false, "", root.root, root.hidden, false, config.VCSMask, idMap)
+	root.slot = slot
+	root.idMap = idMap
+
+	filePath := filepath.Join(srcDir, "ephemeral.txt")
+	if err := os.WriteFile(filePath, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var eOut fuse.EntryOut
+	fIno, lErr := root.Lookup(ctx, "ephemeral.txt", &eOut)
+	if lErr != 0 {
+		t.Fatalf("Lookup(ephemeral.txt): %v", lErr)
+	}
+	root.AddChild("ephemeral.txt", fIno, true)
+	fNode := fIno.Operations().(*filteredNode)
+
+	fh, _, oErr := fNode.Open(ctx, syscall.O_RDWR)
+	if oErr != 0 {
+		t.Fatalf("Open(ephemeral.txt): %v", oErr)
+	}
+	sf := fh.(*safeFile)
+	defer sf.Release(ctx)
+
+	// Unlink the file and detach its inode so path-based lookup would return ENOENT.
+	if uErr := root.Unlink(ctx, "ephemeral.txt"); uErr != 0 {
+		t.Fatalf("Unlink(ephemeral.txt): %v", uErr)
+	}
+	root.RmChild("ephemeral.txt")
+
+	var aOut fuse.AttrOut
+	truncIn := fuse.SetAttrIn{}
+	truncIn.Valid = fuse.FATTR_SIZE
+	truncIn.Size = 4
+	if sErr := fNode.Setattr(ctx, sf, &truncIn, &aOut); sErr != 0 || aOut.Size != 4 {
+		t.Errorf("Setattr on unlinked open handle = (%v, size=%d), want (0, 4)", sErr, aOut.Size)
+	}
+	if aOut.Uid != config.GuestUID || aOut.Gid != config.GuestGID {
+		t.Errorf("Setattr on unlinked handle UID:GID = %d:%d, want %d:%d", aOut.Uid, aOut.Gid, config.GuestUID, config.GuestGID)
+	}
+
+	var sxOut fuse.StatxOut
+	if sxErr := fNode.Statx(ctx, sf, 0, unix.STATX_BASIC_STATS, &sxOut); sxErr != 0 {
+		t.Errorf("Statx on unlinked open handle = %v, want 0", sxErr)
+	}
+	if sxOut.Statx.Size != 4 || sxOut.Statx.Uid != config.GuestUID || sxOut.Statx.Gid != config.GuestGID {
+		t.Errorf("Statx on unlinked handle = (size=%d uid=%d gid=%d), want (4, %d, %d)",
+			sxOut.Statx.Size, sxOut.Statx.Uid, sxOut.Statx.Gid, config.GuestUID, config.GuestGID)
+	}
+
+	// Verify Setattr and Statx on O_TMPFILE handle when supported by underlying FS.
+	tmpIno, tmpFH, _, tErr := root.Tmpfile(ctx, syscall.O_RDWR, 0o600, &eOut)
+	if tErr == syscall.EOPNOTSUPP || tErr == syscall.EISDIR {
+		t.Skipf("O_TMPFILE unsupported on test filesystem: %v", tErr)
+	}
+	if tErr != 0 {
+		t.Fatalf("Tmpfile: %v", tErr)
+	}
+	tmpSF := tmpFH.(*safeFile)
+	defer tmpSF.Release(ctx)
+	tmpNode := tmpIno.Operations().(*filteredNode)
+
+	if _, wErr := tmpSF.Write(ctx, []byte("abcdef"), 0); wErr != 0 {
+		t.Fatalf("tmpSF.Write: %v", wErr)
+	}
+	truncIn.Size = 3
+	if sErr := tmpNode.Setattr(ctx, tmpSF, &truncIn, &aOut); sErr != 0 || aOut.Size != 3 {
+		t.Errorf("Setattr on O_TMPFILE handle = (%v, size=%d), want (0, 3)", sErr, aOut.Size)
+	}
+	if sxErr := tmpNode.Statx(ctx, tmpSF, 0, unix.STATX_BASIC_STATS, &sxOut); sxErr != 0 || sxOut.Statx.Size != 3 {
+		t.Errorf("Statx on O_TMPFILE handle = (%v, size=%d), want (0, 3)", sxErr, sxOut.Statx.Size)
+	}
+}
+
+func TestFileShareNodeHardlinkHandleSetattrAndXattrRejection(t *testing.T) {
+	ctx := context.Background()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(base, "data")
+	singleFile := filepath.Join(base, "solo.txt")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(singleFile, []byte("payload\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	hub, err := NewWorkspaceHubWithOptions([]HubShareConfig{
+		{GuestName: "solo.txt", HostPath: singleFile, ReadOnly: false, VCSPolicy: config.VCSMask},
+	}, HubOptions{HomeReal: base, DataDir: dataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.CloseAll()
+
+	fNode := &fileShareNode{slot: hub.slots["solo.txt"]}
+	fh, _, oErr := fNode.Open(ctx, syscall.O_RDWR)
+	if oErr != 0 {
+		t.Fatalf("fileShareNode.Open(O_RDWR): %v", oErr)
+	}
+	sf := fh.(*safeFile)
+	defer sf.Release(ctx)
+
+	// Add a second hard link on the host after open.
+	hardPeer := filepath.Join(base, "solo-peer.txt")
+	if err := os.Link(singleFile, hardPeer); err != nil {
+		t.Fatal(err)
+	}
+
+	var aOut fuse.AttrOut
+	setIn := fuse.SetAttrIn{}
+	setIn.Valid = fuse.FATTR_SIZE
+	setIn.Size = 2
+	if sErr := fNode.Setattr(ctx, sf, &setIn, &aOut); sErr != syscall.EPERM {
+		t.Errorf("fileShareNode.Setattr via open handle with Nlink=2 = %v, want EPERM", sErr)
+	}
+	if xErr := fNode.Setxattr(ctx, "user.tag", []byte("v"), 0); xErr != syscall.EPERM {
+		t.Errorf("fileShareNode.Setxattr with Nlink=2 = %v, want EPERM", xErr)
+	}
+	if xErr := fNode.Removexattr(ctx, "user.tag"); xErr != syscall.EPERM {
+		t.Errorf("fileShareNode.Removexattr with Nlink=2 = %v, want EPERM", xErr)
+	}
+
+	// Removing the extra link restores handle Setattr.
+	_ = os.Remove(hardPeer)
+	if sErr := fNode.Setattr(ctx, sf, &setIn, &aOut); sErr != 0 || aOut.Size != 2 {
+		t.Errorf("fileShareNode.Setattr via open handle with Nlink=1 = (%v, size=%d), want (0, 2)", sErr, aOut.Size)
+	}
+}
+
+func TestHubLookupRemoveRace(t *testing.T) {
+	ctx := context.Background()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(base, "data")
+	repoDir := filepath.Join(base, "repo")
+	for _, d := range []string{dataDir, repoDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hub, err := NewWorkspaceHubWithOptions(nil, HubOptions{HomeReal: base, DataDir: dataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.CloseAll()
+	_ = fs.NewNodeFS(hub, &fs.Options{})
+
+	for round := 0; round < 20; round++ {
+		if _, err := hub.addShare(HubShareConfig{
+			GuestName: "repo",
+			HostPath:  repoDir,
+			ReadOnly:  true,
+			VCSPolicy: config.VCSMask,
+		}); err != nil {
+			t.Fatalf("addShare round %d: %v", round, err)
+		}
+		var eOut fuse.EntryOut
+		if _, lErr := hub.Lookup(ctx, "repo", &eOut); lErr != 0 {
+			t.Fatalf("initial Lookup round %d: %v", round, lErr)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				var out fuse.EntryOut
+				_, _ = hub.Lookup(ctx, "repo", &out)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			_ = hub.removeShare("repo", true)
+		}()
+		wg.Wait()
+
+		if _, lErr := hub.Lookup(ctx, "repo", &eOut); lErr != syscall.ENOENT {
+			t.Errorf("Lookup after removeShare round %d = %v, want ENOENT", round, lErr)
+		}
+	}
+}
+
+func TestLaunchFilterDaemonExitZeroLargePayloadAndFIFOLogs(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mntDir := filepath.Join(base, "mnt")
+	if err := os.MkdirAll(mntDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Child that exits 0 before mounting formats cleanly without %!w(<nil>).
+	pidZero := filepath.Join(base, "zero.pid")
+	_, err = launchFilterDaemon(daemonLaunchConfig{
+		exePath:        "/bin/sh",
+		args:           []string{"-c", "exit 0"},
+		mntDir:         mntDir,
+		pidFile:        pidZero,
+		label:          "FUSE test",
+		startupTimeout: 500 * time.Millisecond,
+		readyCheck:     func() bool { return false },
+	})
+	if err == nil {
+		t.Fatal("expected error when child exits 0 before mounting")
+	}
+	if !strings.Contains(err.Error(), "exit status 0") {
+		t.Errorf("expected 'exit status 0' in error, got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "%!w") {
+		t.Errorf("error contains raw format verb: %q", err.Error())
+	}
+
+	// 2. Large bootstrap pipe payload (>64 KiB) with stalling child times out cleanly without hanging.
+	pidLarge := filepath.Join(base, "large.pid")
+	largePayload := bytes.Repeat([]byte("A"), 256*1024)
+	start := time.Now()
+	_, err = launchFilterDaemon(daemonLaunchConfig{
+		exePath:        "/bin/sh",
+		args:           []string{"-c", "sleep 10"},
+		mntDir:         mntDir,
+		pidFile:        pidLarge,
+		pipePayload:    largePayload,
+		label:          "FUSE large",
+		startupTimeout: 150 * time.Millisecond,
+		readyCheck:     func() bool { return false },
+	})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected error when stalling child fails to drain large bootstrap pipe")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("launchFilterDaemon blocked too long on large pipe write: %v", elapsed)
+	}
+
+	// 3. FIFO at pidFile or stderr log path is rejected without blocking.
+	fifoPID := filepath.Join(base, "blocked.pid")
+	if err := syscall.Mkfifo(fifoPID, 0o600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
+	}
+	fifoDone := make(chan error, 2)
+	go func() {
+		fifoDone <- writePIDFileNoFollow(fifoPID, 12345)
+	}()
+	select {
+	case wErr := <-fifoDone:
+		if wErr == nil || !strings.Contains(wErr.Error(), "non-regular") {
+			t.Errorf("writePIDFileNoFollow(FIFO) = %v, want non-regular error", wErr)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("writePIDFileNoFollow blocked on FIFO")
+	}
+
+	fifoErr := filepath.Join(base, "blocked.err")
+	if err := syscall.Mkfifo(fifoErr, 0o600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
+	}
+	go func() {
+		f, oErr := openDaemonStderrFile(fifoErr)
+		if f != nil {
+			_ = f.Close()
+		}
+		fifoDone <- oErr
+	}()
+	select {
+	case oErr := <-fifoDone:
+		if oErr == nil || !strings.Contains(oErr.Error(), "non-regular") {
+			t.Errorf("openDaemonStderrFile(FIFO) = %v, want non-regular error", oErr)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("openDaemonStderrFile blocked on FIFO")
+	}
+}
+
+func TestSubmoduleRefsAndObjectsConfigProtection(t *testing.T) {
+	protectedDirs := []string{
+		".git/modules/refs/heads",
+		".git/modules/a/refs/heads",
+		".git/modules/objects/00",
+		".git/modules/a/objects/00",
+		".git/modules/a/objects/info",
+		".git/modules/logs/refs/heads",
+		".git/objects/00",
+		".git/objects/info",
+		".git/objects/pack",
+		".jj/repo/store/git/modules/refs/heads",
+		".jj/repo/store/git/modules/git/refs/heads",
+		".jj/repo/store/git/modules/a/objects/info",
+	}
+	protectedNames := []string{"config", "config.worktree", "commondir", "gitdir"}
+	for _, dir := range protectedDirs {
+		for _, name := range protectedNames {
+			rel := dir + "/" + name
+			if !isProtectedVCSHookRelPath(rel) {
+				t.Errorf("isProtectedVCSHookRelPath(%q) = false, want true", rel)
+			}
+		}
+	}
+
+	allowedPaths := []string{
+		".git/refs/heads/config",
+		".git/refs/heads/config.worktree",
+		".git/refs/tags/commondir",
+		".git/logs/refs/heads/config",
+		".git/logs/refs/heads/gitdir",
+		".jj/repo/store/git/refs/heads/config",
+		".jj/repo/store/git/logs/refs/heads/config",
+		"subrepo/.git/refs/heads/config",
+		"subrepo/.git/logs/refs/heads/config",
+	}
+	for _, rel := range allowedPaths {
+		if isProtectedVCSHookRelPath(rel) {
+			t.Errorf("isProtectedVCSHookRelPath(%q) = true, want false", rel)
+		}
+	}
+}
+
+func TestSetlkwRevokeAndSetShareRemoveShareNoDeadlock(t *testing.T) {
+	// Verify singular and plural error wording for open writable file handles.
+	if err := openWritableHandlesError("app", 1); err.Error() != `share "app" has 1 open writable file handle. Close it in the sandbox or pass --force` {
+		t.Errorf("singular error = %q", err.Error())
+	}
+	if err := openWritableHandlesError("app", 2); err.Error() != `share "app" has 2 open writable file handles. Close them in the sandbox or pass --force` {
+		t.Errorf("plural error = %q", err.Error())
+	}
+
+	ctx := context.Background()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(base, "data")
+	projDir := filepath.Join(base, "proj")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockTarget := filepath.Join(projDir, "locked.txt")
+	if err := os.WriteFile(lockTarget, []byte("lock-data\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hub, err := NewWorkspaceHubWithOptions([]HubShareConfig{
+		{GuestName: "proj", HostPath: projDir, ReadOnly: false, VCSPolicy: config.VCSMask},
+	}, HubOptions{HomeReal: base, DataDir: dataDir, MSBHome: filepath.Join(base, "msb")})
+	if err != nil {
+		t.Fatalf("NewWorkspaceHubWithOptions: %v", err)
+	}
+	defer hub.CloseAll()
+
+	slot := hub.slots["proj"]
+	var dirSt syscall.Stat_t
+	if err := syscall.Stat(projDir, &dirSt); err != nil {
+		t.Fatal(err)
+	}
+	root := buildRootFilteredNode(projDir, slot.root, dirSt, slot)
+	_ = fs.NewNodeFS(root, &fs.Options{})
+
+	var eOut fuse.EntryOut
+	fileIno, errNo := root.Lookup(ctx, "locked.txt", &eOut)
+	if errNo != 0 {
+		t.Fatalf("Lookup(locked.txt): %v", errNo)
+	}
+	root.AddChild("locked.txt", fileIno, true)
+	fileNode := fileIno.Operations().(*filteredNode)
+
+	// Hold an exclusive flock on a separate host descriptor so Setlkw contends.
+	holder, err := os.OpenFile(lockTarget, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("Flock(LOCK_EX): %v", err)
+	}
+
+	// Open one writable handle and verify singular wording when setShare omits --force.
+	fh1, _, errNo := fileNode.Open(ctx, syscall.O_RDWR)
+	if errNo != 0 {
+		t.Fatalf("Open(O_RDWR) #1: %v", errNo)
+	}
+	sf1 := fh1.(*safeFile)
+	roTrue := true
+	if _, err := hub.setShare("proj", &roTrue, nil, false); err == nil || !strings.Contains(err.Error(), "1 open writable file handle. Close it in the sandbox") {
+		t.Errorf("setShare without force = %v, want singular Close it error", err)
+	}
+
+	// Block sf1.Setlkw on the contended flock, then downgrade with setShare(force=true).
+	lk := fuse.FileLock{Typ: syscall.F_WRLCK}
+	setlkwDone := make(chan syscall.Errno, 1)
+	go func() {
+		setlkwDone <- sf1.Setlkw(ctx, 1, &lk, fuse.FUSE_LK_FLOCK)
+	}()
+	time.Sleep(15 * time.Millisecond)
+
+	setDone := make(chan error, 1)
+	go func() {
+		_, sErr := hub.setShare("proj", &roTrue, nil, true)
+		setDone <- sErr
+	}()
+	select {
+	case sErr := <-setDone:
+		if sErr != nil {
+			t.Fatalf("setShare(ro, force=true) failed: %v", sErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("setShare deadlocked while Setlkw waited on contended lock")
+	}
+	select {
+	case lErr := <-setlkwDone:
+		if lErr != syscall.EROFS {
+			t.Errorf("sf1.Setlkw after setShare(ro, force) = %v, want EROFS", lErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sf1.Setlkw did not wake up after revoke")
+	}
+	_ = sf1.Release(ctx)
+
+	// Switch share back to rw, contend Setlkw again, then detach via removeShare(force=true).
+	roFalse := false
+	if _, err := hub.setShare("proj", &roFalse, nil, false); err != nil {
+		t.Fatalf("setShare(rw): %v", err)
+	}
+	fh2, _, errNo := fileNode.Open(ctx, syscall.O_RDWR)
+	if errNo != 0 {
+		t.Fatalf("Open(O_RDWR) #2: %v", errNo)
+	}
+	sf2 := fh2.(*safeFile)
+	setlkwDone2 := make(chan syscall.Errno, 1)
+	go func() {
+		setlkwDone2 <- sf2.Setlkw(ctx, 2, &lk, fuse.FUSE_LK_FLOCK)
+	}()
+	time.Sleep(15 * time.Millisecond)
+
+	rmDone := make(chan error, 1)
+	go func() {
+		rmDone <- hub.removeShare("proj", true)
+	}()
+	select {
+	case rErr := <-rmDone:
+		if rErr != nil {
+			t.Fatalf("removeShare(force=true) failed: %v", rErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("removeShare deadlocked while Setlkw waited on contended lock")
+	}
+	select {
+	case lErr := <-setlkwDone2:
+		if lErr != syscall.ESTALE {
+			t.Errorf("sf2.Setlkw after removeShare(force) = %v, want ESTALE", lErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sf2.Setlkw did not wake up after detach")
+	}
+	_ = sf2.Release(ctx)
+
+	// Verify Setlkw wakes on context cancel and acquires once the holder unlocks.
+	if _, err := hub.addShare(HubShareConfig{GuestName: "proj", HostPath: projDir, ReadOnly: false, VCSPolicy: config.VCSMask}); err != nil {
+		t.Fatalf("re-add proj: %v", err)
+	}
+	slot2 := hub.slots["proj"]
+	root2 := buildRootFilteredNode(projDir, slot2.root, dirSt, slot2)
+	_ = fs.NewNodeFS(root2, &fs.Options{})
+	fileIno2, errNo := root2.Lookup(ctx, "locked.txt", &eOut)
+	if errNo != 0 {
+		t.Fatalf("Lookup(locked.txt) #2: %v", errNo)
+	}
+	root2.AddChild("locked.txt", fileIno2, true)
+	fh3, _, errNo := fileIno2.Operations().(*filteredNode).Open(ctx, syscall.O_RDWR)
+	if errNo != 0 {
+		t.Fatalf("Open(O_RDWR) #3: %v", errNo)
+	}
+	sf3 := fh3.(*safeFile)
+	defer sf3.Release(ctx)
+
+	cancelCtx, cancel := context.WithTimeout(ctx, 25*time.Millisecond)
+	defer cancel()
+	if cErr := sf3.Setlkw(cancelCtx, 3, &lk, fuse.FUSE_LK_FLOCK); cErr != syscall.EINTR {
+		t.Errorf("sf3.Setlkw on canceled context = %v, want EINTR", cErr)
+	}
+
+	acquireDone := make(chan syscall.Errno, 1)
+	go func() {
+		acquireDone <- sf3.Setlkw(ctx, 3, &lk, fuse.FUSE_LK_FLOCK)
+	}()
+	time.Sleep(15 * time.Millisecond)
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("Flock(LOCK_UN): %v", err)
+	}
+	select {
+	case aErr := <-acquireDone:
+		if aErr != 0 {
+			t.Errorf("sf3.Setlkw after unlock = %v, want 0", aErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sf3.Setlkw did not acquire lock after holder unlocked")
 	}
 }

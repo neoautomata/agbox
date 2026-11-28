@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -53,7 +54,7 @@ func (a *appRuntime) auth(ctx context.Context, args []string) error {
 		if err := persist.RemoveAuth(a.Env.DataDir, opts.Target); err != nil {
 			return err
 		}
-		a.logf("Removed saved %s credentials from %s.", opts.Target, filepath.Join(a.Env.DataDir, "auth"))
+		a.logf("Deleted saved %s credentials from %s.", opts.Target, filepath.Join(a.Env.DataDir, "auth"))
 		return nil
 	}
 
@@ -77,7 +78,7 @@ func (a *appRuntime) auth(ctx context.Context, args []string) error {
 		}
 	}
 	if baseState.Agent != "" && baseState.Agent != "both" && baseState.Agent != agent {
-		return fmt.Errorf("the base snapshot contains only agent=%s. Run 'agbox create-base %s' or 'agbox create-base both'", baseState.Agent, agent)
+		return fmt.Errorf("the base snapshot contains only agent=%s. Run 'agbox create-base --force %s' or 'agbox create-base --force both'", baseState.Agent, agent)
 	}
 	if a.IsTTY == nil || !a.IsTTY() {
 		return errors.New("agbox auth requires an interactive TTY")
@@ -195,7 +196,7 @@ func (a *appRuntime) skills(ctx context.Context, args []string) error {
 		if err := persist.RemoveSkill(skillsDir, opts.Target); err != nil {
 			return err
 		}
-		a.logf("Removed global skill %q.", opts.Target)
+		a.logf("Deleted global skill %q.", opts.Target)
 		return nil
 	}
 	return nil
@@ -282,13 +283,13 @@ func (a *appRuntime) rules(ctx context.Context, args []string) error {
 			if err := persist.RemoveAllRules(rulesDir); err != nil {
 				return err
 			}
-			a.logf("Removed all global rules from %s.", rulesDir)
+			a.logf("Deleted all global rules from %s.", rulesDir)
 			return nil
 		}
 		if err := persist.RemoveRule(rulesDir, opts.Target); err != nil {
 			return err
 		}
-		a.logf("Removed global rule %q.", opts.Target)
+		a.logf("Deleted global rule %q.", opts.Target)
 		return nil
 	}
 	return nil
@@ -345,6 +346,16 @@ func (a *appRuntime) profile(ctx context.Context, args []string) error {
 		}
 		defer func() { _ = lock.Unlock() }()
 
+		if opts.Size != "" {
+			if existing, lErr := persist.ListProfiles(a.Env.DataDir); lErr == nil {
+				for _, pm := range existing {
+					if pm.Name == opts.Name && pm.Size != "" && !strings.EqualFold(pm.Size, opts.Size) {
+						return fmt.Errorf("profile %q already exists with size %s. agbox cannot resize existing profile disks in place", opts.Name, pm.Size)
+					}
+				}
+			}
+		}
+
 		size := defaultStr(opts.Size, defaultStr(a.Env.ProfileDisk, config.DefaultProfileDisk))
 		volName, err := a.ensureProfileVolume(ctx, opts.Name, size)
 		if err != nil {
@@ -363,11 +374,41 @@ func (a *appRuntime) profile(ctx context.Context, args []string) error {
 		return nil
 
 	case "rm":
+		volName := persist.FormatProfileVolumeName(opts.Name)
+		profDir := filepath.Join(a.Env.DataDir, "profiles", opts.Name)
+		dirExists := false
+		if _, stErr := os.Lstat(profDir); stErr == nil {
+			dirExists = true
+		} else if !os.IsNotExist(stErr) {
+			return fmt.Errorf("stat profile directory %s: %w", profDir, stErr)
+		}
+		volExists, err := msb.VolumeExists(ctx, a.MSB, volName)
+		if err != nil {
+			return err
+		}
+		if !dirExists && !volExists {
+			return fmt.Errorf("profile %q does not exist", opts.Name)
+		}
+
 		lock, err := persist.LockProfile(a.Env.DataDir, opts.Name)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = lock.Unlock() }()
+
+		dirExists = false
+		if _, stErr := os.Lstat(profDir); stErr == nil {
+			dirExists = true
+		} else if !os.IsNotExist(stErr) {
+			return fmt.Errorf("stat profile directory %s: %w", profDir, stErr)
+		}
+		volExists, err = msb.VolumeExists(ctx, a.MSB, volName)
+		if err != nil {
+			return err
+		}
+		if !dirExists && !volExists {
+			return fmt.Errorf("profile %q does not exist", opts.Name)
+		}
 
 		lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 		if err != nil {
@@ -378,12 +419,7 @@ func (a *appRuntime) profile(ctx context.Context, args []string) error {
 			return err
 		}
 
-		volName := persist.FormatProfileVolumeName(opts.Name)
-		exists, err := msb.VolumeExists(ctx, a.MSB, volName)
-		if err != nil {
-			return err
-		}
-		if exists {
+		if volExists {
 			if rmRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"volume", "rm", volName}}); err != nil {
 				return formatMSBError("delete volume "+volName, rmRes, err)
 			}
@@ -436,7 +472,7 @@ func (a *appRuntime) ensureProfileVolume(ctx context.Context, profileName, size 
 			rmRes, rmErr := a.MSB.Run(teardownCtx, msb.CommandRequest{Args: []string{"volume", "rm", volName}})
 			cancel()
 			if rmErr != nil {
-				a.warnf("Could not roll back profile volume %s: %v", volName, formatMSBError("msb volume rm", rmRes, rmErr))
+				a.warnf("Could not delete profile volume %s: %v", volName, formatMSBError("msb volume rm", rmRes, rmErr))
 			}
 		}
 		return "", fmt.Errorf("save profile metadata: %w", err)
@@ -577,55 +613,164 @@ func (a *appRuntime) suspendSandboxOnExit(sandbox, runFilterDir string, meta con
 	}
 
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
-	if err := config.SaveRunMeta(suspendedPath, savedMeta); err != nil {
-		a.warnf("Could not save suspended metadata for %s: %v", sandbox, err)
-		return
+	saveErr := config.SaveRunMeta(suspendedPath, savedMeta)
+	if saveErr != nil {
+		a.warnf("Could not save suspended metadata for %s: %v", sandbox, saveErr)
+	} else {
+		_ = os.Remove(filepath.Join(runFilterDir, "detached"))
 	}
-	_ = os.Remove(filepath.Join(runFilterDir, "detached"))
 	if uErr := mounttab.UnmountFilterDir(runFilterDir, a.MountCtl); uErr != nil {
 		a.warnf("Could not unmount shares in %s: %v", runFilterDir, uErr)
 	}
+	if saveErr != nil {
+		return
+	}
 	a.logf("Persisted %s (stopped). Resume with 'agbox resume %s' or delete with 'agbox stop %s'.", sandbox, sandbox, sandbox)
+}
+
+type shareCompareTuple struct {
+	hostPath  string
+	guestName string
+	isDir     bool
+	masked    bool
+	readOnly  bool
+	vcsPolicy config.VCSPolicy
+}
+
+func compareShareTuples(a, b shareCompareTuple) int {
+	if c := cmp.Compare(a.hostPath, b.hostPath); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.guestName, b.guestName); c != 0 {
+		return c
+	}
+	return cmp.Compare(string(a.vcsPolicy), string(b.vcsPolicy))
 }
 
 func sharesMatchRecorded(validated []pathsec.ShareTarget, recorded []config.ShareRecord, useMask bool, metaReadOnly bool) bool {
 	if len(validated) != len(recorded) {
 		return false
 	}
+	want := make([]shareCompareTuple, len(validated))
 	for i, v := range validated {
-		rec := recorded[i]
-		wantMasked := v.IsDir && useMask && v.VCSPolicy == config.VCSMask
-		if rec.Index != i || rec.HostPath != v.HostPath || rec.GuestName != v.GuestName || rec.IsDir != v.IsDir || rec.Masked != wantMasked {
-			return false
+		var vcs config.VCSPolicy
+		if useMask {
+			vcs = v.VCSPolicy
 		}
-		if rec.EffectiveReadOnly(metaReadOnly) != v.ReadOnly {
-			return false
-		}
-		if useMask && rec.EffectiveVCSPolicy() != v.VCSPolicy {
-			return false
+		want[i] = shareCompareTuple{
+			hostPath:  v.HostPath,
+			guestName: v.GuestName,
+			isDir:     v.IsDir,
+			masked:    v.IsDir && useMask && v.VCSPolicy == config.VCSMask,
+			readOnly:  v.ReadOnly,
+			vcsPolicy: vcs,
 		}
 	}
-	return true
+	got := make([]shareCompareTuple, len(recorded))
+	for i, rec := range recorded {
+		var vcs config.VCSPolicy
+		if useMask {
+			vcs = rec.EffectiveVCSPolicy()
+		}
+		got[i] = shareCompareTuple{
+			hostPath:  rec.HostPath,
+			guestName: rec.GuestName,
+			isDir:     rec.IsDir,
+			masked:    rec.Masked,
+			readOnly:  rec.EffectiveReadOnly(metaReadOnly),
+			vcsPolicy: vcs,
+		}
+	}
+	slices.SortFunc(want, compareShareTuples)
+	slices.SortFunc(got, compareShareTuples)
+	return slices.Equal(want, got)
 }
 
 func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID string, baseState config.State, opts runOpts, useMask bool) error {
 	runFilterDir := filepath.Join(a.Env.DataDir, "run", dirID)
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
+
+	metaLock, err := lockRunMeta(runFilterDir)
+	if err != nil {
+		return err
+	}
 	meta, err := config.LoadRunMeta(suspendedPath)
 	if err != nil {
+		metaLock.unlock()
 		return fmt.Errorf("load suspended metadata for %q: %w", runSandbox, err)
 	}
-
-	if len(opts.Paths) > 0 || len(opts.ShareSpecs) > 0 {
-		validated, vErr := a.resolveRunShareTargets(opts)
-		if vErr != nil {
-			return vErr
+	if meta.Sandbox != runSandbox {
+		metaLock.unlock()
+		return fmt.Errorf("suspended metadata sandbox mismatch: got %q, want %q", meta.Sandbox, runSandbox)
+	}
+	if meta.Profile != "" {
+		metaLock.unlock()
+		return fmt.Errorf("suspended sandbox %q uses profile %q and cannot resume with --persist. Run 'agbox resume %s' instead", runSandbox, meta.Profile, runSandbox)
+	}
+	if !opts.Supervised {
+		if opts.NoNet || len(opts.NetSpecs) > 0 {
+			metaLock.unlock()
+			return fmt.Errorf("cannot change network options when resuming persistent sandbox %q. Run 'agbox stop %s' to recreate it", runSandbox, runSandbox)
 		}
-		if opts.ReadOnly != meta.ReadOnly || opts.MaskMode != meta.MaskMode || !sharesMatchRecorded(validated, meta.Shares, meta.WorkspaceHub && useMask, meta.ReadOnly) {
-			return fmt.Errorf("persistent sandbox %q has different shared paths or mount flags. Use 'agbox share' to modify shares, or 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+		if opts.CPUs != "" || opts.Memory != "" {
+			metaLock.unlock()
+			return fmt.Errorf("cannot change --cpus or --memory when resuming persistent sandbox %q. Run 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+		}
+		if opts.ShareHub {
+			metaLock.unlock()
+			return fmt.Errorf("cannot change --share-hub when resuming persistent sandbox %q. Run 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+		}
+	}
+	if opts.Port != 0 && opts.Port != meta.Port {
+		metaLock.unlock()
+		return fmt.Errorf("persistent sandbox %q uses port %d, not %d. Run 'agbox stop %s' to recreate it", runSandbox, meta.Port, opts.Port, runSandbox)
+	}
+	if !opts.Supervised {
+		if opts.LockAccess {
+			accessConflict := opts.ReadOnly != meta.ReadOnly
+			if !accessConflict {
+				for _, sh := range meta.Shares {
+					if sh.EffectiveReadOnly(meta.ReadOnly) != opts.ReadOnly {
+						accessConflict = true
+						break
+					}
+				}
+			}
+			if accessConflict {
+				metaLock.unlock()
+				return fmt.Errorf("persistent sandbox %q has different shared paths or mount flags. Use 'agbox share' to modify shares, or 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+			}
+		}
+		if opts.ExplicitMask {
+			maskConflict := opts.MaskMode != meta.MaskMode || (opts.MaskMode == config.MaskOff && meta.WorkspaceHub)
+			if !maskConflict && opts.LockVCS {
+				for _, sh := range meta.Shares {
+					if sh.IsDir && sh.EffectiveVCSPolicy() != opts.DefaultVCS {
+						maskConflict = true
+						break
+					}
+				}
+			}
+			if maskConflict {
+				metaLock.unlock()
+				return fmt.Errorf("persistent sandbox %q has different shared paths or mount flags. Use 'agbox share' to modify shares, or 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+			}
+		}
+
+		if len(opts.Paths) > 0 || len(opts.ShareSpecs) > 0 {
+			validated, vErr := a.resolveRunShareTargets(opts)
+			if vErr != nil {
+				metaLock.unlock()
+				return vErr
+			}
+			if opts.ReadOnly != meta.ReadOnly || opts.MaskMode != meta.MaskMode || !sharesMatchRecorded(validated, meta.Shares, meta.WorkspaceHub && useMask, meta.ReadOnly) {
+				metaLock.unlock()
+				return fmt.Errorf("persistent sandbox %q has different shared paths or mount flags. Use 'agbox share' to modify shares, or 'agbox stop %s' to recreate it", runSandbox, runSandbox)
+			}
 		}
 	}
 
+	origMeta := meta
 	origMode := meta.Mode
 	origCmd := meta.Cmd
 	origRC := meta.RemoteControl
@@ -634,11 +779,13 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 	if opts.Agent != "" || opts.Serve || opts.RemoteControl {
 		effAgent, aErr := selectEffectiveAgent(baseState.Agent, opts)
 		if aErr != nil {
+			metaLock.unlock()
 			return aErr
 		}
 		meta.Agent = effAgent
 	}
 	if opts.Serve && meta.Port == 0 {
+		metaLock.unlock()
 		return fmt.Errorf("persistent sandbox %q has no --serve port. Run 'agbox stop %s', then start it with --serve", runSandbox, runSandbox)
 	}
 	switch {
@@ -667,10 +814,12 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 
 	meta.Persist = true
 	if err := config.SaveRunMeta(suspendedPath, meta); err != nil {
+		metaLock.unlock()
 		return fmt.Errorf("update persistent metadata: %w", err)
 	}
+	metaLock.unlock()
 
-	runErr := a.resumeSandbox(ctx, resumeOpts{
+	resumed, runErr := a.resumeSandboxTracked(ctx, resumeOpts{
 		Sandbox:         runSandbox,
 		AllowRoot:       opts.AllowRoot,
 		Detach:          opts.Detach,
@@ -683,10 +832,21 @@ func (a *appRuntime) resumeFromRunPersist(ctx context.Context, runSandbox, dirID
 		Supervised:      opts.Supervised,
 	})
 
-	if opts.Cmd != "" && origMode != config.RunModeCmd && hasMarker(suspendedPath) {
-		metaLock, lockErr := lockRunMeta(runFilterDir)
+	if runErr != nil && !resumed && hasMarker(suspendedPath) {
+		restoreLock, lockErr := lockRunMeta(runFilterDir)
 		if lockErr == nil {
-			defer metaLock.unlock()
+			defer restoreLock.unlock()
+		}
+		if sErr := config.SaveRunMeta(suspendedPath, origMeta); sErr != nil {
+			a.warnf("Could not restore suspended metadata for %s: %v", runSandbox, sErr)
+		}
+		return runErr
+	}
+
+	if opts.Cmd != "" && origMode != config.RunModeCmd && hasMarker(suspendedPath) {
+		restoreLock, lockErr := lockRunMeta(runFilterDir)
+		if lockErr == nil {
+			defer restoreLock.unlock()
 		}
 		if latest, lErr := config.LoadRunMeta(suspendedPath); lErr == nil {
 			latest.Mode = origMode
@@ -763,6 +923,8 @@ func (a *appRuntime) printPersistenceStatus(ctx context.Context) {
 		} else {
 			fmt.Fprintf(a.Stdout, "auth: %s\n", strings.Join(configured, ", "))
 		}
+	} else {
+		fmt.Fprintf(a.Stdout, "auth: error (%v)\n", err)
 	}
 	agentsDir := filepath.Join(a.Env.DataDir, "agents")
 	if cached, err := persist.InspectAgentsDir(agentsDir); err == nil {
@@ -775,6 +937,8 @@ func (a *appRuntime) printPersistenceStatus(ctx context.Context) {
 			}
 			fmt.Fprintf(a.Stdout, "cached_agents: %s\n", strings.Join(entries, ", "))
 		}
+	} else {
+		fmt.Fprintf(a.Stdout, "cached_agents: error (%v)\n", err)
 	}
 	skillsDir := filepath.Join(a.Env.DataDir, "skills")
 	if skills, err := persist.InspectSkillsDir(skillsDir); err == nil {
@@ -783,6 +947,8 @@ func (a *appRuntime) printPersistenceStatus(ctx context.Context) {
 		} else {
 			fmt.Fprintf(a.Stdout, "global_skills: %s\n", strings.Join(skills, ", "))
 		}
+	} else {
+		fmt.Fprintf(a.Stdout, "global_skills: error (%v)\n", err)
 	}
 	rulesDir := filepath.Join(a.Env.DataDir, "rules")
 	if rules, err := persist.InspectRulesDir(rulesDir); err == nil {
@@ -791,9 +957,12 @@ func (a *appRuntime) printPersistenceStatus(ctx context.Context) {
 		} else {
 			fmt.Fprintf(a.Stdout, "global_rules: %s\n", strings.Join(rules, ", "))
 		}
+	} else {
+		fmt.Fprintf(a.Stdout, "global_rules: error (%v)\n", err)
 	}
 	var profNames []string
-	if profs, err := persist.ListProfiles(a.Env.DataDir); err == nil {
+	profs, profErr := persist.ListProfiles(a.Env.DataDir)
+	if profErr == nil {
 		for _, p := range profs {
 			profNames = append(profNames, p.Name)
 		}
@@ -808,7 +977,16 @@ func (a *appRuntime) printPersistenceStatus(ctx context.Context) {
 					}
 				}
 			}
+		} else {
+			a.warnf("Could not list msb volumes: %v", formatMSBError("msb volume ls", volRes, vErr))
 		}
+	}
+	if profErr != nil && len(profNames) == 0 {
+		fmt.Fprintf(a.Stdout, "profiles: error (%v)\n", profErr)
+		return
+	}
+	if profErr != nil {
+		a.warnf("Could not list profile metadata: %v", profErr)
 	}
 	slices.Sort(profNames)
 	if len(profNames) == 0 {

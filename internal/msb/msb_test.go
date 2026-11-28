@@ -85,7 +85,7 @@ func TestTranslateNetSpecAndBuildNetArgs(t *testing.T) {
 		}
 	}
 
-	// Host profile places allow@host before deny@private while blocking loopback, multicast, and meta.
+	// Host profile places allow@host and allow@dns before deny@private while blocking loopback, multicast, and meta.
 	gotHost, err := buildNetArgs(false, []string{"host"})
 	if err != nil {
 		t.Fatalf("buildNetArgs(false, []string{host}): %v", err)
@@ -93,9 +93,24 @@ func TestTranslateNetSpecAndBuildNetArgs(t *testing.T) {
 	assertAllNetRuleTokensValid(t, gotHost)
 	hostJoined := strings.Join(gotHost, " ")
 	allowHostIdx := strings.Index(hostJoined, "allow@host")
+	hostDNSIdx := strings.Index(hostJoined, "allow@dns")
 	denyPrivIdx := strings.Index(hostJoined, "deny@private")
-	if allowHostIdx < 0 || denyPrivIdx < 0 || allowHostIdx > denyPrivIdx {
-		t.Errorf("expected allow@host before deny@private in %q", hostJoined)
+	if allowHostIdx < 0 || hostDNSIdx < 0 || denyPrivIdx < 0 || allowHostIdx > denyPrivIdx || hostDNSIdx > denyPrivIdx {
+		t.Errorf("expected allow@host and allow@dns before deny@private in %q", hostJoined)
+	}
+	hostDenyDNS, err := buildNetArgs(false, []string{"host", "deny@dns"})
+	if err != nil {
+		t.Fatalf("buildNetArgs(host + deny@dns): %v", err)
+	}
+	if slices.Contains(hostDenyDNS, "allow@dns") {
+		t.Errorf("expected allow@dns omitted under host + deny@dns: %v", hostDenyDNS)
+	}
+	hostExplicitDNS, err := buildNetArgs(false, []string{"host", "allow@dns:udp:53"})
+	if err != nil {
+		t.Fatalf("buildNetArgs(host + explicit dns): %v", err)
+	}
+	if slices.Contains(hostExplicitDNS, "allow@dns") || !slices.Contains(hostExplicitDNS, "allow@dns:udp:53") {
+		t.Errorf("expected explicit dns rule to replace default allow@dns under host: %v", hostExplicitDNS)
 	}
 
 	for _, spec := range []string{"all", "allow"} {
@@ -370,6 +385,14 @@ func TestNetRuleParserBoundaryRejections(t *testing.T) {
 		"allow:ingress@public:icmpv4",
 		"allow:any@public:icmpv6",
 		"allow@public:tcp:443:extra",
+		"allow@10.0.0.1/24",
+		"deny@192.168.1.5/24:tcp:443",
+		"allow@dns:",
+		"allow@dns::",
+		"allow@dns::53",
+		"allow@dns:udp:",
+		"allow@dns:tcp:",
+		"allow@dns:any:",
 	}
 	for _, badSpec := range badSpecs {
 		t.Run(badSpec, func(t *testing.T) {
@@ -409,6 +432,9 @@ func TestValidateDNSRuleRightErrors(t *testing.T) {
 		{right: "dns:any:53:extra", dir: "egress", token: "allow@dns:any:53:extra"},
 		{right: "dns:sctp", dir: "egress", token: "allow@dns:sctp"},
 		{right: "dns:udp:80", dir: "egress", token: "allow@dns:udp:80"},
+		{right: "dns:", dir: "egress", token: "allow@dns:"},
+		{right: "dns::53", dir: "egress", token: "allow@dns::53"},
+		{right: "dns:udp:", dir: "egress", token: "allow@dns:udp:"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.token, func(t *testing.T) {
@@ -1316,4 +1342,395 @@ type stubErrorRunner struct {
 
 func (s *stubErrorRunner) Run(ctx context.Context, req CommandRequest) (CommandResult, error) {
 	return CommandResult{Stderr: "simulated failure", ExitCode: 1}, s.err
+}
+
+func TestValidateNetArgsAndExplicitIPAllowOrdering(t *testing.T) {
+	if err := ValidateNetArgs(false, []string{"public"}); err != nil {
+		t.Fatalf("ValidateNetArgs(public): %v", err)
+	}
+	if err := ValidateNetArgs(true, nil); err != nil {
+		t.Fatalf("ValidateNetArgs(noNet): %v", err)
+	}
+	if err := ValidateNetArgs(true, []string{"public"}); err == nil {
+		t.Error("expected ValidateNetArgs conflict error for --no-net with --net public")
+	}
+	if err := ValidateNetArgs(false, []string{"allow@10.0.0.1/24"}); err == nil {
+		t.Error("expected ValidateNetArgs error for non-canonical IPv4 CIDR")
+	}
+	if err := ValidateNetArgs(false, []string{"allow@dns:"}); err == nil {
+		t.Error("expected ValidateNetArgs error for trailing-colon DNS rule")
+	}
+
+	// Non-metadata private/CGNAT/loopback IP and CIDR allows must precede broad group denies
+	// while remaining strictly behind deny@meta and metadata CIDRs.
+	nonMetaArgs, err := buildNetArgs(false, []string{
+		"public",
+		"allow@10.0.0.5:tcp:5432",
+		"allow@192.168.1.0/24:tcp:443",
+		"allow@100.64.0.5:tcp:8080",
+		"allow@[fd00:1::1]:tcp:443",
+	})
+	if err != nil {
+		t.Fatalf("buildNetArgs(non-metadata IP allows): %v", err)
+	}
+	assertAllNetRuleTokensValid(t, nonMetaArgs)
+	joined := strings.Join(nonMetaArgs, " ")
+
+	for _, metaDeny := range []string{
+		"deny@meta",
+		"deny@100.100.100.200/32",
+		"deny@168.63.129.16/32",
+		"deny@169.254.0.0/16",
+		"deny@[fd00:ec2::254/128]",
+	} {
+		if strings.Count(joined, metaDeny) != 1 {
+			t.Errorf("expected single %q in %q", metaDeny, joined)
+		}
+		metaIdx := strings.Index(joined, metaDeny)
+		for _, ipAllow := range []string{
+			"allow@10.0.0.5:tcp:5432",
+			"allow@192.168.1.0/24:tcp:443",
+			"allow@100.64.0.5:tcp:8080",
+			"allow@[fd00:1::1]:tcp:443",
+		} {
+			ipIdx := strings.Index(joined, ipAllow)
+			if metaIdx < 0 || ipIdx < 0 || metaIdx > ipIdx {
+				t.Errorf("expected %q before %q in %q", metaDeny, ipAllow, joined)
+			}
+		}
+	}
+	for _, broadDeny := range []string{"deny@loopback", "deny@private", "deny@100.64.0.0/10"} {
+		denyIdx := strings.Index(joined, broadDeny)
+		for _, ipAllow := range []string{
+			"allow@10.0.0.5:tcp:5432",
+			"allow@192.168.1.0/24:tcp:443",
+			"allow@100.64.0.5:tcp:8080",
+			"allow@[fd00:1::1]:tcp:443",
+		} {
+			ipIdx := strings.Index(joined, ipAllow)
+			if denyIdx < 0 || ipIdx < 0 || ipIdx > denyIdx {
+				t.Errorf("expected %q before %q in %q", ipAllow, broadDeny, joined)
+			}
+		}
+	}
+
+	// Metadata-overlapping and IPv4-mapped/NAT64 IP/CIDR allows must stay behind all metadata denies.
+	for _, metaOverlap := range []string{
+		"allow@169.254.169.254:tcp:80",
+		"allow@100.100.100.200:tcp:80",
+		"allow@168.63.129.16:tcp:80",
+		"allow@[fd00:ec2::254]:tcp:80",
+		"allow@100.64.0.0/10:tcp:80",
+		"allow@0.0.0.0/0:tcp:80",
+		"allow@[::ffff:169.254.169.254]:tcp:80",
+		"allow@[64:ff9b::a9fe:a9fe]:tcp:80",
+	} {
+		t.Run(metaOverlap, func(t *testing.T) {
+			args, err := buildNetArgs(false, []string{"public", metaOverlap})
+			if err != nil {
+				t.Fatalf("buildNetArgs(%s): %v", metaOverlap, err)
+			}
+			assertAllNetRuleTokensValid(t, args)
+			s := strings.Join(args, " ")
+			allowIdx := strings.Index(s, metaOverlap)
+			for _, denyTok := range []string{
+				"deny@meta",
+				"deny@169.254.0.0/16",
+				"deny@100.100.100.200/32",
+				"deny@168.63.129.16/32",
+				"deny@[fd00:ec2::254/128]",
+				"deny@[::ffff:0:0/96]",
+				"deny@[64:ff9b::/96]",
+			} {
+				denyIdx := strings.Index(s, denyTok)
+				if denyIdx < 0 || allowIdx < 0 || denyIdx > allowIdx {
+					t.Errorf("expected %q before %q in %q", denyTok, metaOverlap, s)
+				}
+			}
+		})
+	}
+}
+
+func TestFormatEnvExportsInvalidKeyRejection(t *testing.T) {
+	envMap := map[string]string{
+		"VALID_KEY_1": "ok",
+		"_PRIVATE":    "ok2",
+		"1BAD":        "v1",
+		"FOO=BAR":     "v2",
+		"A;id":        "v3",
+		"A B":         "v4",
+		"-FLAG":       "v5",
+		"BAD-KEY":     "v6",
+	}
+	script, count := FormatEnvExports(func(k string) string { return envMap[k] }, []string{
+		"VALID_KEY_1",
+		"_PRIVATE",
+		"1BAD",
+		"FOO=BAR",
+		"A;id",
+		"A B",
+		"-FLAG",
+		"BAD-KEY",
+	})
+	if count != 2 {
+		t.Fatalf("count = %d, want 2 (script=%q)", count, script)
+	}
+	for _, valid := range []string{"export VALID_KEY_1='ok'\n", "export _PRIVATE='ok2'\n"} {
+		if !strings.Contains(script, valid) {
+			t.Errorf("missing %q in %q", valid, script)
+		}
+	}
+	for _, invalid := range []string{"1BAD", "FOO=BAR", "A;id", "A B", "-FLAG", "BAD-KEY"} {
+		if strings.Contains(script, invalid) {
+			t.Errorf("unexpected invalid key %q in %q", invalid, script)
+		}
+	}
+}
+
+func TestBuildExecArgsStreamModes(t *testing.T) {
+	streamNoStdin := BuildExecArgs(ExecCmdOpts{
+		Sandbox: "agbox-run-1",
+		Stream:  true,
+		NoStdin: true,
+		Command: []string{"echo", "hi"},
+	})
+	wantNoStdin := []string{"exec", "--stream", "--no-stdin", "-u", "agent", "agbox-run-1", "--", "echo", "hi"}
+	if !slices.Equal(streamNoStdin, wantNoStdin) {
+		t.Errorf("BuildExecArgs(Stream+NoStdin) = %v, want %v", streamNoStdin, wantNoStdin)
+	}
+
+	streamWithStdin := BuildExecArgs(ExecCmdOpts{
+		Sandbox: "agbox-run-1",
+		Stream:  true,
+		NoStdin: false,
+		Command: []string{"cat"},
+	})
+	wantWithStdin := []string{"exec", "--stream", "-u", "agent", "agbox-run-1", "--", "cat"}
+	if !slices.Equal(streamWithStdin, wantWithStdin) {
+		t.Errorf("BuildExecArgs(Stream+Stdin) = %v, want %v", streamWithStdin, wantWithStdin)
+	}
+}
+
+func TestRetryHighTrafficHookPythonExecution(t *testing.T) {
+	pyBin, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not installed")
+	}
+
+	fullScript := ProvisionAgyRetryHookScript()
+	startMarker := "#!/usr/bin/env python3\n"
+	startIdx := strings.Index(fullScript, startMarker)
+	if startIdx < 0 {
+		t.Fatal("cannot find python script start in ProvisionAgyRetryHookScript")
+	}
+	rest := fullScript[startIdx:]
+	endIdx := strings.Index(rest, "\nEOF\n")
+	if endIdx < 0 {
+		t.Fatal("cannot find python script EOF in ProvisionAgyRetryHookScript")
+	}
+	pySource := strings.Replace(rest[:endIdx], "SLEEP_SECONDS = 60", "SLEEP_SECONDS = 0", 1)
+	if !strings.Contains(pySource, "Continue the previous task.") {
+		t.Fatalf("expected ASD-STE100 prompt in retry hook script:\n%s", pySource)
+	}
+
+	scriptPath := filepath.Join(t.TempDir(), "retry-high-traffic.py")
+	if err := os.WriteFile(scriptPath, []byte(pySource+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name         string
+		stdin        string
+		wantDecision string
+		wantReason   string
+	}{
+		{
+			name:         "normal high traffic retry",
+			stdin:        `{"terminationReason":"ERROR","error":"503 Service Unavailable: high traffic","executionNum":1}`,
+			wantDecision: `"decision": "continue"`,
+			wantReason:   "Continue the previous task.",
+		},
+		{
+			name:         "max retries reached stops",
+			stdin:        `{"terminationReason":"ERROR","error":"503 capacity","executionNum":5}`,
+			wantDecision: `"decision": "stop"`,
+		},
+		{
+			name:         "non-matching error stops",
+			stdin:        `{"terminationReason":"ERROR","error":"invalid api key","executionNum":0}`,
+			wantDecision: `"decision": "stop"`,
+		},
+		{
+			name:         "null executionNum retries",
+			stdin:        `{"terminationReason":"ERROR","error":"unavailable","executionNum":null}`,
+			wantDecision: `"decision": "continue"`,
+		},
+		{
+			name:         "non-numeric executionNum falls back to zero",
+			stdin:        `{"terminationReason":"ERROR","error":"capacity limit","executionNum":"bad"}`,
+			wantDecision: `"decision": "continue"`,
+		},
+		{
+			name:         "non-string error dict handled safely",
+			stdin:        `{"terminationReason":"ERROR","error":{"code":503,"msg":"high traffic"},"executionNum":0}`,
+			wantDecision: `"decision": "continue"`,
+		},
+		{
+			name:         "non-string error int handled safely",
+			stdin:        `{"terminationReason":"ERROR","error":503,"executionNum":0}`,
+			wantDecision: `"decision": "continue"`,
+		},
+		{
+			name:         "null error stops cleanly",
+			stdin:        `{"terminationReason":"ERROR","error":null,"executionNum":0}`,
+			wantDecision: `"decision": "stop"`,
+		},
+		{
+			name:         "empty stdin stops cleanly",
+			stdin:        "",
+			wantDecision: `"decision": "stop"`,
+		},
+		{
+			name:         "invalid JSON stops cleanly",
+			stdin:        "{not-json",
+			wantDecision: `"decision": "stop"`,
+		},
+		{
+			name:         "non-object JSON array stops cleanly",
+			stdin:        `["ERROR","503"]`,
+			wantDecision: `"decision": "stop"`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(pyBin, scriptPath)
+			cmd.Stdin = strings.NewReader(tc.stdin)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("python3 execution failed: %v (output=%q)", err, string(out))
+			}
+			got := strings.TrimSpace(string(out))
+			if !strings.Contains(got, tc.wantDecision) {
+				t.Errorf("output = %q, want substring %q", got, tc.wantDecision)
+			}
+			if tc.wantReason != "" && !strings.Contains(got, tc.wantReason) {
+				t.Errorf("output = %q, want reason %q", got, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestBuildNetArgsScopedGroupRulesKeepMetadataBlocked(t *testing.T) {
+	// Port-scoped link-local allows must stay behind deny@meta and cloud metadata CIDRs
+	// including 169.254.169.254/32, while preceding deny@link-local and deny@169.254.0.0/16.
+	for _, specs := range [][]string{
+		{"allow@link-local:tcp:80"},
+		{"public", "allow@link-local:tcp:80"},
+	} {
+		args, err := buildNetArgs(false, specs)
+		if err != nil {
+			t.Fatalf("buildNetArgs(%v): %v", specs, err)
+		}
+		assertAllNetRuleTokensValid(t, args)
+		joined := strings.Join(args, " ")
+		allowIdx := strings.Index(joined, "allow@link-local:tcp:80")
+		for _, metaDeny := range []string{
+			"deny@meta",
+			"deny@100.100.100.200/32",
+			"deny@168.63.129.16/32",
+			"deny@169.254.169.254/32",
+			"deny@[fd00:ec2::254/128]",
+		} {
+			denyIdx := strings.Index(joined, metaDeny)
+			if denyIdx < 0 || allowIdx < 0 || denyIdx > allowIdx {
+				t.Errorf("specs=%v: expected %q before allow@link-local:tcp:80 in %q", specs, metaDeny, joined)
+			}
+		}
+		for _, laterDeny := range []string{
+			"deny@link-local",
+			"deny@169.254.0.0/16",
+			"deny@[fe80::/10]",
+		} {
+			denyIdx := strings.Index(joined, laterDeny)
+			if denyIdx < 0 || allowIdx > denyIdx {
+				t.Errorf("specs=%v: expected allow@link-local:tcp:80 before %q in %q", specs, laterDeny, joined)
+			}
+		}
+	}
+
+	// Port-scoped private allows must stay behind deny@meta and all cloud metadata CIDRs,
+	// including [fd00:ec2::254/128], while preceding deny@private and deny@100.64.0.0/10.
+	for _, specs := range [][]string{
+		{"allow@private:tcp:80"},
+		{"public", "allow@private:tcp:80"},
+	} {
+		args, err := buildNetArgs(false, specs)
+		if err != nil {
+			t.Fatalf("buildNetArgs(%v): %v", specs, err)
+		}
+		assertAllNetRuleTokensValid(t, args)
+		joined := strings.Join(args, " ")
+		allowIdx := strings.Index(joined, "allow@private:tcp:80")
+		for _, metaDeny := range []string{
+			"deny@meta",
+			"deny@100.100.100.200/32",
+			"deny@168.63.129.16/32",
+			"deny@169.254.0.0/16",
+			"deny@[fd00:ec2::254/128]",
+		} {
+			if strings.Count(joined, metaDeny) != 1 {
+				t.Errorf("specs=%v: expected single %q in %q", specs, metaDeny, joined)
+			}
+			denyIdx := strings.Index(joined, metaDeny)
+			if denyIdx < 0 || allowIdx < 0 || denyIdx > allowIdx {
+				t.Errorf("specs=%v: expected %q before allow@private:tcp:80 in %q", specs, metaDeny, joined)
+			}
+		}
+		for _, laterDeny := range []string{"deny@private", "deny@100.64.0.0/10"} {
+			denyIdx := strings.Index(joined, laterDeny)
+			if denyIdx < 0 || allowIdx > denyIdx {
+				t.Errorf("specs=%v: expected allow@private:tcp:80 before %q in %q", specs, laterDeny, joined)
+			}
+		}
+	}
+
+	// Explicit port-scoped meta allows must remain ahead of deny@meta,
+	// while non-meta scoped group allows remain behind deny@meta.
+	for _, specs := range [][]string{
+		{"allow@meta:tcp:80"},
+		{"public", "allow@meta:tcp:80"},
+		{"public", "allow@meta:tcp:80", "allow@private:tcp:80", "allow@link-local:tcp:80"},
+	} {
+		args, err := buildNetArgs(false, specs)
+		if err != nil {
+			t.Fatalf("buildNetArgs(%v): %v", specs, err)
+		}
+		assertAllNetRuleTokensValid(t, args)
+		joined := strings.Join(args, " ")
+		metaAllowIdx := strings.Index(joined, "allow@meta:tcp:80")
+		denyMetaIdx := strings.Index(joined, "deny@meta")
+		if metaAllowIdx < 0 || denyMetaIdx < 0 || metaAllowIdx > denyMetaIdx {
+			t.Errorf("specs=%v: expected allow@meta:tcp:80 before deny@meta in %q", specs, joined)
+		}
+		for _, nonMeta := range []string{"allow@private:tcp:80", "allow@link-local:tcp:80"} {
+			if idx := strings.Index(joined, nonMeta); idx >= 0 && denyMetaIdx > idx {
+				t.Errorf("specs=%v: expected deny@meta before %q in %q", specs, nonMeta, joined)
+			}
+		}
+	}
+}
+
+func TestCategoryHugoAndRustHardening(t *testing.T) {
+	rustScript := scriptCategoryRust()
+	if !strings.Contains(rustScript, "-sSfL https://sh.rustup.rs") {
+		t.Errorf("expected -L flag in rustup curl command: %s", rustScript)
+	}
+	hugoScript := scriptCategoryHugo()
+	if !strings.Contains(hugoScript, "&& tar -C /usr/local/bin -xzf /tmp/hugo.tgz hugo; then") {
+		t.Errorf("expected hugo tar extraction inside if condition: %s", hugoScript)
+	}
+	if strings.Count(hugoScript, "rm -f /tmp/hugo.tgz") < 2 {
+		t.Errorf("expected /tmp/hugo.tgz cleanup in both success and failure branches: %s", hugoScript)
+	}
 }

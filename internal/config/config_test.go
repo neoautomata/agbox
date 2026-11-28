@@ -690,3 +690,180 @@ func TestFormatRunMetaPrefixAndNonBlockingFIFOOpen(t *testing.T) {
 		t.Fatal("LoadRunMeta blocked on FIFO without writer")
 	}
 }
+
+func TestFromLookupVersionTokenAndPathControlChars(t *testing.T) {
+	// Valid version tokens succeed.
+	for _, validVer := range []string{"latest", "1.19.5", "v2.0.0-rc.1+build_42"} {
+		env, err := FromLookup("/home/alice", func(k string) string {
+			if k == "AGBOX_OPENCODE_VERSION" {
+				return validVer
+			}
+			return ""
+		})
+		if err != nil || env.OpenCodeVersion != validVer {
+			t.Errorf("FromLookup(AGBOX_OPENCODE_VERSION=%q) = (%q, %v), want success", validVer, env.OpenCodeVersion, err)
+		}
+	}
+
+	// Shell metacharacters, leading dash/dot, and control chars in version fail.
+	for _, badVer := range []string{
+		"latest;id",
+		"$(id)",
+		"`id`",
+		"-v1.0.0",
+		".hidden",
+		"1.0/2",
+		"1.0|cat",
+		"1.0&bg",
+	} {
+		if _, err := FromLookup("/home/alice", func(k string) string {
+			if k == "AGBOX_OPENCODE_VERSION" {
+				return badVer
+			}
+			return ""
+		}); err == nil {
+			t.Errorf("expected error for invalid AGBOX_OPENCODE_VERSION %q", badVer)
+		}
+	}
+
+	// Control and bidi chars in homeReal, AGBOX_DATA_DIR, and MSB_HOME fail.
+	for _, badHome := range []string{"/home/alice\x07", "/home/alice\n", "/home/alice\u202E"} {
+		if _, err := FromLookup(badHome, func(string) string { return "" }); err == nil {
+			t.Errorf("expected error for homeReal %q", badHome)
+		}
+	}
+	for _, tc := range []struct {
+		key string
+		val string
+	}{
+		{"AGBOX_DATA_DIR", "/tmp/data\x07"},
+		{"AGBOX_DATA_DIR", "/tmp/data\n"},
+		{"AGBOX_DATA_DIR", "/tmp/data\u200B"},
+		{"AGBOX_DATA_DIR", "/tmp/data\u202E"},
+		{"MSB_HOME", "/tmp/msb\x01"},
+		{"MSB_HOME", "/tmp/msb\r"},
+		{"MSB_HOME", "/tmp/msb\uFEFF"},
+	} {
+		if _, err := FromLookup("/home/alice", func(k string) string {
+			if k == tc.key {
+				return tc.val
+			}
+			return ""
+		}); err == nil {
+			t.Errorf("expected error for %s=%q", tc.key, tc.val)
+		}
+	}
+}
+
+func TestValidateRunMetaCanonicalFieldsAndSingleFileVCS(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+	}{
+		{"uppercase VCS-HOOKS on ro share", `{"sandbox": "s1", "read_only": true, "shares": [{"index": 0, "guest_name": "repo", "is_dir": true, "vcs_policy": "VCS-HOOKS"}]}`},
+		{"uppercase VCS policy", `{"sandbox": "s1", "shares": [{"index": 0, "guest_name": "repo", "is_dir": true, "vcs_policy": "VCS"}]}`},
+		{"whitespace VCS policy", `{"sandbox": "s1", "shares": [{"index": 0, "guest_name": "repo", "is_dir": true, "vcs_policy": " mask "}]}`},
+		{"invalid mask_mode", `{"sandbox": "s1", "mask_mode": "STRICT"}`},
+		{"unknown mask_mode", `{"sandbox": "s1", "mask_mode": "bogus"}`},
+		{"single-file share with vcs policy", `{"sandbox": "s1", "shares": [{"index": 0, "guest_name": "note.md", "is_dir": false, "vcs_policy": "vcs"}]}`},
+		{"single-file share with vcs-hooks policy", `{"sandbox": "s1", "shares": [{"index": 0, "guest_name": "note.md", "is_dir": false, "vcs_policy": "vcs-hooks"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseRunMeta(strings.NewReader(tc.json)); err == nil {
+				t.Errorf("expected ParseRunMeta to reject %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestEnsurePrivateDirTrailingSlashRootAndStateLineEdges(t *testing.T) {
+	tmpDir := t.TempDir()
+	realDir := filepath.Join(tmpDir, "real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	symDir := filepath.Join(tmpDir, "sym")
+	if err := os.Symlink(realDir, symDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trailing slash on a symlinked directory must still be rejected.
+	if err := EnsurePrivateDir(symDir + "/"); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("EnsurePrivateDir(symDir+\"/\") = %v, want symlink error", err)
+	}
+
+	// Filesystem root "/" and "//" must be rejected.
+	for _, rootPath := range []string{"/", "//"} {
+		if err := EnsurePrivateDir(rootPath); err == nil {
+			t.Errorf("EnsurePrivateDir(%q) succeeded, want error", rootPath)
+		}
+	}
+
+	// SaveFile rejects \n and \r in State fields.
+	cfgPath := filepath.Join(tmpDir, "cfg")
+	for _, badState := range []State{
+		{Agent: "opencode\nimage=evil"},
+		{Image: "node:24\r\nsnapshot=bad"},
+		{Categories: "go\nrust"},
+	} {
+		if err := SaveFile(cfgPath, badState); err == nil {
+			t.Errorf("SaveFile(%+v) succeeded, want line-break error", badState)
+		}
+	}
+	// Format strips line breaks so direct callers cannot inject keys.
+	formatted := Format(State{Agent: "opencode\nimage=evil"})
+	if strings.Contains(formatted, "\nimage=evil") {
+		t.Errorf("Format allowed injected key line: %q", formatted)
+	}
+
+	// Parse accepts a config line longer than 64 KiB (up to maxStateFileBytes).
+	longCategories := strings.Repeat("a", 80*1024)
+	longCfg := "agent=opencode\ncategories=" + longCategories + "\n"
+	parsed, err := Parse(strings.NewReader(longCfg))
+	if err != nil {
+		t.Fatalf("Parse(>64KiB line) failed: %v", err)
+	}
+	if parsed.Agent != "opencode" || parsed.Categories != longCategories {
+		t.Errorf("Parse(>64KiB line) returned Agent=%q len(Categories)=%d, want opencode and %d", parsed.Agent, len(parsed.Categories), len(longCategories))
+	}
+}
+
+func TestResolveLongestExistingAncestorRelativeDanglingUnderSymlinkedParent(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	realConfig := filepath.Join(base, "dotfiles", "config")
+	targetParent := filepath.Join(base, "dotfiles", "state-store")
+	for _, d := range []string{realConfig, targetParent} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(realConfig, filepath.Join(base, "config-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../state-store/missing", filepath.Join(realConfig, "agbox")); err != nil {
+		t.Fatal(err)
+	}
+
+	input := filepath.Join(base, "config-link", "agbox", "data")
+	want := filepath.Join(targetParent, "missing", "data")
+	if got := resolveLongestExistingAncestor(input); got != want {
+		t.Errorf("resolveLongestExistingAncestor(%q) = %q, want %q", input, got, want)
+	}
+
+	env, err := FromLookup(base, func(k string) string {
+		if k == "AGBOX_DATA_DIR" {
+			return input
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("FromLookup failed: %v", err)
+	}
+	if env.DataDir != want {
+		t.Errorf("FromLookup DataDir = %q, want %q", env.DataDir, want)
+	}
+}

@@ -93,9 +93,16 @@ func FromLookup(homeReal string, getenv func(string) string) (Env, error) {
 	if homeReal == "" {
 		return Env{}, errors.New("home directory path must not be empty")
 	}
+	if hasControlOrBidiChar(homeReal) {
+		return Env{}, fmt.Errorf("invalid home directory path %q: must not contain control characters", homeReal)
+	}
 	cleanHome := filepath.Clean(homeReal)
 
-	dataDirRaw := strings.TrimSpace(getenv("AGBOX_DATA_DIR"))
+	rawDataDir := getenv("AGBOX_DATA_DIR")
+	if hasControlOrBidiChar(rawDataDir) {
+		return Env{}, fmt.Errorf("invalid AGBOX_DATA_DIR %q: must not contain control characters", rawDataDir)
+	}
+	dataDirRaw := strings.TrimSpace(rawDataDir)
 	var dataDir string
 	if dataDirRaw == "" {
 		dataDir = filepath.Join(cleanHome, ".local", "share", "agbox")
@@ -106,8 +113,15 @@ func FromLookup(homeReal string, getenv func(string) string) (Env, error) {
 		dataDir = filepath.Clean(dataDirRaw)
 	}
 	dataDir = resolveLongestExistingAncestor(dataDir)
+	if hasControlOrBidiChar(dataDir) {
+		return Env{}, fmt.Errorf("invalid AGBOX_DATA_DIR %q: resolved path must not contain control characters", dataDir)
+	}
 
-	msbHomeRaw := strings.TrimSpace(getenv("MSB_HOME"))
+	rawMSBHome := getenv("MSB_HOME")
+	if hasControlOrBidiChar(rawMSBHome) {
+		return Env{}, fmt.Errorf("invalid MSB_HOME %q: must not contain control characters", rawMSBHome)
+	}
+	msbHomeRaw := strings.TrimSpace(rawMSBHome)
 	var msbHome string
 	if msbHomeRaw == "" {
 		msbHome = filepath.Join(cleanHome, ".microsandbox")
@@ -118,6 +132,9 @@ func FromLookup(homeReal string, getenv func(string) string) (Env, error) {
 		msbHome = filepath.Clean(msbHomeRaw)
 	}
 	msbHome = resolveLongestExistingAncestor(msbHome)
+	if hasControlOrBidiChar(msbHome) {
+		return Env{}, fmt.Errorf("invalid MSB_HOME %q: resolved path must not contain control characters", msbHome)
+	}
 
 	maskMode, err := ParseMaskMode(getenv("AGBOX_MASK_VCS"))
 	if err != nil {
@@ -150,8 +167,8 @@ func FromLookup(homeReal string, getenv func(string) string) (Env, error) {
 	}
 
 	openCodeVer := defaultIfEmpty(getenv("AGBOX_OPENCODE_VERSION"), DefaultOpenCodeVersion)
-	if hasUnsafeTokenChars(openCodeVer) {
-		return Env{}, fmt.Errorf("invalid AGBOX_OPENCODE_VERSION %q: must not contain whitespace or control characters", openCodeVer)
+	if !isValidVersionToken(openCodeVer) {
+		return Env{}, fmt.Errorf("invalid AGBOX_OPENCODE_VERSION %q: use only ASCII letters, digits, '.', '_', '+', and '-'", openCodeVer)
 	}
 
 	agyURL := defaultIfEmpty(getenv("AGBOX_AGY_INSTALLER_URL"), DefaultAgyInstallerURL)
@@ -200,7 +217,11 @@ func resolveLongestExistingAncestor(absPath string) string {
 					return p
 				}
 				if !filepath.IsAbs(target) {
-					target = filepath.Join(filepath.Dir(cur), target)
+					parentDir := filepath.Dir(cur)
+					if resolvedParent, pErr := filepath.EvalSymlinks(parentDir); pErr == nil {
+						parentDir = resolvedParent
+					}
+					target = filepath.Join(parentDir, target)
 				}
 				rel, relErr := filepath.Rel(cur, p)
 				if relErr != nil {
@@ -260,6 +281,7 @@ type State struct {
 func Parse(r io.Reader) (State, error) {
 	var st State
 	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), maxStateFileBytes)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -321,8 +343,32 @@ func LoadFile(path string) (State, error) {
 	return Parse(bytes.NewReader(raw))
 }
 
+func validateState(st State) error {
+	fields := []struct {
+		name string
+		val  string
+	}{
+		{"agent", st.Agent},
+		{"image", st.Image},
+		{"snapshot", st.Snapshot},
+		{"cpus", st.CPUs},
+		{"memory", st.Memory},
+		{"root_disk", st.RootDisk},
+		{"categories", st.Categories},
+	}
+	for _, f := range fields {
+		if strings.ContainsAny(f.val, "\r\n") {
+			return fmt.Errorf("invalid config field %q: must not contain line breaks", f.name)
+		}
+	}
+	return nil
+}
+
 // SaveFile writes State atomically at mode 0600 and sets parent directories to 0700.
 func SaveFile(path string, st State) error {
+	if err := validateState(st); err != nil {
+		return err
+	}
 	return saveBytesAtomic(path, []byte(Format(st)))
 }
 
@@ -445,6 +491,13 @@ func validateRunMeta(meta RunMeta, op string) error {
 			return fmt.Errorf("%s: invalid mode %q", op, meta.Mode)
 		}
 	}
+	if meta.MaskMode != "" {
+		switch meta.MaskMode {
+		case MaskStrict, MaskAuto, MaskOff:
+		default:
+			return fmt.Errorf("%s: invalid mask_mode %q", op, meta.MaskMode)
+		}
+	}
 	for _, sh := range meta.Shares {
 		if sh.Index < 0 {
 			return fmt.Errorf("%s: negative share index %d", op, sh.Index)
@@ -453,9 +506,14 @@ func validateRunMeta(meta RunMeta, op string) error {
 			return fmt.Errorf("%s: invalid share access_mode %q", op, sh.AccessMode)
 		}
 		if sh.VCSPolicy != "" {
-			if _, err := ParseVCSPolicy(string(sh.VCSPolicy)); err != nil {
-				return fmt.Errorf("%s: %w", op, err)
+			switch sh.VCSPolicy {
+			case VCSMask, VCSAllow, VCSAllowHooks:
+			default:
+				return fmt.Errorf("%s: invalid share vcs_policy %q", op, sh.VCSPolicy)
 			}
+		}
+		if !sh.IsDir && sh.EffectiveVCSPolicy() != VCSMask {
+			return fmt.Errorf("%s: single-file share %q must use mask VCS policy", op, sh.GuestName)
 		}
 		if meta.MaskMode != MaskOff && sh.EffectiveReadOnly(meta.ReadOnly) && sh.EffectiveVCSPolicy() == VCSAllowHooks {
 			return fmt.Errorf("%s: read-only share %q cannot enable vcs-hooks", op, sh.GuestName)
@@ -543,7 +601,11 @@ func EnsurePrivateDir(dir string) error {
 	if dir == "" {
 		return errors.New("private directory path must not be empty")
 	}
-	if info, err := os.Lstat(dir); err == nil {
+	cleanDir := filepath.Clean(dir)
+	if cleanDir == "/" {
+		return fmt.Errorf("refusing root directory %q", dir)
+	}
+	if info, err := os.Lstat(cleanDir); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("refusing symlinked directory %q", dir)
 		}
@@ -553,10 +615,10 @@ func EnsurePrivateDir(dir string) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat dir %q: %w", dir, err)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(cleanDir, 0o700); err != nil {
 		return fmt.Errorf("create dir %q: %w", dir, err)
 	}
-	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	fd, err := syscall.Open(cleanDir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
 			return fmt.Errorf("refusing symlink or non-directory %q: %w", dir, err)
@@ -679,6 +741,32 @@ func isValidSizeSpec(spec string) bool {
 	return err == nil && n > 0
 }
 
+func hasControlOrBidiChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+		if (r >= 0x200B && r <= 0x200F) || (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) || r == 0xFEFF {
+			return true
+		}
+	}
+	return false
+}
+
+func isValidVersionToken(s string) bool {
+	if s == "" || s[0] == '-' || s[0] == '.' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !isAlphaNum && c != '.' && c != '_' && c != '+' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
 func hasUnsafeTokenChars(s string) bool {
 	if s == "" {
 		return true
@@ -703,6 +791,7 @@ func defaultIfEmpty(val, fallback string) string {
 }
 
 func writeKV(b *strings.Builder, k, v string) {
+	v = strings.NewReplacer("\r", "", "\n", "").Replace(v)
 	if v != "" {
 		b.WriteString(k)
 		b.WriteByte('=')

@@ -13,6 +13,7 @@ import (
 
 	"agbox/internal/complete"
 	"agbox/internal/config"
+	"agbox/internal/service"
 )
 
 func TestCompletionCommand(t *testing.T) {
@@ -255,5 +256,104 @@ func TestHiddenCompleteMissingDataDirDoesNotCreate(t *testing.T) {
 	}
 	if _, err := os.Stat(missingDir); !os.IsNotExist(err) {
 		t.Fatalf("expected %s to remain absent, stat err=%v", missingDir, err)
+	}
+}
+
+func TestCompletionRootGuardSuspendedPrecedenceServicesAndSymlinkRunDir(t *testing.T) {
+	// 1. Root guard on `agbox completion bash` without --allow-root.
+	var stdout, stderr bytes.Buffer
+	rootApp := &appRuntime{
+		Env:     config.Env{DataDir: t.TempDir()},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+		GetEUID: func() int { return 0 },
+	}
+	if rc := rootApp.dispatch(context.Background(), []string{"completion", "bash"}); rc == 0 {
+		t.Fatal("expected completion bash as root without --allow-root to fail")
+	}
+	if !strings.Contains(stderr.String(), "do not run as root") {
+		t.Fatalf("expected root guard error, got %q", stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if rc := rootApp.dispatch(context.Background(), []string{"completion", "--allow-root", "bash"}); rc != 0 {
+		t.Fatalf("expected completion --allow-root bash to succeed, rc=%d stderr=%q", rc, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "_agbox_completions") {
+		t.Fatalf("unexpected completion output: %q", stdout.String())
+	}
+
+	// 2. Suspended sandbox with both run.meta and suspended: hide from running and read shares from suspended.
+	dataDir := t.TempDir()
+	bothDir := filepath.Join(dataDir, "run", "dual")
+	if err := os.MkdirAll(bothDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(bothDir, "run.meta"), config.RunMeta{
+		Sandbox:      "agbox-dual",
+		WorkspaceHub: true,
+		Shares:       []config.ShareRecord{{GuestName: "stale-share", HostPath: "/tmp/stale"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(bothDir, "suspended"), config.RunMeta{
+		Sandbox:      "agbox-dual",
+		WorkspaceHub: true,
+		Shares:       []config.ShareRecord{{GuestName: "fresh-share", HostPath: "/tmp/fresh"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := listCompletionSandboxes(dataDir, complete.SandboxRunning); len(got) != 0 {
+		t.Errorf("SandboxRunning returned suspended sandbox with run.meta: %v", got)
+	}
+	if got := listCompletionSandboxes(dataDir, complete.SandboxSuspended); strings.Join(got, ",") != "agbox-dual" {
+		t.Errorf("SandboxSuspended = %v, want [agbox-dual]", got)
+	}
+	if got := listCompletionSandboxes(dataDir, complete.SandboxAll); strings.Join(got, ",") != "agbox-dual" {
+		t.Errorf("SandboxAll = %v, want [agbox-dual]", got)
+	}
+	if got := listCompletionShares(dataDir, "agbox-dual", 50*time.Millisecond); strings.Join(got, ",") != "fresh-share" {
+		t.Errorf("listCompletionShares = %v, want [fresh-share] from suspended", got)
+	}
+
+	// 3. listCompletionServices returns sorted service names via __complete.
+	for _, svcName := range []string{"zeta", "alpha"} {
+		if err := service.SaveSpec(dataDir, service.Spec{
+			Name:  svcName,
+			Agent: "antigravity",
+			Mode:  config.RunModeRemoteControl,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stdout.Reset()
+	stderr.Reset()
+	svcApp := &appRuntime{
+		Env:    config.Env{DataDir: dataDir},
+		Stdout: &stdout,
+		Stderr: &stderr,
+	}
+	if rc := svcApp.dispatch(context.Background(), []string{complete.SubcommandName, "--", "service", "start", ""}); rc != 0 {
+		t.Fatalf("__complete service start exited %d, stderr=%q", rc, stderr.String())
+	}
+	if stdout.String() != "alpha\nzeta\n:nofiles\n" {
+		t.Errorf("__complete service start = %q, want alpha/zeta", stdout.String())
+	}
+
+	// 4. Symlinked run/ directory is ignored safely.
+	symData := t.TempDir()
+	realRun := filepath.Join(t.TempDir(), "real-run")
+	if err := os.MkdirAll(filepath.Join(realRun, "leak"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveRunMeta(filepath.Join(realRun, "leak", "run.meta"), config.RunMeta{Sandbox: "agbox-leak"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRun, filepath.Join(symData, "run")); err != nil {
+		t.Fatal(err)
+	}
+	if got := listCompletionSandboxes(symData, complete.SandboxAll); len(got) != 0 {
+		t.Errorf("listCompletionSandboxes followed symlinked run/ dir: %v", got)
 	}
 }

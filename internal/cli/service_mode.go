@@ -165,15 +165,20 @@ func parseServiceArgs(args []string) (serviceOpts, error) {
 	case "logs":
 		opts.Action = "logs"
 		var pos []string
+		sawLines := false
 		for i := 0; i < len(tail); i++ {
 			if val, ok, err := consumeFlagValue(tail, &i, "-n", "--lines"); ok {
 				if err != nil {
 					return serviceOpts{}, errors.New("--lines requires a positive integer")
 				}
+				if sawLines {
+					return serviceOpts{}, errors.New("duplicate --lines flag")
+				}
 				n, nErr := strconv.Atoi(val)
 				if nErr != nil || !isDigits(val) || n < 1 {
 					return serviceOpts{}, errors.New("--lines must be a positive integer")
 				}
+				sawLines = true
 				opts.Lines = n
 				continue
 			}
@@ -261,15 +266,37 @@ func parseServiceArgs(args []string) (serviceOpts, error) {
 	}
 }
 
+func isRunValueFlag(arg string) (exact bool, withEquals bool) {
+	switch arg {
+	case "--name", "--share", "--profile", "--session", "--conversation", "-s",
+		"--port", "--cmd", "--net", "--net-rule", "--cpus", "--memory":
+		return true, false
+	}
+	for _, prefix := range []string{
+		"--name=", "--share=", "--profile=", "--session=", "--conversation=",
+		"--port=", "--cmd=", "--net=", "--net-rule=", "--cpus=", "--memory=",
+	} {
+		if strings.HasPrefix(arg, prefix) {
+			return false, true
+		}
+	}
+	return false, false
+}
+
 func parseServiceAddArgs(opts serviceOpts, args []string) (serviceOpts, error) {
 	// Parse service-specific flags until the service <name> positional token.
-	// Everything after <name> is passed to parseRunArgs as run options and share paths.
+	// Pass tokens after <name> to parseRunArgs as run options and share paths.
 	nameIdx := -1
+	sawEnvFile := false
 	for i := 0; i < len(args); i++ {
 		if val, ok, err := consumeFlagValue(args, &i, "--env-file"); ok {
 			if err != nil || strings.TrimSpace(val) == "" {
 				return serviceOpts{}, errors.New("--env-file requires a file path")
 			}
+			if sawEnvFile {
+				return serviceOpts{}, errors.New("duplicate --env-file flag")
+			}
+			sawEnvFile = true
 			opts.EnvFile = val
 			continue
 		}
@@ -310,15 +337,29 @@ func parseServiceAddArgs(opts serviceOpts, args []string) (serviceOpts, error) {
 	// Also allow service-specific flags immediately after <name> before paths.
 	rawRun := args[nameIdx+1:]
 	filteredRun := make([]string, 0, len(rawRun))
+	sawAgent := false
+	sawPositional := false
 	for i := 0; i < len(rawRun); i++ {
-		if rawRun[i] == "--" {
+		if sawPositional || rawRun[i] == "--" {
 			filteredRun = append(filteredRun, rawRun[i:]...)
 			break
+		}
+		if exact, withEq := isRunValueFlag(rawRun[i]); exact || withEq {
+			filteredRun = append(filteredRun, rawRun[i])
+			if exact && i+1 < len(rawRun) {
+				i++
+				filteredRun = append(filteredRun, rawRun[i])
+			}
+			continue
 		}
 		if val, ok, err := consumeFlagValue(rawRun, &i, "--env-file"); ok {
 			if err != nil || strings.TrimSpace(val) == "" {
 				return serviceOpts{}, errors.New("--env-file requires a file path")
 			}
+			if sawEnvFile {
+				return serviceOpts{}, errors.New("duplicate --env-file flag")
+			}
+			sawEnvFile = true
 			opts.EnvFile = val
 			continue
 		}
@@ -335,6 +376,13 @@ func parseServiceAddArgs(opts serviceOpts, args []string) (serviceOpts, error) {
 		case "--allow-root":
 			opts.AllowRoot = true
 		default:
+			if !strings.HasPrefix(rawRun[i], "-") {
+				if (rawRun[i] == "opencode" || rawRun[i] == "antigravity") && !sawAgent {
+					sawAgent = true
+				} else {
+					sawPositional = true
+				}
+			}
 			filteredRun = append(filteredRun, rawRun[i])
 		}
 	}
@@ -413,6 +461,7 @@ func (a *appRuntime) ensureTemplateUnitInstalled(ctx context.Context) (string, e
 		MSBHome:          a.Env.MSBHome,
 		PathEnv:          a.buildServicePathEnv(),
 		AllowOutsideHome: a.Env.AllowOutsideHome,
+		AllowRoot:        a.isRoot() || a.Env.AllowRoot,
 	})
 	if err != nil {
 		return "", err
@@ -468,12 +517,16 @@ func (a *appRuntime) serviceAdd(ctx context.Context, opts serviceOpts) error {
 		}
 	}
 
-	for _, rawArg := range opts.RunArgs {
+	for i := 0; i < len(opts.RunArgs); i++ {
+		rawArg := opts.RunArgs[i]
 		if rawArg == "--" {
 			break
 		}
 		if rawArg == "--name" || strings.HasPrefix(rawArg, "--name=") {
 			return errors.New("do not pass --name to 'agbox service add'. The service name sets the sandbox name")
+		}
+		if exact, _ := isRunValueFlag(rawArg); exact && i+1 < len(opts.RunArgs) {
+			i++
 		}
 	}
 
@@ -523,8 +576,12 @@ func (a *appRuntime) serviceAdd(ctx context.Context, opts serviceOpts) error {
 	}
 	canonicalShares := make([]string, 0, len(validated))
 	for _, sh := range validated {
-		specStr := fmt.Sprintf("%s:%s,%s,as=%s", sh.HostPath, shareAccessMode(sh.ReadOnly), sh.VCSPolicy, sh.GuestName)
-		canonicalShares = append(canonicalShares, specStr)
+		mods := []string{shareAccessMode(sh.ReadOnly)}
+		if runOpts.MaskMode != config.MaskOff && sh.IsDir {
+			mods = append(mods, string(sh.VCSPolicy))
+		}
+		mods = append(mods, "as="+sh.GuestName)
+		canonicalShares = append(canonicalShares, fmt.Sprintf("%s:%s", sh.HostPath, strings.Join(mods, ",")))
 	}
 
 	var envFilePath string
@@ -561,9 +618,9 @@ func (a *appRuntime) serviceAdd(ctx context.Context, opts serviceOpts) error {
 		Profile:      runOpts.Profile,
 		ShareHub:     runOpts.ShareHub,
 		ReadOnly:     runOpts.ReadOnly,
-		LockAccess:   runOpts.LockAccess,
+		LockAccess:   false,
 		DefaultVCS:   runOpts.DefaultVCS,
-		LockVCS:      runOpts.LockVCS,
+		LockVCS:      false,
 		MaskMode:     runOpts.MaskMode,
 		Shares:       canonicalShares,
 		NoNet:        runOpts.NoNet,
@@ -577,12 +634,11 @@ func (a *appRuntime) serviceAdd(ctx context.Context, opts serviceOpts) error {
 		EnvFile:      envFilePath,
 	}
 
-	if err := service.SaveSpec(a.Env.DataDir, spec); err != nil {
-		return err
-	}
-
 	unitPath, err := a.ensureTemplateUnitInstalled(ctx)
 	if err != nil {
+		return err
+	}
+	if err := service.SaveSpec(a.Env.DataDir, spec); err != nil {
 		return err
 	}
 	ctl := a.serviceController()
@@ -641,10 +697,10 @@ func (a *appRuntime) ensureLingerBestEffort(ctx context.Context, ctl service.Con
 		return
 	}
 	if err := ctl.EnableLinger(ctx, username); err != nil {
-		a.warnf("Could not enable user linger automatically (%v). Run 'sudo loginctl enable-linger %s' so services start at boot without login and persist after logout.", err, username)
+		a.warnf("Could not enable user linger (%v). Run 'sudo loginctl enable-linger %s'. Services then start at boot and stay active after logout.", err, username)
 		return
 	}
-	a.logf("Enabled systemd user linger for %s (starts at boot without login and persists after logout).", username)
+	a.logf("Enabled user linger for %s. Services now start at boot and stay active after logout.", username)
 }
 
 func (a *appRuntime) serviceDisable(ctx context.Context, opts serviceOpts) error {
@@ -695,6 +751,17 @@ func (a *appRuntime) serviceLogs(ctx context.Context, opts serviceOpts) error {
 	return a.serviceController().Logs(ctx, service.UnitName(opts.Name), opts.Follow, opts.Lines, a.Stdout, a.Stderr)
 }
 
+func isSystemdUnitNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such file or directory") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "not loaded")
+}
+
 func (a *appRuntime) serviceRemove(ctx context.Context, opts serviceOpts) error {
 	if _, err := service.LoadSpec(a.Env.DataDir, opts.Name); err != nil {
 		if os.IsNotExist(err) {
@@ -705,10 +772,11 @@ func (a *appRuntime) serviceRemove(ctx context.Context, opts serviceOpts) error 
 
 	ctl := a.serviceController()
 	unit := service.UnitName(opts.Name)
-	if err := ctl.Disable(ctx, unit, true); err != nil {
+	if err := ctl.Disable(ctx, unit, true); err != nil && !isSystemdUnitNotFound(err) {
 		if !opts.Force {
-			a.warnf("Could not disable/stop %s (%v). Continuing to delete service spec.", unit, err)
+			return fmt.Errorf("disable or stop %s (pass --force to delete the spec anyway): %w", unit, err)
 		}
+		a.warnf("Could not disable or stop %s (%v). Continuing because --force is active.", unit, err)
 	}
 	if err := service.DeleteSpec(a.Env.DataDir, opts.Name); err != nil {
 		return err
@@ -724,7 +792,7 @@ func (a *appRuntime) serviceRemove(ctx context.Context, opts serviceOpts) error 
 			}
 		}
 	}
-	a.logf("Removed service %s.", opts.Name)
+	a.logf("Deleted service %s.", opts.Name)
 	return nil
 }
 
@@ -798,7 +866,11 @@ func (a *appRuntime) serviceList(ctx context.Context) error {
 
 func (a *appRuntime) printServiceStatus(ctx context.Context) {
 	specs, err := service.ListSpecs(a.Env.DataDir)
-	if err != nil || len(specs) == 0 {
+	if err != nil {
+		fmt.Fprintf(a.Stdout, "services: error (%v)\n", err)
+		return
+	}
+	if len(specs) == 0 {
 		return
 	}
 	names := make([]string, 0, len(specs))
@@ -828,7 +900,7 @@ func (a *appRuntime) cleanupManagedServices(ctx context.Context) {
 	for _, spec := range specs {
 		unit := service.UnitName(spec.Name)
 		if dErr := ctl.Disable(ctx, unit, true); dErr != nil {
-			a.warnf("Could not stop/disable %s during remove: %v", unit, dErr)
+			a.warnf("Could not stop or disable %s during remove: %v", unit, dErr)
 		}
 	}
 	if unitPath, pErr := a.serviceUnitPath(); pErr == nil {
@@ -948,7 +1020,7 @@ func (a *appRuntime) recoverStaleServiceSandbox(ctx context.Context, spec servic
 		return nil
 	}
 
-	// Non-persistent service: clean up stale stopped sandbox from a prior crash or reboot.
+	// Non-persistent service: delete a stale stopped sandbox from a prior crash or reboot.
 	if rmRes, rmErr := a.destroySandbox(ctx, sandbox, false, true); rmErr != nil {
 		return formatMSBError("delete stale sandbox "+sandbox, rmRes, rmErr)
 	}
@@ -957,7 +1029,7 @@ func (a *appRuntime) recoverStaleServiceSandbox(ctx context.Context, spec servic
 			return tdErr
 		}
 	}
-	a.logf("Cleaned stale stopped sandbox %s before fresh start.", sandbox)
+	a.logf("Deleted stale stopped sandbox %s before fresh start.", sandbox)
 	return nil
 }
 
@@ -998,7 +1070,7 @@ func isRemoteControlStatusHealthy(stdout, stderr string, err error) bool {
 	return true
 }
 
-func (a *appRuntime) superviseRemoteControl(ctx context.Context, sandbox, workDir string, envFlags []string, initialHealthy bool) error {
+func (a *appRuntime) superviseRemoteControl(ctx context.Context, sandbox, workDir string, envFlags []string, initialHealthy bool) (bool, error) {
 	threshold := a.serviceFailThreshold()
 	statusInner := fmt.Sprintf("%s cd %s && agy remote-control status", msb.KeyLoaderPrefix, msb.ShellQuote(workDir))
 	statusArgs := msb.BuildExecArgs(msb.ExecCmdOpts{
@@ -1025,20 +1097,20 @@ func (a *appRuntime) superviseRemoteControl(ctx context.Context, sandbox, workDi
 		select {
 		case <-ctx.Done():
 			a.notifySystemd("STOPPING=1")
-			return nil
+			return readySent, nil
 		case <-ticker.C:
 			var checkErr error
 			if pingRes, pErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ping", sandbox}}); pErr != nil {
 				if ctx.Err() != nil {
 					a.notifySystemd("STOPPING=1")
-					return nil
+					return readySent, nil
 				}
 				checkErr = formatMSBError("sandbox ping failed for "+sandbox, pingRes, pErr)
 			} else {
 				stRes, stErr := a.MSB.Run(ctx, msb.CommandRequest{Args: statusArgs})
 				if ctx.Err() != nil {
 					a.notifySystemd("STOPPING=1")
-					return nil
+					return readySent, nil
 				}
 				if !isRemoteControlStatusHealthy(stRes.Stdout, stRes.Stderr, stErr) {
 					if stErr != nil {
@@ -1063,13 +1135,13 @@ func (a *appRuntime) superviseRemoteControl(ctx context.Context, sandbox, workDi
 			a.warnf("Health check failed for %s (%d/%d): %v", sandbox, failures, threshold, checkErr)
 			if failures >= threshold {
 				a.notifySystemd("STOPPING=1")
-				return fmt.Errorf("health check failed %d consecutive times for %s: %w", failures, sandbox, checkErr)
+				return readySent, fmt.Errorf("health check failed %d consecutive times for %s: %w", failures, sandbox, checkErr)
 			}
 		}
 	}
 }
 
-func (a *appRuntime) superviseServe(ctx context.Context, sandbox string, port int, execArgs []string) error {
+func (a *appRuntime) superviseServe(ctx context.Context, sandbox string, port int, execArgs []string) (bool, error) {
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 
@@ -1085,6 +1157,7 @@ func (a *appRuntime) superviseServe(ctx context.Context, sandbox string, port in
 
 	var healthMu sync.Mutex
 	var healthErr error
+	var readyReached bool
 	setHealthErr := func(err error) {
 		healthMu.Lock()
 		if healthErr == nil {
@@ -1104,6 +1177,9 @@ func (a *appRuntime) superviseServe(ctx context.Context, sandbox string, port in
 			}
 			return
 		}
+		healthMu.Lock()
+		readyReached = true
+		healthMu.Unlock()
 		a.notifySystemd("READY=1")
 		a.notifySystemd("WATCHDOG=1")
 
@@ -1143,21 +1219,38 @@ func (a *appRuntime) superviseServe(ctx context.Context, sandbox string, port in
 	wg.Wait()
 	a.notifySystemd("STOPPING=1")
 
-	if ctx.Err() != nil {
-		return nil
-	}
 	healthMu.Lock()
 	hErr := healthErr
+	ready := readyReached
 	healthMu.Unlock()
-	if hErr != nil {
-		return hErr
+
+	if ctx.Err() != nil {
+		return ready, nil
 	}
-	return wrapPassthroughExit(res, err)
+	if hErr != nil {
+		return ready, hErr
+	}
+	if err == nil && res.ExitCode == 0 {
+		return ready, fmt.Errorf("opencode serve exited unexpectedly with status 0 in %s", sandbox)
+	}
+	return ready, wrapPassthroughExit(res, err)
 }
 
-func (a *appRuntime) superviseCmd(ctx context.Context, sandbox string, execArgs []string) error {
+func (a *appRuntime) superviseCmd(ctx context.Context, sandbox string, execArgs []string) (bool, error) {
 	cmdCtx, cancelCmd := context.WithCancel(ctx)
 	defer cancelCmd()
+
+	threshold := a.serviceFailThreshold()
+
+	var healthMu sync.Mutex
+	var healthErr error
+	setHealthErr := func(err error) {
+		healthMu.Lock()
+		if healthErr == nil {
+			healthErr = err
+		}
+		healthMu.Unlock()
+	}
 
 	a.notifySystemd("READY=1")
 	a.notifySystemd("WATCHDOG=1")
@@ -1166,6 +1259,7 @@ func (a *appRuntime) superviseCmd(ctx context.Context, sandbox string, execArgs 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		failures := 0
 		ticker := time.NewTicker(a.servicePollInterval())
 		defer ticker.Stop()
 		for {
@@ -1173,8 +1267,22 @@ func (a *appRuntime) superviseCmd(ctx context.Context, sandbox string, execArgs 
 			case <-cmdCtx.Done():
 				return
 			case <-ticker.C:
-				if _, pErr := a.MSB.Run(cmdCtx, msb.CommandRequest{Args: []string{"ping", sandbox}}); pErr == nil {
+				pingRes, pErr := a.MSB.Run(cmdCtx, msb.CommandRequest{Args: []string{"ping", sandbox}})
+				if pErr == nil {
+					failures = 0
 					a.notifySystemd("WATCHDOG=1")
+					continue
+				}
+				if cmdCtx.Err() != nil {
+					return
+				}
+				failures++
+				pingErr := formatMSBError("sandbox ping failed for "+sandbox, pingRes, pErr)
+				a.warnf("Health check failed for %s (%d/%d): %v", sandbox, failures, threshold, pingErr)
+				if failures >= threshold {
+					setHealthErr(fmt.Errorf("health check failed %d consecutive times for %s: %w", failures, sandbox, pingErr))
+					cancelCmd()
+					return
 				}
 			}
 		}
@@ -1189,10 +1297,17 @@ func (a *appRuntime) superviseCmd(ctx context.Context, sandbox string, execArgs 
 	wg.Wait()
 	a.notifySystemd("STOPPING=1")
 
+	healthMu.Lock()
+	hErr := healthErr
+	healthMu.Unlock()
+
 	if ctx.Err() != nil {
-		return nil
+		return true, nil
 	}
-	return wrapPassthroughExit(res, err)
+	if hErr != nil {
+		return true, hErr
+	}
+	return true, wrapPassthroughExit(res, err)
 }
 
 func runOptsFromSpec(spec service.Spec, allowRoot bool) runOpts {

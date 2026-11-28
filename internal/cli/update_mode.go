@@ -51,7 +51,7 @@ func (a *appRuntime) update(ctx context.Context, args []string) error {
 		if err := persist.RemoveCachedAgent(agentsDir, opts.Target); err != nil {
 			return err
 		}
-		a.logf("Removed cached %s agent update(s) from %s.", opts.Target, agentsDir)
+		a.logf("Deleted cached %s agent update(s) from %s.", opts.Target, agentsDir)
 		return nil
 	}
 
@@ -71,7 +71,7 @@ func (a *appRuntime) update(ctx context.Context, args []string) error {
 		target = defaultStr(baseState.Agent, "both")
 	}
 	if baseState.Agent != "" && baseState.Agent != "both" && target != baseState.Agent {
-		return fmt.Errorf("the base snapshot contains only agent=%s. Run 'agbox create-base %s' or 'agbox create-base both'", baseState.Agent, target)
+		return fmt.Errorf("the base snapshot contains only agent=%s. Run 'agbox create-base --force %s' or 'agbox create-base --force both'", baseState.Agent, target)
 	}
 
 	var targets []string
@@ -149,7 +149,7 @@ func (a *appRuntime) update(ctx context.Context, args []string) error {
 		})
 		if streamErr != nil {
 			cw.Abort()
-			return formatMSBError("stream "+ag+" binary from "+updSandbox, streamRes, streamErr)
+			return formatMSBStderrOnlyError("stream "+ag+" binary from "+updSandbox, streamRes.Stderr, streamErr)
 		}
 		if cw.Written() == 0 && len(streamRes.Stdout) > 0 {
 			if _, wErr := io.WriteString(cw, streamRes.Stdout); wErr != nil {

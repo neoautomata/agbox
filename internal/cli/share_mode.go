@@ -86,6 +86,9 @@ func (a *appRuntime) share(ctx context.Context, args []string) error {
 		}
 		metaPath = suspMetaPath
 	}
+	if meta.Sandbox != opts.Sandbox {
+		return fmt.Errorf("metadata sandbox mismatch in %s: got %q, want %q", runFilterDir, meta.Sandbox, opts.Sandbox)
+	}
 
 	if opts.Action == "list" {
 		return a.listSandboxShares(opts.Sandbox, sb.Running, runFilterDir, meta)
@@ -184,6 +187,9 @@ func (a *appRuntime) addSandboxShare(ctx context.Context, opts shareOpts, runnin
 		return err
 	}
 	newTarget := resolvedList[0]
+	if !newTarget.IsDir && opts.HasVCS && opts.VCSPolicy != config.VCSMask {
+		return fmt.Errorf("VCS policy %q applies only to directory shares (%s is a file)", opts.VCSPolicy, newTarget.HostPath)
+	}
 
 	combinedTargets := make([]pathsec.ShareTarget, 0, len(meta.Shares)+1)
 	existingNames := make(map[string]bool, len(meta.Shares))
@@ -248,7 +254,7 @@ func (a *appRuntime) addSandboxShare(ctx context.Context, opts shareOpts, runnin
 		if running {
 			sockPath := filepath.Join(runFilterDir, "ws.sock")
 			if rbErr := vcsfuse.RemoveHubShare(sockPath, newTarget.GuestName, true); rbErr != nil {
-				a.warnf("Could not roll back added share /workspace/%s: %v", newTarget.GuestName, rbErr)
+				a.warnf("Could not revert added share /workspace/%s: %v", newTarget.GuestName, rbErr)
 			}
 		}
 		return fmt.Errorf("save share metadata: %w", err)
@@ -318,9 +324,10 @@ func (a *appRuntime) setSandboxShare(ctx context.Context, opts shareOpts, runnin
 	rec.VCSPolicy = nextVCS
 	rec.Masked = rec.IsDir && nextVCS == config.VCSMask
 	meta.Shares[idx] = rec
+	isDowngrade := (!curRO && nextRO) || vcsPolicyRank(nextVCS) < vcsPolicyRank(curVCS)
 	if err := config.SaveRunMeta(metaPath, meta); err != nil {
 		if running {
-			// Roll back privilege upgrades only. Never revert a downgrade to weaker isolation.
+			// Revert privilege upgrades only. Keep downgrades so isolation never weakens.
 			var origROPtr *bool
 			if curRO && !nextRO {
 				origRO := true
@@ -334,8 +341,11 @@ func (a *appRuntime) setSandboxShare(ctx context.Context, opts shareOpts, runnin
 			if origROPtr != nil || origVCSPtr != nil {
 				sockPath := filepath.Join(runFilterDir, "ws.sock")
 				if _, rbErr := vcsfuse.SetHubShare(sockPath, rec.GuestName, origROPtr, origVCSPtr, true); rbErr != nil {
-					a.warnf("Could not roll back share upgrade on /workspace/%s: %v", rec.GuestName, rbErr)
+					a.warnf("Could not revert share upgrade on /workspace/%s: %v", rec.GuestName, rbErr)
 				}
+			}
+			if isDowngrade {
+				a.dropGuestVFSCaches(ctx, opts.Sandbox)
 			}
 		}
 		return fmt.Errorf("save share metadata: %w", err)
@@ -364,19 +374,22 @@ func (a *appRuntime) removeSandboxShare(ctx context.Context, opts shareOpts, run
 	meta.Shares = append(meta.Shares[:idx], meta.Shares[idx+1:]...)
 	if err := config.SaveRunMeta(metaPath, meta); err != nil {
 		// Keep the share detached on metadata save failure so we never re-expose revoked access.
+		if running {
+			a.dropGuestVFSCaches(ctx, opts.Sandbox)
+		}
 		return fmt.Errorf("save share metadata: %w", err)
 	}
 	if running {
 		a.dropGuestVFSCaches(ctx, opts.Sandbox)
 	}
-	a.logf("Removed share /workspace/%s (%s) from %s.", rec.GuestName, rec.HostPath, opts.Sandbox)
+	a.logf("Deleted share /workspace/%s (%s) from %s.", rec.GuestName, rec.HostPath, opts.Sandbox)
 	return nil
 }
 
 func findShareRecordIndex(shares []config.ShareRecord, query string) (int, error) {
 	trimmed := strings.TrimSpace(query)
 	if strings.HasPrefix(trimmed, msb.GuestWorkspace+"/") {
-		rel := strings.TrimPrefix(trimmed, msb.GuestWorkspace+"/")
+		rel := strings.TrimRight(strings.TrimPrefix(trimmed, msb.GuestWorkspace+"/"), "/")
 		if !strings.Contains(rel, "/") && rel != "" {
 			for i, sh := range shares {
 				if sh.GuestName == rel {

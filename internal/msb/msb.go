@@ -85,6 +85,22 @@ var nonDNSBlockHostRules = []string{
 	"deny@host:icmpv6",
 }
 
+var protectedMetadataPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("100.100.100.200/32"),
+	netip.MustParsePrefix("168.63.129.16/32"),
+	netip.MustParsePrefix("fd00:ec2::254/128"),
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::ffff:0:0/96"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+}
+
+// ValidateNetArgs checks network flags and rules without returning CLI arguments.
+func ValidateNetArgs(noNet bool, netSpecs []string) error {
+	_, err := buildNetArgs(noNet, netSpecs)
+	return err
+}
+
 func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 	if noNet {
 		for _, raw := range specs {
@@ -115,8 +131,11 @@ func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 
 	var userDenies []string
 	var hostScopedAllows []string
+	var metaScopedAllows []string
 	var groupScopedAllows []string
+	var specificIPAllows []string
 	var userAllows []string
+	hasLinkLocalScopedAllow := false
 
 	for _, rawSpec := range specs {
 		s := strings.TrimSpace(rawSpec)
@@ -201,10 +220,19 @@ func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 					hostScopedAllows = appendUnique(hostScopedAllows, rule)
 				case targetGroup == "host" && hasPortScope:
 					hostScopedAllows = appendUnique(hostScopedAllows, rule)
-				case hasPortScope && (targetGroup == "private" || targetGroup == "loopback" || targetGroup == "link-local" || targetGroup == "multicast" || targetGroup == "meta"):
+				case hasPortScope && targetGroup == "meta":
+					metaScopedAllows = appendUnique(metaScopedAllows, rule)
+				case hasPortScope && (targetGroup == "private" || targetGroup == "loopback" || targetGroup == "link-local" || targetGroup == "multicast"):
+					if targetGroup == "link-local" {
+						hasLinkLocalScopedAllow = true
+					}
 					groupScopedAllows = appendUnique(groupScopedAllows, rule)
 				default:
-					userAllows = appendUnique(userAllows, rule)
+					if pfx, ok := parseNetTargetPrefix(right); ok && !overlapsProtectedMetadata(pfx) {
+						specificIPAllows = appendUnique(specificIPAllows, rule)
+					} else {
+						userAllows = appendUnique(userAllows, rule)
+					}
 				}
 			}
 		}
@@ -239,6 +267,9 @@ func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 		for _, r := range hostScopedAllows {
 			args = append(args, "--net-rule", r)
 		}
+		if hasGroupAllow && !denyDNS && !hasExplicitAllowDNS {
+			args = append(args, "--net-rule", "allow@dns")
+		}
 	case hasGroupAllow || hasExplicitAllowDNS:
 		for _, r := range hostScopedAllows {
 			args = append(args, "--net-rule", r)
@@ -262,8 +293,34 @@ func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 		}
 	}
 
-	for _, r := range groupScopedAllows {
+	for _, r := range metaScopedAllows {
 		args = append(args, "--net-rule", r)
+	}
+
+	// Place metadata denies ahead of non-meta scoped group allows and specific IP/CIDR allows
+	// so explicit allow rules precede broad group denies without weakening metadata blocks.
+	metaEmittedEarly := false
+	linkLocalCIDREmittedEarly := false
+	if len(groupScopedAllows) > 0 || len(specificIPAllows) > 0 {
+		if !allowMetadata {
+			metaEmittedEarly = true
+			args = append(args, "--net-rule", "deny@meta")
+			args = append(args, "--net-rule", "deny@100.100.100.200/32")
+			args = append(args, "--net-rule", "deny@168.63.129.16/32")
+			if !allowLinkLocal && !hasLinkLocalScopedAllow {
+				args = append(args, "--net-rule", "deny@169.254.0.0/16")
+				linkLocalCIDREmittedEarly = true
+			} else {
+				args = append(args, "--net-rule", "deny@169.254.169.254/32")
+			}
+			args = append(args, "--net-rule", "deny@[fd00:ec2::254/128]")
+		}
+		for _, r := range groupScopedAllows {
+			args = append(args, "--net-rule", r)
+		}
+		for _, r := range specificIPAllows {
+			args = append(args, "--net-rule", r)
+		}
 	}
 
 	var denies []string
@@ -279,7 +336,7 @@ func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 	if !allowMulticast {
 		denies = appendUnique(denies, "deny@multicast")
 	}
-	if !allowMetadata {
+	if !allowMetadata && !metaEmittedEarly {
 		denies = appendUnique(denies, "deny@meta")
 	}
 	if !allowLoopback {
@@ -289,9 +346,11 @@ func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 		denies = appendUnique(denies, "deny@100.64.0.0/10")
 	}
 	if !allowMetadata {
-		denies = appendUnique(denies, "deny@100.100.100.200/32")
-		denies = appendUnique(denies, "deny@168.63.129.16/32")
-		if !allowLinkLocal {
+		if !metaEmittedEarly {
+			denies = appendUnique(denies, "deny@100.100.100.200/32")
+			denies = appendUnique(denies, "deny@168.63.129.16/32")
+		}
+		if !allowLinkLocal && !linkLocalCIDREmittedEarly {
 			denies = appendUnique(denies, "deny@169.254.0.0/16")
 		}
 	}
@@ -304,7 +363,7 @@ func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 	if !allowLinkLocal {
 		denies = appendUnique(denies, "deny@[fe80::/10]")
 	}
-	if !allowMetadata {
+	if !allowMetadata && !metaEmittedEarly {
 		denies = appendUnique(denies, "deny@[fd00:ec2::254/128]")
 	}
 
@@ -318,6 +377,40 @@ func buildNetArgs(noNet bool, specs []string) ([]string, error) {
 		args = append(args, "--net-rule", "deny@host")
 	}
 	return args, nil
+}
+
+func parseNetTargetPrefix(right string) (netip.Prefix, bool) {
+	var raw string
+	if strings.HasPrefix(right, "[") {
+		closeIdx := strings.IndexByte(right, ']')
+		if closeIdx <= 1 {
+			return netip.Prefix{}, false
+		}
+		raw = right[1:closeIdx]
+	} else {
+		raw, _, _ = strings.Cut(right, ":")
+	}
+	if strings.Contains(raw, "/") {
+		pfx, err := netip.ParsePrefix(raw)
+		if err != nil {
+			return netip.Prefix{}, false
+		}
+		return pfx, true
+	}
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		return netip.Prefix{}, false
+	}
+	return netip.PrefixFrom(addr, addr.BitLen()), true
+}
+
+func overlapsProtectedMetadata(pfx netip.Prefix) bool {
+	for _, meta := range protectedMetadataPrefixes {
+		if pfx.Overlaps(meta) {
+			return true
+		}
+	}
+	return false
 }
 
 func isFullDNSRight(right string) bool {
@@ -441,15 +534,21 @@ func validateDNSRuleRight(right, dir, fullToken string) error {
 		return fmt.Errorf("invalid --net-rule %q: trailing fields after port", fullToken)
 	}
 	if len(parts) >= 2 {
+		if parts[1] == "" {
+			return fmt.Errorf("invalid --net-rule %q: empty protocol after ':'", fullToken)
+		}
 		switch parts[1] {
-		case "", "any", "udp", "tcp":
+		case "any", "udp", "tcp":
 		default:
 			return fmt.Errorf("invalid --net-rule %q: dns protocol %q must be any, udp, or tcp", fullToken, parts[1])
 		}
 	}
 	if len(parts) == 3 {
+		if parts[2] == "" {
+			return fmt.Errorf("invalid --net-rule %q: empty port after ':'", fullToken)
+		}
 		switch parts[2] {
-		case "", "any", "53":
+		case "any", "53":
 		default:
 			return fmt.Errorf("invalid --net-rule %q: dns port %q must be 53 or any", fullToken, parts[2])
 		}
@@ -577,6 +676,9 @@ func validateUnbracketedTarget(target, fullToken string) error {
 		if pfx.Addr().Is6() {
 			return fmt.Errorf("invalid --net-rule %q: wrap IPv6 CIDR %s in square brackets", fullToken, target)
 		}
+		if pfx.Masked() != pfx {
+			return fmt.Errorf("invalid --net-rule %q: non-canonical IPv4 CIDR %q", fullToken, target)
+		}
 		return nil
 	}
 	if addr, err := netip.ParseAddr(target); err == nil {
@@ -702,14 +804,35 @@ func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// FormatEnvExports builds the shell script for GuestKeysFile from non-empty keys.
+func isValidEnvKey(k string) bool {
+	if k == "" {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		isLetter := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 {
+			if !isLetter {
+				return false
+			}
+			continue
+		}
+		if !isLetter && !isDigit {
+			return false
+		}
+	}
+	return true
+}
+
+// FormatEnvExports builds the shell script for GuestKeysFile from non-empty valid keys.
 // It uses lookup to read host values and returns the script and export count.
 func FormatEnvExports(lookup func(string) string, keys []string) (string, int) {
 	var b strings.Builder
 	b.WriteString("# Generated by agbox inside the guest sandbox.\n")
 	count := 0
 	for _, k := range keys {
-		if k == "" || lookup == nil {
+		if !isValidEnvKey(k) || lookup == nil {
 			continue
 		}
 		val := lookup(k)
@@ -1168,10 +1291,19 @@ import time
 MAX_RETRIES = 5
 SLEEP_SECONDS = 60
 
-payload = json.load(sys.stdin)
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    payload = {}
+if not isinstance(payload, dict):
+    payload = {}
+
 reason = payload.get("terminationReason", "")
-error = (payload.get("error") or "").lower()
-execution_num = int(payload.get("executionNum", 0))
+error = str(payload.get("error") or "").lower()
+try:
+    execution_num = int(payload.get("executionNum") or 0)
+except (TypeError, ValueError):
+    execution_num = 0
 
 is_high_traffic = any(
     token in error
@@ -1182,7 +1314,7 @@ if reason == "ERROR" and is_high_traffic and execution_num < MAX_RETRIES:
     time.sleep(SLEEP_SECONDS)
     print(json.dumps({
         "decision": "continue",
-        "reason": "The server returned a temporary high-traffic error. Continue where you left off."
+        "reason": "The server returned a temporary high-traffic error. Continue the previous task."
     }))
 else:
     print(json.dumps({"decision": "stop"}))

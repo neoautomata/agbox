@@ -82,6 +82,7 @@ type fakeController struct {
 	unmountedMPs  []string
 	keepStubborn  bool
 	failPolite    bool
+	unmountErr    error
 	listErr       error
 	listErrOnCall int
 	listCalls     int
@@ -105,10 +106,10 @@ func (f *fakeController) Unmount(mp string, lazy bool) error {
 	f.unmountCalls = append(f.unmountCalls, lazy)
 	f.unmountedMPs = append(f.unmountedMPs, mp)
 	if f.keepStubborn {
-		return nil
+		return f.unmountErr
 	}
 	if f.failPolite && !lazy {
-		return nil
+		return f.unmountErr
 	}
 	var next []Entry
 	for _, e := range f.mounts {
@@ -181,7 +182,7 @@ func TestTeardownFilterDirRefusesRemoveWhenStillMountedAndSymlinkAncestors(t *te
 		t.Fatal(err)
 	}
 
-	// Create run directory under realRoot, while caller passes path via symRoot ([H3]).
+	// Create run directory under realRoot, while caller passes path via symRoot.
 	realRunDir := filepath.Join(realRoot, "run", "5678")
 	realMP := filepath.Join(realRunDir, "m0")
 	if err := os.MkdirAll(realMP, 0o700); err != nil {
@@ -360,7 +361,7 @@ func TestIsFilterCmdlineAndOSControllerDI(t *testing.T) {
 		}
 	}
 
-	// Verify [M8]: SignalPID / signalRecordedPIDs checks -mnt directory prefix in cmdline.
+	// SignalPID and signalRecordedPIDs verify the -mnt directory prefix in cmdline.
 	runDir1 := filepath.Join(t.TempDir(), "run", "sbx1")
 	if err := os.MkdirAll(runDir1, 0o700); err != nil {
 		t.Fatal(err)
@@ -502,5 +503,169 @@ func TestReadPIDFileNoFollowDoesNotBlockOnFIFO(t *testing.T) {
 	}
 	if _, err := os.Stat(filterDir); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("expected filterDir removed, stat err = %v", err)
+	}
+}
+
+func TestExtractFilterMountArgParsing(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "repeated -mnt uses last value",
+			args: []string{"-mnt", "/first", "-mnt=/second", "--mnt", "/third", ""},
+			want: "/third",
+		},
+		{
+			name: "stops at double dash",
+			args: []string{"-mnt", "/before", "--", "-mnt", "/after", ""},
+			want: "/before",
+		},
+		{
+			name: "double dash before any -mnt yields empty",
+			args: []string{"--", "-mnt", "/after", ""},
+			want: "",
+		},
+		{
+			name: "skips value of -src even when value looks like -mnt",
+			args: []string{"-src", "-mnt", "-mnt", "/real/mnt", ""},
+			want: "/real/mnt",
+		},
+		{
+			name: "skips other value flags and keeps bool flags single-token",
+			args: []string{"-hub", "-sock", "-mnt=/fake", "-map-guest-ids", "-spec-fd", "3", "-guest-uid", "1000", "-guest-gid", "1000", "--mnt=/real/hub", ""},
+			want: "/real/hub",
+		},
+		{
+			name: "stops at positional argument",
+			args: []string{"positional", "-mnt", "/ignored", ""},
+			want: "",
+		},
+		{
+			name: "equals form on value flag does not consume next flag",
+			args: []string{"-src=/host/dir", "-mnt", "/target/mnt", ""},
+			want: "/target/mnt",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractFilterMountArg(tc.args); got != tc.want {
+				t.Errorf("extractFilterMountArg(%v) = %q, want %q", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUnmountFilterDirErrorReportingAndPluralization(t *testing.T) {
+	runDir := filepath.Join(t.TempDir(), "run1")
+	mp1 := filepath.Join(runDir, "m0")
+	mp2 := filepath.Join(runDir, "m1")
+	if err := os.MkdirAll(mp1, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(mp2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Single active mount uses singular wording and wraps the last unmount error.
+	singleCtl := &fakeController{
+		mounts:       []Entry{{MountPoint: mp1, FSType: "fuse.agboxfilter"}},
+		keepStubborn: true,
+		unmountErr:   syscall.EBUSY,
+	}
+	err := UnmountFilterDir(runDir, singleCtl)
+	if err == nil {
+		t.Fatal("expected error when 1 mount remains active")
+	}
+	if !strings.Contains(err.Error(), "1 mount remains active") {
+		t.Errorf("expected singular message, got %v", err)
+	}
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Errorf("expected wrapped syscall.EBUSY, got %v", err)
+	}
+
+	// Multiple active mounts use plural wording without trailing error when Unmount returns nil.
+	multiCtl := &fakeController{
+		mounts: []Entry{
+			{MountPoint: mp1, FSType: "fuse.agboxfilter"},
+			{MountPoint: mp2, FSType: "fuse.agboxfilter"},
+		},
+		keepStubborn: true,
+	}
+	err = UnmountFilterDir(runDir, multiCtl)
+	if err == nil {
+		t.Fatal("expected error when 2 mounts remain active")
+	}
+	if !strings.Contains(err.Error(), "2 mounts remain active") {
+		t.Errorf("expected plural message, got %v", err)
+	}
+}
+
+func TestParseMountinfoZeroOptionalFieldsAndSymlinkAncestorMountsUnder(t *testing.T) {
+	// Zero optional fields between mount options and " - ".
+	line := "36 35 98:0 / /mnt/plain rw,noatime - ext4 /dev/root rw\n"
+	entries, err := ParseMountinfo(strings.NewReader(line))
+	if err != nil {
+		t.Fatalf("ParseMountinfo failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].MountPoint != "/mnt/plain" || entries[0].FSType != "ext4" || entries[0].Source != "/dev/root" {
+		t.Fatalf("unexpected entry with zero optional fields: %+v", entries)
+	}
+
+	// MountsUnder finds mounts recorded under canonical path when queried through a symlinked ancestor.
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	realRoot := filepath.Join(base, "real-root")
+	symRoot := filepath.Join(base, "sym-root")
+	if err := os.MkdirAll(filepath.Join(realRoot, "run", "a"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRoot, symRoot); err != nil {
+		t.Fatal(err)
+	}
+	canonicalMP := filepath.Join(realRoot, "run", "a", "ws")
+	mountEntries := []Entry{{MountPoint: canonicalMP, FSType: "fuse.agboxhub"}}
+
+	found := MountsUnder(mountEntries, filepath.Join(symRoot, "run", "a"))
+	if !slices.Equal(found, []string{canonicalMP}) {
+		t.Errorf("MountsUnder(symlinked ancestor) = %v, want [%s]", found, canonicalMP)
+	}
+}
+
+func TestResolvePathWithAncestorRelativeDanglingUnderSymlinkedParent(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	realConfig := filepath.Join(base, "store", "links")
+	realRunRoot := filepath.Join(base, "store", "runs")
+	for _, d := range []string{realConfig, realRunRoot} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(realConfig, filepath.Join(base, "sym-links")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../runs/missing-run", filepath.Join(realConfig, "active")); err != nil {
+		t.Fatal(err)
+	}
+
+	query := filepath.Join(base, "sym-links", "active", "ws")
+	want := filepath.Join(realRunRoot, "missing-run", "ws")
+	if got := resolvePathWithAncestor(query); got != want {
+		t.Errorf("resolvePathWithAncestor(%q) = %q, want %q", query, got, want)
+	}
+
+	entries := []Entry{{MountPoint: want, FSType: "fuse.agboxhub"}}
+	if !IsMounted(entries, query) {
+		t.Errorf("IsMounted(%q) = false, want true", query)
+	}
+	found := MountsUnder(entries, filepath.Join(base, "sym-links", "active"))
+	if !slices.Equal(found, []string{want}) {
+		t.Errorf("MountsUnder = %v, want [%s]", found, want)
 	}
 }

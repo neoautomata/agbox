@@ -3,6 +3,7 @@ package persist
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -210,11 +211,18 @@ func TestAuthCaptureSaveLoadRestoreRoundTripAndSecurity(t *testing.T) {
 	_ = os.MkdirAll(symAgy, 0o700)
 	_ = os.Symlink(canary, filepath.Join(symAgy, "antigravity-oauth-token"))
 	symScript, _ := buildAuthCaptureScriptForHome("antigravity", symHome)
-	symOut, symErr := exec.Command("/bin/sh", "-c", symScript).Output()
+	symCmd := exec.Command("/bin/sh", "-c", symScript)
+	var symStdout, symStderr bytes.Buffer
+	symCmd.Stdout = &symStdout
+	symCmd.Stderr = &symStderr
+	symErr := symCmd.Run()
 	if symErr == nil {
 		t.Error("expected capture script to fail closed on symlinked guest token")
 	}
-	if _, err := ParseAuthCapture("antigravity", string(symOut)); err == nil || !strings.Contains(err.Error(), "refusing symlinked") {
+	if !strings.Contains(symStderr.String(), "SYMLINK antigravity antigravity-oauth-token") {
+		t.Errorf("expected symlink diagnostic on stderr, got stdout=%q stderr=%q", symStdout.String(), symStderr.String())
+	}
+	if _, err := ParseAuthCapture("antigravity", "SYMLINK antigravity antigravity-oauth-token\n"); err == nil || !strings.Contains(err.Error(), "refusing symlinked") {
 		t.Errorf("expected ParseAuthCapture SYMLINK error, got %v", err)
 	}
 
@@ -586,7 +594,7 @@ func TestProfileLockMetadataAndSessionIDValidation(t *testing.T) {
 
 	profScript := BuildGuestProfileMountScript()
 	for _, want := range []string{
-		"grep -qs ' /home/agent/.agbox-profile ' /proc/self/mountinfo",
+		"grep -Fqs ' /home/agent/.agbox-profile ' /proc/self/mountinfo",
 		"/home/agent/.agbox-profile/agy-cli",
 		"/home/agent/.agbox-profile/agy-projects",
 		"/home/agent/.agbox-profile/opencode-data",
@@ -1092,6 +1100,42 @@ func TestAgentsCacheInstallInspectRemoveAndSecurity(t *testing.T) {
 		t.Errorf("expected newly created binary removed on rollback, got err=%v", err)
 	}
 
+	// syncParentDir failure must also roll back both replaced and newly created binaries.
+	syncFailDir := filepath.Join(t.TempDir(), "agents-sync-rollback")
+	if _, err := installAgentBinaryFromReader(syncFailDir, "opencode", "1.0.0", bytes.NewReader(origELF)); err != nil {
+		t.Fatalf("initial sync-rollback install: %v", err)
+	}
+	cwSyncExisting, err := NewAgentBinaryCaptureWriter(syncFailDir, "opencode")
+	if err != nil {
+		t.Fatalf("NewAgentBinaryCaptureWriter(sync existing): %v", err)
+	}
+	cwSyncExisting.syncDir = func(string) error { return errors.New("injected sync failure") }
+	if _, err := cwSyncExisting.Write(newELF); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cwSyncExisting.Commit("2.0.0"); err == nil || !strings.Contains(err.Error(), "injected sync failure") {
+		t.Fatalf("expected Commit to fail on syncParentDir error, got %v", err)
+	}
+	restoredSync, err := os.ReadFile(filepath.Join(syncFailDir, "bin", "opencode"))
+	if err != nil || !bytes.Equal(restoredSync, origELF) {
+		t.Fatalf("expected original binary restored on syncParentDir failure: err=%v, match=%v", err, bytes.Equal(restoredSync, origELF))
+	}
+
+	cwSyncNew, err := NewAgentBinaryCaptureWriter(syncFailDir, "antigravity")
+	if err != nil {
+		t.Fatalf("NewAgentBinaryCaptureWriter(sync new): %v", err)
+	}
+	cwSyncNew.syncDir = func(string) error { return errors.New("injected sync failure") }
+	if _, err := cwSyncNew.Write(newELF); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cwSyncNew.Commit("2.0.0"); err == nil || !strings.Contains(err.Error(), "injected sync failure") {
+		t.Fatalf("expected Commit to fail on syncParentDir error for new binary, got %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(syncFailDir, "bin", "agy")); !os.IsNotExist(err) {
+		t.Errorf("expected newly created binary removed on syncParentDir failure, got err=%v", err)
+	}
+
 	// [M5] Concurrent updates across goroutines serialize cleanly via .agents.lock without corrupting manifest.json.
 	concDir := filepath.Join(t.TempDir(), "conc-data", "agents")
 	var wg sync.WaitGroup
@@ -1271,5 +1315,306 @@ func TestNonBlockingFIFOOpensRejectImmediately(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("O_RDONLY open blocked on FIFO without writer")
+	}
+}
+
+func TestAuthCaptureSymlinkedParentsAndSaveAuthMissingRequired(t *testing.T) {
+	victim := t.TempDir()
+
+	// Symlinked guestHome must fail closed with stderr message.
+	symHome := filepath.Join(t.TempDir(), "sym-home")
+	if err := os.Symlink(victim, symHome); err != nil {
+		t.Fatal(err)
+	}
+	for _, agent := range []string{"antigravity", "opencode"} {
+		script, err := buildAuthCaptureScriptForHome(agent, symHome)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("/bin/sh", "-c", script)
+		var outBuf, errBuf bytes.Buffer
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &errBuf
+		if err := cmd.Run(); err == nil {
+			t.Errorf("buildAuthCaptureScriptForHome(%s) accepted symlinked guestHome", agent)
+		}
+		if !strings.Contains(errBuf.String(), "rejects symlinked guest home") {
+			t.Errorf("expected symlinked guest home error on stderr for %s, got %q", agent, errBuf.String())
+		}
+	}
+
+	// Symlinked parent directories for antigravity (.gemini, .gemini/antigravity-cli) and opencode (.local, .local/share, .local/share/opencode).
+	parentCases := []struct {
+		agent    string
+		mkDirs   []string
+		linkPath []string
+	}{
+		{agent: "antigravity", linkPath: []string{".gemini"}},
+		{agent: "antigravity", mkDirs: []string{".gemini"}, linkPath: []string{".gemini", "antigravity-cli"}},
+		{agent: "opencode", linkPath: []string{".local"}},
+		{agent: "opencode", mkDirs: []string{".local"}, linkPath: []string{".local", "share"}},
+		{agent: "opencode", mkDirs: []string{".local", "share"}, linkPath: []string{".local", "share", "opencode"}},
+	}
+	for _, tc := range parentCases {
+		name := tc.agent + ":" + filepath.Join(tc.linkPath...)
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			if len(tc.mkDirs) > 0 {
+				if err := os.MkdirAll(filepath.Join(append([]string{home}, tc.mkDirs...)...), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			linkFull := filepath.Join(append([]string{home}, tc.linkPath...)...)
+			if err := os.Symlink(victim, linkFull); err != nil {
+				t.Fatal(err)
+			}
+			script, err := buildAuthCaptureScriptForHome(tc.agent, home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/sh", "-c", script)
+			var errBuf bytes.Buffer
+			cmd.Stderr = &errBuf
+			if err := cmd.Run(); err == nil {
+				t.Fatalf("expected capture script to reject symlinked parent %s", linkFull)
+			}
+			if !strings.Contains(errBuf.String(), "rejects symlinked credential directory") {
+				t.Errorf("expected stderr error for symlinked parent, got %q", errBuf.String())
+			}
+		})
+	}
+
+	// Unreadable credential file fails closed when running as non-root.
+	if os.Geteuid() != 0 {
+		unreadableHome := t.TempDir()
+		ocDir := filepath.Join(unreadableHome, ".local", "share", "opencode")
+		if err := os.MkdirAll(ocDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		authPath := filepath.Join(ocDir, "auth.json")
+		if err := os.WriteFile(authPath, []byte(`{"ok":true}`), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(authPath, 0o600)
+		script, err := buildAuthCaptureScriptForHome("opencode", unreadableHome)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("/bin/sh", "-c", script)
+		var errBuf bytes.Buffer
+		cmd.Stderr = &errBuf
+		if err := cmd.Run(); err == nil {
+			t.Fatal("expected capture script to fail on unreadable auth file")
+		}
+		if !strings.Contains(errBuf.String(), "cannot read credential file") {
+			t.Errorf("expected unreadable diagnostic on stderr, got %q", errBuf.String())
+		}
+	}
+
+	// SaveAuthBundle must reject a bundle missing a required file without deleting existing saved credentials.
+	dataDir := filepath.Join(t.TempDir(), "data")
+	initial := AuthBundle{
+		Files: []AuthFile{
+			{Agent: "antigravity", Name: "antigravity-oauth-token", Data: []byte("valid-token")},
+			{Agent: "antigravity", Name: "installation_id", Data: []byte("id-1")},
+		},
+	}
+	if err := SaveAuthBundle(dataDir, initial); err != nil {
+		t.Fatalf("initial SaveAuthBundle: %v", err)
+	}
+	missingReq := AuthBundle{
+		Files: []AuthFile{
+			{Agent: "antigravity", Name: "installation_id", Data: []byte("id-2")},
+		},
+	}
+	if err := SaveAuthBundle(dataDir, missingReq); err == nil || !strings.Contains(err.Error(), "missing required file") {
+		t.Fatalf("expected missing required file error, got %v", err)
+	}
+	// Existing token and installation_id must remain untouched.
+	gotTok, err := os.ReadFile(filepath.Join(dataDir, "auth", "antigravity", "antigravity-oauth-token"))
+	if err != nil || string(gotTok) != "valid-token" {
+		t.Fatalf("existing required token was modified or deleted: got %q, err=%v", gotTok, err)
+	}
+	gotID, err := os.ReadFile(filepath.Join(dataDir, "auth", "antigravity", "installation_id"))
+	if err != nil || string(gotID) != "id-1" {
+		t.Fatalf("existing optional file was modified: got %q, err=%v", gotID, err)
+	}
+}
+
+func TestRulesStageUnclosedFrontmatterQuotedTriggersAndMountCleanup(t *testing.T) {
+	base := t.TempDir()
+	rulesDir := filepath.Join(base, "rules")
+	stageDir := filepath.Join(base, "staged")
+	if err := os.MkdirAll(rulesDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unclosed leading "---" (Markdown horizontal rule) must preserve the entire file body in AGENTS.md.
+	unclosed := "---\n# Horizontal Rule Doc\nKeep all of this text.\n"
+	if err := os.WriteFile(filepath.Join(rulesDir, "horizontal.md"), []byte(unclosed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Double-quoted and single-quoted modular triggers must stage into rules/, not AGENTS.md.
+	doubleQuoted := "---\ntrigger: \"glob\"\nglobs: [\"*.go\"]\n---\n# Double Quoted Glob\n"
+	singleQuoted := "---\ntrigger: 'manual'\ndescription: manual\n---\n# Single Quoted Manual\n"
+	if err := os.WriteFile(filepath.Join(rulesDir, "dq-glob.md"), []byte(doubleQuoted), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rulesDir, "sq-manual.md"), []byte(singleQuoted), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", buildGuestRulesStageScript(rulesDir, stageDir))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("buildGuestRulesStageScript failed: %v (%s)", err, string(out))
+	}
+
+	combined, err := os.ReadFile(filepath.Join(stageDir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read staged AGENTS.md: %v", err)
+	}
+	combinedStr := string(combined)
+	if !strings.Contains(combinedStr, "# Horizontal Rule Doc") || !strings.Contains(combinedStr, "Keep all of this text.") {
+		t.Errorf("unclosed leading --- rule body was lost: %q", combinedStr)
+	}
+	if strings.Contains(combinedStr, "Double Quoted Glob") || strings.Contains(combinedStr, "Single Quoted Manual") {
+		t.Errorf("quoted modular rules leaked into AGENTS.md: %q", combinedStr)
+	}
+	for _, modFile := range []string{"dq-glob.md", "sq-manual.md"} {
+		if _, err := os.Stat(filepath.Join(stageDir, "rules", modFile)); err != nil {
+			t.Errorf("expected modular rule %s in staged rules/: %v", modFile, err)
+		}
+	}
+
+	mntScript := BuildGuestRulesMountScript()
+	if !strings.Contains(mntScript, "grep -Fqs") {
+		t.Errorf("BuildGuestRulesMountScript should use grep -Fqs:\n%s", mntScript)
+	}
+	if !strings.Contains(mntScript, "if [ -f \"$dst\" ] && [ ! -L \"$dst\" ] && [ ! -s \"$dst\" ]; then") {
+		t.Errorf("BuildGuestRulesMountScript missing stale 0-byte AGENTS.md cleanup:\n%s", mntScript)
+	}
+	skillsScript := BuildGuestSkillsMountScript()
+	if !strings.Contains(skillsScript, "grep -Fqs") {
+		t.Errorf("BuildGuestSkillsMountScript should use grep -Fqs:\n%s", skillsScript)
+	}
+}
+
+func TestAgentsConcurrentInspectCommitRemoveAndHardening(t *testing.T) {
+	base := t.TempDir()
+	agentsDir := filepath.Join(base, "data", "agents")
+
+	agyELF := append([]byte{0x7f, 'E', 'L', 'F'}, bytes.Repeat([]byte("A"), 128)...)
+	ocELF := append([]byte{0x7f, 'E', 'L', 'F'}, bytes.Repeat([]byte("O"), 160)...)
+	if _, err := installAgentBinaryFromReader(agentsDir, "antigravity", "1.0.0", bytes.NewReader(agyELF)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Concurrent InspectAgentsDir vs Commit and RemoveCachedAgent must serialize cleanly via .agents.lock.
+	var wg sync.WaitGroup
+	errCh := make(chan error, 64)
+	for i := range 8 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			payload := append([]byte{0x7f, 'E', 'L', 'F'}, bytes.Repeat([]byte{byte('A' + idx)}, 128)...)
+			if _, err := installAgentBinaryFromReader(agentsDir, "opencode", "1.0."+strconv.Itoa(idx), bytes.NewReader(payload)); err != nil {
+				errCh <- err
+				return
+			}
+			if idx%3 == 0 {
+				if err := RemoveCachedAgent(agentsDir, "opencode"); err != nil {
+					errCh <- err
+				}
+			}
+		}(i)
+	}
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				if _, err := InspectAgentsDir(agentsDir); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent agents operation failed: %v", err)
+	}
+
+	// InspectAgentsDir rejects symlinked or FIFO .agents.lock without blocking.
+	lockPath := filepath.Join(filepath.Dir(agentsDir), ".agents.lock")
+	_ = os.Remove(lockPath)
+	if err := os.Symlink("/etc/passwd", lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectAgentsDir(agentsDir); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("expected InspectAgentsDir to reject symlinked .agents.lock, got %v", err)
+	}
+	_ = os.Remove(lockPath)
+
+	if err := syscall.Mkfifo(lockPath, 0o600); err == nil {
+		done := make(chan error, 1)
+		go func() {
+			_, err := InspectAgentsDir(agentsDir)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "non-regular") {
+				t.Errorf("expected InspectAgentsDir to reject FIFO .agents.lock, got %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("InspectAgentsDir blocked on FIFO .agents.lock")
+		}
+		_ = os.Remove(lockPath)
+	}
+
+	// RemoveCachedAgent must reject symlinked binary and must not recreate agents/bin when absent.
+	symAgentsDir := filepath.Join(t.TempDir(), "sym-data", "agents")
+	if _, err := installAgentBinaryFromReader(symAgentsDir, "opencode", "1.0.0", bytes.NewReader(ocELF)); err != nil {
+		t.Fatal(err)
+	}
+	ocBinPath := filepath.Join(symAgentsDir, "bin", "opencode")
+	_ = os.Remove(ocBinPath)
+	if err := os.Symlink("/bin/sh", ocBinPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveCachedAgent(symAgentsDir, "opencode"); err == nil || !strings.Contains(err.Error(), "non-regular") {
+		t.Errorf("expected RemoveCachedAgent to reject symlinked binary, got %v", err)
+	}
+	_ = os.Remove(ocBinPath)
+
+	noBinAgentsDir := filepath.Join(t.TempDir(), "nobin-data", "agents")
+	if err := os.MkdirAll(noBinAgentsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveCachedAgent(noBinAgentsDir, "all"); err != nil {
+		t.Fatalf("RemoveCachedAgent(all) without bin dir failed: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(noBinAgentsDir, "bin")); !os.IsNotExist(err) {
+		t.Errorf("RemoveCachedAgent unexpectedly created agents/bin: err=%v", err)
+	}
+
+	// BuildGuestAgentsMountScript restores both bin/opencode and bin/opencode.exe symlinks.
+	mntScript := BuildGuestAgentsMountScript()
+	for _, want := range []string{
+		"/usr/local/lib/node_modules/opencode-ai/bin/opencode",
+		"ln -sfn ../lib/node_modules/opencode-ai/bin/opencode /usr/local/bin/opencode",
+		"/usr/local/lib/node_modules/opencode-ai/bin/opencode.exe",
+		"ln -sfn ../lib/node_modules/opencode-ai/bin/opencode.exe /usr/local/bin/opencode",
+	} {
+		if !strings.Contains(mntScript, want) {
+			t.Errorf("BuildGuestAgentsMountScript missing %q:\n%s", want, mntScript)
+		}
+	}
+	shCmd := exec.Command("/bin/sh", "-n")
+	shCmd.Stdin = strings.NewReader(mntScript)
+	if out, err := shCmd.CombinedOutput(); err != nil {
+		t.Fatalf("BuildGuestAgentsMountScript sh -n failed: %v (%s)", err, string(out))
 	}
 }

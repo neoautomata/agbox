@@ -500,73 +500,207 @@ func completeShare(prev []string, cur string, p Providers) Result {
 }
 
 func completeService(prev []string, cur string, p Providers) Result {
-	valFlags := map[string]bool{"--env-file": true, "-n": true, "--lines": true}
-	if flag, ok := pendingFlagValue(prev, valFlags); ok {
-		if flag == "--env-file" {
-			return Result{Directive: DirectiveFile}
+	// Locate the service action token after any leading flags.
+	actionIdx := -1
+	for i, tok := range prev {
+		if strings.HasPrefix(tok, "-") {
+			continue
 		}
-		return Result{Directive: DirectiveNoFiles}
+		actionIdx = i
+		break
 	}
-	if flag, _, ok := splitEqualsFlag(cur); ok {
-		if flag == "--env-file" {
-			return Result{Directive: DirectiveFile}
-		}
-		return Result{Directive: DirectiveNoFiles}
-	}
-
-	pos := collectPositionals(prev, valFlags)
-	if len(pos) == 0 {
+	if actionIdx < 0 {
 		if strings.HasPrefix(cur, "-") {
 			return filterResult(basicFlags, cur, DirectiveNoFiles)
 		}
 		return filterResult([]string{"list", "add", "enable", "disable", "start", "stop", "restart", "logs", "rm", "linger"}, cur, DirectiveNoFiles)
 	}
 
-	action := pos[0]
-	if strings.HasPrefix(cur, "-") {
-		switch action {
-		case "list", "status":
-			return filterResult(basicFlags, cur, DirectiveNoFiles)
-		case "add", "create":
-			addFlags := []string{
-				"--force", "--env-file", "--enable", "--now", "--no-linger",
-				"--persist", "--profile", "--no-auth", "--no-skills", "--no-rules", "--no-agent-cache",
-				"--allow-root", "--share", "--share-hub", "--ro", "--rw",
-				"--mask-vcs", "--vcs", "--vcs-hooks", "--no-mask",
-				"--serve", "--port", "--remote-control", "--cmd",
-				"--no-net", "--net", "--net-rule", "--cpus", "--memory",
-				"-h", "--help",
-			}
-			return filterResult(addFlags, cur, DirectiveNoFiles)
-		case "enable":
-			return filterResult([]string{"--now", "--no-linger", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
-		case "disable":
-			return filterResult([]string{"--now", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
-		case "start", "stop", "restart", "linger":
-			return filterResult(basicFlags, cur, DirectiveNoFiles)
-		case "logs":
-			return filterResult([]string{"-f", "--follow", "-n", "--lines", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
-		case "rm", "remove", "delete":
-			return filterResult([]string{"--force", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
-		default:
-			return Result{Directive: DirectiveNoFiles}
-		}
-	}
+	action := prev[actionIdx]
+	tail := prev[actionIdx+1:]
 
 	switch action {
-	case "enable", "disable", "start", "stop", "restart", "logs", "rm", "remove", "delete":
-		if len(pos) == 1 {
+	case "add", "create":
+		return completeServiceAdd(tail, cur, p)
+	case "list", "status":
+		if strings.HasPrefix(cur, "-") {
+			return filterResult(basicFlags, cur, DirectiveNoFiles)
+		}
+		return Result{Directive: DirectiveNoFiles}
+	case "enable":
+		if strings.HasPrefix(cur, "-") {
+			return filterResult([]string{"--now", "--no-linger", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
+		}
+		if countPositionals(tail, nil) == 0 {
+			return filterResult(callStringSlice(p.Services), cur, DirectiveNoFiles)
+		}
+		return Result{Directive: DirectiveNoFiles}
+	case "disable":
+		if strings.HasPrefix(cur, "-") {
+			return filterResult([]string{"--now", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
+		}
+		if countPositionals(tail, nil) == 0 {
+			return filterResult(callStringSlice(p.Services), cur, DirectiveNoFiles)
+		}
+		return Result{Directive: DirectiveNoFiles}
+	case "start", "stop", "restart":
+		if strings.HasPrefix(cur, "-") {
+			return filterResult(basicFlags, cur, DirectiveNoFiles)
+		}
+		if countPositionals(tail, nil) == 0 {
+			return filterResult(callStringSlice(p.Services), cur, DirectiveNoFiles)
+		}
+		return Result{Directive: DirectiveNoFiles}
+	case "logs":
+		valFlags := map[string]bool{"-n": true, "--lines": true}
+		if _, ok := pendingFlagValue(tail, valFlags); ok {
+			return Result{Directive: DirectiveNoFiles}
+		}
+		if flag, _, ok := splitEqualsFlag(cur); ok && valFlags[flag] {
+			return Result{Directive: DirectiveNoFiles}
+		}
+		if strings.HasPrefix(cur, "-") {
+			return filterResult([]string{"-f", "--follow", "-n", "--lines", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
+		}
+		if countPositionals(tail, valFlags) == 0 {
+			return filterResult(callStringSlice(p.Services), cur, DirectiveNoFiles)
+		}
+		return Result{Directive: DirectiveNoFiles}
+	case "rm", "remove", "delete":
+		if strings.HasPrefix(cur, "-") {
+			return filterResult([]string{"--force", "--allow-root", "-h", "--help"}, cur, DirectiveNoFiles)
+		}
+		if countPositionals(tail, nil) == 0 {
 			return filterResult(callStringSlice(p.Services), cur, DirectiveNoFiles)
 		}
 		return Result{Directive: DirectiveNoFiles}
 	case "linger":
-		if len(pos) == 1 {
+		if strings.HasPrefix(cur, "-") {
+			return filterResult(basicFlags, cur, DirectiveNoFiles)
+		}
+		if countPositionals(tail, nil) == 0 {
 			return filterResult([]string{"status", "enable"}, cur, DirectiveNoFiles)
 		}
 		return Result{Directive: DirectiveNoFiles}
 	default:
 		return Result{Directive: DirectiveNoFiles}
 	}
+}
+
+func completeServiceAdd(tail []string, cur string, p Providers) Result {
+	preNameFlags := []string{
+		"--force", "--env-file", "--enable", "--now", "--no-linger",
+		"--allow-root", "-h", "--help",
+	}
+	postNameFlags := []string{
+		"--force", "--env-file", "--enable", "--now", "--no-linger",
+		"--persist", "--profile", "--no-auth", "--no-skills", "--no-rules", "--no-agent-cache",
+		"--allow-root", "--share", "--share-hub", "--ro", "--rw",
+		"--mask-vcs", "--vcs", "--vcs-hooks", "--no-mask",
+		"--serve", "--port", "--remote-control", "--cmd",
+		"--no-net", "--net", "--net-rule", "--cpus", "--memory",
+		"-h", "--help",
+	}
+	postNameValFlags := map[string]bool{
+		"--env-file": true,
+		"--profile":  true,
+		"--share":    true,
+		"--port":     true,
+		"--cmd":      true,
+		"--net":      true,
+		"--net-rule": true,
+		"--cpus":     true,
+		"--memory":   true,
+	}
+
+	// Phase 1: parse service-specific options until the service <name> token.
+	nameIdx := -1
+	for i := 0; i < len(tail); i++ {
+		tok := tail[i]
+		if tok == "--env-file" {
+			if i == len(tail)-1 {
+				return Result{Directive: DirectiveFile}
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(tok, "-") {
+			continue
+		}
+		nameIdx = i
+		break
+	}
+	if nameIdx < 0 {
+		if flag, _, ok := splitEqualsFlag(cur); ok && flag == "--env-file" {
+			return Result{Directive: DirectiveFile}
+		}
+		if strings.HasPrefix(cur, "-") {
+			return filterResult(preNameFlags, cur, DirectiveNoFiles)
+		}
+		return Result{Directive: DirectiveNoFiles}
+	}
+
+	// Phase 2: parse run and service options after <name>, then agent and share paths.
+	postTail := tail[nameIdx+1:]
+	afterDoubleDash := false
+	sawAgent := false
+	sawPath := false
+	pendingFlag := ""
+	for i := 0; i < len(postTail); i++ {
+		tok := postTail[i]
+		if afterDoubleDash {
+			sawPath = true
+			continue
+		}
+		if tok == "--" {
+			afterDoubleDash = true
+			continue
+		}
+		if postNameValFlags[tok] {
+			if i == len(postTail)-1 {
+				pendingFlag = tok
+				break
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(tok, "-") {
+			continue
+		}
+		if !sawAgent && !sawPath && (tok == "opencode" || tok == "antigravity") {
+			sawAgent = true
+			continue
+		}
+		sawPath = true
+	}
+
+	if pendingFlag != "" {
+		if pendingFlag == "--env-file" {
+			return Result{Directive: DirectiveFile}
+		}
+		return completeRunFlagValue("", pendingFlag, cur, p)
+	}
+	if !afterDoubleDash && !sawPath {
+		if flag, val, ok := splitEqualsFlag(cur); ok && postNameValFlags[flag] {
+			if flag == "--env-file" {
+				return Result{Directive: DirectiveFile}
+			}
+			return completeRunFlagValue(flag+"=", flag, val, p)
+		}
+		if strings.HasPrefix(cur, "-") {
+			return filterResult(postNameFlags, cur, DirectiveNoFiles)
+		}
+	}
+
+	if strings.Contains(cur, ":") {
+		return completeShareSpec("", cur)
+	}
+
+	if !afterDoubleDash && !sawAgent && !sawPath {
+		agents := filterStrings([]string{"opencode", "antigravity"}, cur)
+		return Result{Candidates: agents, Directive: DirectiveFile}
+	}
+	return Result{Directive: DirectiveFile}
 }
 
 func completeRun(prev []string, cur string, p Providers) Result {
@@ -766,6 +900,9 @@ func completeShareSpec(flagPrefix, cur string) Result {
 			continue
 		}
 		if mod == "vcs-hooks" && used["ro"] {
+			continue
+		}
+		if mod == "ro" && used["vcs-hooks"] {
 			continue
 		}
 		if strings.HasPrefix(mod, token) {

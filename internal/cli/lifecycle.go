@@ -58,6 +58,7 @@ func (a *appRuntime) reapOrphanRuns(ctx context.Context) {
 		flushProfile := mErr == nil && meta.Profile != "" && sb.Running
 		if rmRes, rmErr := a.destroySandbox(ctx, sb.Name, flushProfile, true); rmErr != nil {
 			a.warnf("Could not reap orphan sandbox %s: %v", sb.Name, formatMSBError("msb rm", rmRes, rmErr))
+			continue
 		}
 		if _, sErr := os.Lstat(runDir); sErr == nil {
 			if tdErr := mounttab.TeardownFilterDir(runDir, a.MountCtl); tdErr != nil {
@@ -258,61 +259,66 @@ func (a *appRuntime) resume(ctx context.Context, args []string) error {
 }
 
 func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
+	_, err := a.resumeSandboxTracked(ctx, opts)
+	return err
+}
+
+func (a *appRuntime) resumeSandboxTracked(ctx context.Context, opts resumeOpts) (resumed bool, retErr error) {
 	if err := config.EnsurePrivateDir(a.Env.DataDir); err != nil {
-		return fmt.Errorf("prepare data dir: %w", err)
+		return false, fmt.Errorf("prepare data dir: %w", err)
 	}
 
 	dirID, err := runDirIDFromSandbox(opts.Sandbox)
 	if err != nil {
-		return err
+		return false, err
 	}
 	runFilterDir := filepath.Join(a.Env.DataDir, "run", dirID)
 	if info, sErr := os.Lstat(runFilterDir); sErr == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return fmt.Errorf("refusing non-directory run path %q", runFilterDir)
+			return false, fmt.Errorf("refusing non-directory run path %q", runFilterDir)
 		}
 	}
 
 	lsRes, err := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 	if err != nil {
-		return formatMSBError("list sandboxes", lsRes, err)
+		return false, formatMSBError("list sandboxes", lsRes, err)
 	}
 	sandboxes := msb.ParseSandboxList(lsRes.Stdout)
 	sb, exists := msb.FindSandbox(sandboxes, opts.Sandbox)
 	if !exists {
-		return fmt.Errorf("sandbox %q does not exist", opts.Sandbox)
+		return false, fmt.Errorf("sandbox %q does not exist", opts.Sandbox)
 	}
 	if sb.Running {
-		return fmt.Errorf("sandbox %q is already running", opts.Sandbox)
+		return false, fmt.Errorf("sandbox %q is already running", opts.Sandbox)
 	}
 
 	suspendedPath := filepath.Join(runFilterDir, "suspended")
 	meta, err := config.LoadRunMeta(suspendedPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("sandbox %q has no suspended state to resume", opts.Sandbox)
+			return false, fmt.Errorf("sandbox %q has no suspended state to resume", opts.Sandbox)
 		}
-		return fmt.Errorf("load suspended metadata: %w", err)
+		return false, fmt.Errorf("load suspended metadata: %w", err)
 	}
 	if meta.Sandbox != opts.Sandbox {
-		return fmt.Errorf("suspended metadata sandbox mismatch: got %q, want %q", meta.Sandbox, opts.Sandbox)
+		return false, fmt.Errorf("suspended metadata sandbox mismatch: got %q, want %q", meta.Sandbox, opts.Sandbox)
 	}
 	if meta.Profile != "" {
 		if _, pErr := persist.ValidateProfileName(meta.Profile); pErr != nil {
-			return pErr
+			return false, pErr
 		}
 	}
 	if meta.ContinueSession != "" {
 		if _, sErr := persist.ValidateSessionID(meta.ContinueSession); sErr != nil {
-			return sErr
+			return false, sErr
 		}
 	}
 	if opts.Continue || opts.ContinueSession != "" {
 		if meta.Mode == config.RunModeServe || meta.Mode == config.RunModeCmd {
-			return errors.New("cannot combine --continue or --session with --serve or --cmd")
+			return false, errors.New("cannot combine --continue or --session with --serve or --cmd")
 		}
 		if (meta.RemoteControl || meta.Mode == config.RunModeRemoteControl) && (opts.Detach || a.IsTTY == nil || !a.IsTTY()) {
-			return errors.New("cannot combine --continue or --session with detached --remote-control")
+			return false, errors.New("cannot combine --continue or --session with detached --remote-control")
 		}
 	}
 
@@ -320,7 +326,7 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 		meta.Mode = config.RunModeRemoteControl
 	}
 	if meta.Mode == config.RunModeTUI && (a.IsTTY == nil || !a.IsTTY()) {
-		return errors.New("not a TTY. Pass -d to resume a detached session, or run from an interactive terminal")
+		return false, errors.New("not a TTY. Pass -d to resume a detached session, or run from an interactive terminal")
 	}
 
 	seenIdx := make(map[int]bool, len(meta.Shares))
@@ -328,45 +334,45 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 	checkTargets := make([]pathsec.ShareTarget, 0, len(meta.Shares))
 	for _, sh := range meta.Shares {
 		if sh.Index < 0 || seenIdx[sh.Index] {
-			return fmt.Errorf("invalid or duplicate share index %d in suspended metadata", sh.Index)
+			return false, fmt.Errorf("invalid or duplicate share index %d in suspended metadata", sh.Index)
 		}
 		seenIdx[sh.Index] = true
 		if seenGuest[sh.GuestName] {
-			return fmt.Errorf("duplicate guest share name %q in suspended metadata", sh.GuestName)
+			return false, fmt.Errorf("duplicate guest share name %q in suspended metadata", sh.GuestName)
 		}
 		seenGuest[sh.GuestName] = true
 		if meta.WorkspaceHub {
 			if _, aErr := pathsec.ValidateGuestAlias(sh.GuestName); aErr != nil {
-				return aErr
+				return false, aErr
 			}
 		} else if !isSafeGuestShareName(sh.GuestName) {
-			return fmt.Errorf("invalid guest share name %q in suspended metadata", sh.GuestName)
+			return false, fmt.Errorf("invalid guest share name %q in suspended metadata", sh.GuestName)
 		}
 		if !sh.IsDir && sh.Masked {
-			return fmt.Errorf("tampered share metadata: regular file %q cannot be VCS-masked", sh.GuestName)
+			return false, fmt.Errorf("tampered share metadata: regular file %q cannot be VCS-masked", sh.GuestName)
 		}
 		if meta.MaskMode == config.MaskStrict && sh.IsDir && !sh.Masked && sh.VCSPolicy != config.VCSAllow && sh.VCSPolicy != config.VCSAllowHooks {
-			return fmt.Errorf("tampered share metadata: directory share %q disables VCS masking in strict mode", sh.GuestName)
+			return false, fmt.Errorf("tampered share metadata: directory share %q disables VCS masking in strict mode", sh.GuestName)
 		}
 		if !meta.WorkspaceHub && meta.MaskMode == config.MaskStrict && sh.IsDir && !sh.Masked {
-			return fmt.Errorf("tampered share metadata: directory share %q is unmasked in strict mode", sh.GuestName)
+			return false, fmt.Errorf("tampered share metadata: directory share %q is unmasked in strict mode", sh.GuestName)
 		}
 		effRO := sh.EffectiveReadOnly(meta.ReadOnly)
 		effVCS := sh.EffectiveVCSPolicy()
 		if effRO && effVCS == config.VCSAllowHooks {
-			return fmt.Errorf("conflicting share metadata for %q: read-only share cannot enable vcs-hooks", sh.GuestName)
+			return false, fmt.Errorf("conflicting share metadata for %q: read-only share cannot enable vcs-hooks", sh.GuestName)
 		}
 		target, vErr := pathsec.ValidateShare(sh.HostPath, a.sharePolicy(effRO))
 		if vErr != nil {
-			return vErr
+			return false, vErr
 		}
 		if target.IsDir != sh.IsDir {
-			return fmt.Errorf("share type changed on host for %s", sh.HostPath)
+			return false, fmt.Errorf("share type changed on host for %s", sh.HostPath)
 		}
 		checkTargets = append(checkTargets, target)
 	}
 	if err := pathsec.CheckDisjointHostPaths(checkTargets); err != nil {
-		return err
+		return false, err
 	}
 
 	effNoSkills := meta.NoSkills || opts.NoSkills
@@ -374,7 +380,7 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 	effNoAgentCache := meta.NoAgentCache || opts.NoAgentCache
 	hasSkills, hasRules, hasAgents, _, _, _, err := a.inspectGuestReadOnlyMounts(effNoSkills, effNoRules, effNoAgentCache)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if hasSkills && !meta.SkillsMounted && !effNoSkills {
 		a.logf("Note: agbox created %s before global skills existed. Run 'agbox stop %s' and start it again to mount them.", opts.Sandbox, opts.Sandbox)
@@ -396,35 +402,35 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 		var lErr error
 		profLock, lErr = persist.LockProfile(a.Env.DataDir, meta.Profile)
 		if lErr != nil {
-			return lErr
+			return false, lErr
 		}
 		lsRes, err = a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}})
 		if err != nil {
-			return formatMSBError("list sandboxes", lsRes, err)
+			return false, formatMSBError("list sandboxes", lsRes, err)
 		}
 		sandboxes = msb.ParseSandboxList(lsRes.Stdout)
 		sb, exists = msb.FindSandbox(sandboxes, opts.Sandbox)
 		if !exists {
-			return fmt.Errorf("sandbox %q does not exist", opts.Sandbox)
+			return false, fmt.Errorf("sandbox %q does not exist", opts.Sandbox)
 		}
 		if sb.Running {
-			return fmt.Errorf("sandbox %q is already running", opts.Sandbox)
+			return false, fmt.Errorf("sandbox %q is already running", opts.Sandbox)
 		}
 		if err := a.checkProfileNotActive(meta.Profile, opts.Sandbox, sandboxes); err != nil {
-			return err
+			return false, err
 		}
 		volName := persist.FormatProfileVolumeName(meta.Profile)
 		volExists, vErr := msb.VolumeExists(ctx, a.MSB, volName)
 		if vErr != nil {
-			return vErr
+			return false, vErr
 		}
 		if !volExists {
-			return fmt.Errorf("profile volume %q for %s no longer exists", volName, opts.Sandbox)
+			return false, fmt.Errorf("profile volume %q for %s no longer exists", volName, opts.Sandbox)
 		}
 	}
 
 	if err := config.EnsurePrivateDir(runFilterDir); err != nil {
-		return err
+		return false, err
 	}
 
 	willDetach := !opts.Supervised && ((meta.Mode == config.RunModeServe && (opts.Detach || a.IsTTY == nil || !a.IsTTY())) ||
@@ -438,7 +444,7 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
-			if keepAlive || hasMarker(filepath.Join(runFilterDir, "deleting")) {
+			if keepAlive || hasMarker(filepath.Join(runFilterDir, "deleting")) || (resumed && hasMarker(suspendedPath)) {
 				cancelRun()
 				return
 			}
@@ -467,16 +473,16 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 
 	if meta.WorkspaceHub {
 		if !dataDirSupportsFilter(a.Env.DataDir) {
-			return fmt.Errorf("DATA_DIR (%s) contains unsupported characters for FUSE mounts", a.Env.DataDir)
+			return false, fmt.Errorf("DATA_DIR (%s) contains unsupported characters for FUSE mounts", a.Env.DataDir)
 		}
 		if a.StartHub == nil {
-			return errors.New("FUSE Workspace Hub starter is not configured")
+			return false, errors.New("FUSE Workspace Hub starter is not configured")
 		}
 		wsDir := filepath.Join(runFilterDir, "ws")
 		wsSock := filepath.Join(runFilterDir, "ws.sock")
 		wsPIDFile := filepath.Join(runFilterDir, "ws.pid")
 		if err := config.EnsurePrivateDir(wsDir); err != nil {
-			return err
+			return false, err
 		}
 		initialHub := make([]vcsfuse.HubShareConfig, len(meta.Shares))
 		for idx, sh := range meta.Shares {
@@ -488,7 +494,7 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 			}
 		}
 		if _, fErr := a.StartHub(wsDir, wsSock, wsPIDFile, initialHub, !willDetach); fErr != nil {
-			return fmt.Errorf("remount FUSE Workspace Hub for %s: %w", opts.Sandbox, fErr)
+			return false, fmt.Errorf("remount FUSE Workspace Hub for %s: %w", opts.Sandbox, fErr)
 		}
 		mountsActive = true
 	} else {
@@ -497,18 +503,18 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 				continue
 			}
 			if !dataDirSupportsFilter(a.Env.DataDir) {
-				return fmt.Errorf("DATA_DIR (%s) contains unsupported characters for FUSE mounts", a.Env.DataDir)
+				return false, fmt.Errorf("DATA_DIR (%s) contains unsupported characters for FUSE mounts", a.Env.DataDir)
 			}
 			if a.StartFilter == nil {
-				return errors.New("FUSE filter starter is not configured")
+				return false, errors.New("FUSE filter starter is not configured")
 			}
 			mntDir := filepath.Join(runFilterDir, fmt.Sprintf("m%d", sh.Index))
 			pidFile := filepath.Join(runFilterDir, fmt.Sprintf("m%d.pid", sh.Index))
 			if err := config.EnsurePrivateDir(mntDir); err != nil {
-				return err
+				return false, err
 			}
 			if _, fErr := a.StartFilter(sh.HostPath, mntDir, pidFile, !willDetach); fErr != nil {
-				return fmt.Errorf("remount FUSE filter for %s: %w", sh.HostPath, fErr)
+				return false, fmt.Errorf("remount FUSE filter for %s: %w", sh.HostPath, fErr)
 			}
 			mountsActive = true
 		}
@@ -517,7 +523,7 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 	a.logf("Resuming %s (%d share(s))...", opts.Sandbox, len(meta.Shares))
 	startRes, err := a.MSB.Run(runCtx, msb.CommandRequest{Args: []string{"start", opts.Sandbox}})
 	if err != nil {
-		return formatMSBError("start sandbox "+opts.Sandbox, startRes, err)
+		return false, formatMSBError("start sandbox "+opts.Sandbox, startRes, err)
 	}
 	sandboxStarted = true
 
@@ -525,67 +531,68 @@ func (a *appRuntime) resumeSandbox(ctx context.Context, opts resumeOpts) error {
 	meta.Continue = opts.Continue
 	meta.ContinueSession = opts.ContinueSession
 	if err := config.SaveRunMeta(filepath.Join(runFilterDir, "run.meta"), meta); err != nil {
-		return fmt.Errorf("write run metadata: %w", err)
+		return false, fmt.Errorf("write run metadata: %w", err)
 	}
 	if err := os.Remove(suspendedPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("clear suspended marker: %w", err)
+		return false, fmt.Errorf("clear suspended marker: %w", err)
 	}
+	resumed = true
 	suspendAfter = true
 
 	if err := a.ensureGuestUser(runCtx, opts.Sandbox); err != nil {
-		return err
+		return true, err
 	}
 	if meta.AgentsMounted && !effNoAgentCache && hasAgents {
 		if err := a.setupGuestAgents(runCtx, opts.Sandbox); err != nil {
-			return err
+			return true, err
 		}
 	}
 	if meta.SkillsMounted && !effNoSkills && hasSkills {
 		if err := a.setupGuestSkills(runCtx, opts.Sandbox); err != nil {
-			return err
+			return true, err
 		}
 	}
 	if meta.RulesMounted && !effNoRules && hasRules {
 		if err := a.setupGuestRules(runCtx, opts.Sandbox); err != nil {
-			return err
+			return true, err
 		}
 	}
 	if meta.Profile != "" {
 		if err := a.setupGuestProfile(runCtx, opts.Sandbox); err != nil {
-			return err
+			return true, err
 		}
 	}
 	if !meta.NoAuth && !opts.NoAuth {
 		if err := a.pushAuth(runCtx, opts.Sandbox, meta.Agent); err != nil {
-			return err
+			return true, err
 		}
 	}
 	if err := a.pushKeys(runCtx, opts.Sandbox); err != nil {
-		return err
+		return true, err
 	}
 
 	detachedMarker := filepath.Join(runFilterDir, "detached")
-	execErr := a.execSession(runCtx, opts.Sandbox, meta, willDetach, false, opts.Supervised)
+	_, execErr := a.execSession(runCtx, opts.Sandbox, meta, willDetach, false, opts.Supervised)
 	if hasMarker(suspendedPath) || hasMarker(filepath.Join(runFilterDir, "deleting")) {
 		keepAlive = true
-		return nil
+		return true, nil
 	}
 	if execErr != nil {
 		if opts.Supervised && runCtx.Err() != nil {
 			suspendAfter = true
-			return nil
+			return true, nil
 		}
-		return execErr
+		return true, execErr
 	}
 	if willDetach {
 		if err := writeMarkerAtomic(detachedMarker, fmt.Sprintf("%d\n", a.PID)); err != nil {
-			return fmt.Errorf("mark detached session: %w", err)
+			return true, fmt.Errorf("mark detached session: %w", err)
 		}
 		keepAlive = true
-		return nil
+		return true, nil
 	}
 	suspendAfter = true
-	return nil
+	return true, nil
 }
 
 func (a *appRuntime) stop(ctx context.Context, args []string) error {
@@ -654,9 +661,11 @@ func (a *appRuntime) remove(ctx context.Context, args []string) error {
 		if a.IsTTY == nil || !a.IsTTY() {
 			return errors.New("refusing to delete without --yes in non-interactive mode")
 		}
-		fmt.Fprintf(a.Stdout, "This deletes all agbox sandboxes (%s, %s*), snapshots (%s:*), profile volumes (%s*), active FUSE mounts, and %s.\n",
-			config.BaseSandbox, config.RunPrefix, config.SnapGroup, persist.ProfileVolumePrefix, a.Env.DataDir)
-		fmt.Fprintln(a.Stdout, "It does NOT modify the msb binary, your other sandboxes, or cached base images (beyond pruning unused cached images).")
+		fmt.Fprintf(a.Stdout, "This command deletes all %s* sandboxes, snapshots (%s:*), and profile volumes (%s*).\n",
+			sandboxPrefix, config.SnapGroup, persist.ProfileVolumePrefix)
+		fmt.Fprintf(a.Stdout, "It also deletes managed systemd user services (agbox@.service and agbox@*.service), active FUSE mounts, and %s.\n",
+			a.Env.DataDir)
+		fmt.Fprintln(a.Stdout, "It does not modify the msb binary or other sandboxes. It prunes only unused cached images.")
 		fmt.Fprint(a.Stdout, "Proceed? [y/N] ")
 		sc := bufio.NewScanner(a.Stdin)
 		if !sc.Scan() {
@@ -671,17 +680,6 @@ func (a *appRuntime) remove(ctx context.Context, args []string) error {
 	a.cleanupManagedServices(ctx)
 
 	runRoot := filepath.Join(a.Env.DataDir, "run")
-	if entries, rErr := os.ReadDir(runRoot); rErr == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				continue
-			}
-			dirPath := filepath.Join(runRoot, entry.Name())
-			if uErr := mounttab.UnmountFilterDir(dirPath, a.MountCtl); uErr != nil {
-				a.warnf("Could not unmount shares in %s: %v", dirPath, uErr)
-			}
-		}
-	}
 
 	if mErr := a.ensureMSB(); mErr != nil {
 		a.warnf("Skipping msb resource deletion because msb is unavailable: %v", mErr)
@@ -797,7 +795,7 @@ func (a *appRuntime) remove(ctx context.Context, args []string) error {
 		return stErr
 	}
 
-	a.logf("Removed agbox state (%s).", a.Env.DataDir)
+	a.logf("Deleted agbox state (%s).", a.Env.DataDir)
 	return nil
 }
 
@@ -826,22 +824,30 @@ func (a *appRuntime) status(ctx context.Context, args []string) error {
 		fmt.Fprintln(a.Stdout, "base_snapshot: not configured")
 	}
 
-	_ = a.ensureMSB()
+	if mErr := a.ensureMSB(); mErr != nil {
+		a.warnf("Could not initialize msb for status: %v", mErr)
+	}
 	a.printPersistenceStatus(ctx)
 	a.printServiceStatus(ctx)
 
 	if a.MSB != nil {
+		fmt.Fprintln(a.Stdout, "\n== sandboxes ==")
 		if lsRes, lErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"ls"}}); lErr == nil {
-			fmt.Fprintln(a.Stdout, "\n== sandboxes ==")
 			_, _ = a.Stdout.Write([]byte(lsRes.Stdout))
+		} else {
+			fmt.Fprintf(a.Stdout, "error (%v)\n", formatMSBError("msb ls", lsRes, lErr))
 		}
+		fmt.Fprintln(a.Stdout, "\n== snapshots ==")
 		if snapRes, sErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"snap", "ls"}}); sErr == nil {
-			fmt.Fprintln(a.Stdout, "\n== snapshots ==")
 			_, _ = a.Stdout.Write([]byte(snapRes.Stdout))
+		} else {
+			fmt.Fprintf(a.Stdout, "error (%v)\n", formatMSBError("msb snap ls", snapRes, sErr))
 		}
+		fmt.Fprintln(a.Stdout, "\n== storage ==")
 		if dfRes, dErr := a.MSB.Run(ctx, msb.CommandRequest{Args: []string{"df"}}); dErr == nil {
-			fmt.Fprintln(a.Stdout, "\n== storage ==")
 			_, _ = a.Stdout.Write([]byte(dfRes.Stdout))
+		} else {
+			fmt.Fprintf(a.Stdout, "error (%v)\n", formatMSBError("msb df", dfRes, dErr))
 		}
 	}
 	return nil

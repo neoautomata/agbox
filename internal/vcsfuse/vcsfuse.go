@@ -135,6 +135,7 @@ func isProtectedVCSHookRelPath(relPath string) bool {
 	}
 
 	inGit := false
+	gitRootIdx := -1
 	inGitSafeData := false
 	inJJ := false
 	inJJSafeData := false
@@ -151,7 +152,7 @@ func isProtectedVCSHookRelPath(relPath string) bool {
 		if inGit && !inGitSafeData && (seg == "config" || seg == "config.worktree" || seg == "commondir" || seg == "gitdir") {
 			return true
 		}
-		if inJJ && !inJJSafeData && (seg == "config.toml" || seg == "config") {
+		if inJJ && !inJJSafeData && (seg == "config.toml" || (!inGit && seg == "config")) {
 			return true
 		}
 		if inDarcs && seg == "prefs" {
@@ -167,20 +168,35 @@ func isProtectedVCSHookRelPath(relPath string) bool {
 			return true
 		}
 
-		if inGit && (seg == "refs" || seg == "logs" || seg == "objects") && i > 0 && segs[i-1] != "modules" && segs[i-1] != "worktrees" {
-			inGitSafeData = true
+		if inGit && gitRootIdx >= 0 && i > gitRootIdx+1 && segs[i-1] == "refs" {
+			refsIdx := i - 1
+			isDirectRefs := refsIdx == gitRootIdx+1 || (refsIdx == gitRootIdx+2 && segs[gitRootIdx+1] == "logs")
+			if isDirectRefs && (seg == "heads" || seg == "tags" || seg == "remotes" || seg == "notes" || seg == "replace" || seg == "bisect") {
+				inGitSafeData = true
+			}
 		}
 		if inJJ && (seg == "op_heads" || seg == "op_store" || seg == "working_copy") {
 			inJJSafeData = true
 		}
+		if inJJ && !inJJSafeData && !inGit && seg == "git" {
+			inGit = true
+			gitRootIdx = i
+			inGitSafeData = false
+		}
 
 		switch seg {
 		case ".git":
-			inGit = true
+			if !inGit {
+				inGit = true
+				gitRootIdx = i
+			}
 			inGitSafeData = false
 		case ".jj":
 			inJJ = true
 			inJJSafeData = false
+			inGit = false
+			gitRootIdx = -1
+			inGitSafeData = false
 		case ".svn", ".pijul":
 			inSvnOrPijul = true
 		case "_darcs":
@@ -344,6 +360,15 @@ func (p *pinnedRoot) Revoke(errno syscall.Errno) {
 		_ = unix.Close(p.fd)
 		p.fd = -1
 	}
+}
+
+func (p *pinnedRoot) statRoot(st *syscall.Stat_t, btime *syscall.Timespec) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.fd < 0 {
+		return p.revokedErr
+	}
+	return statAtNoFollow(p.fd, "", st, btime)
 }
 
 func (p *pinnedRoot) openat2(relPath string, flags int, mode uint32) (int, error) {
@@ -626,10 +651,52 @@ const (
 	movedFlagHook
 )
 
-// promoteOpenHandles updates VCS and hook flags on open file and directory handles matching targets.
-func (s *shareSlot) promoteOpenHandles(targets []movedHandleTarget) {
+type fileRevocation struct {
+	file  *safeFile
+	errno syscall.Errno
+}
+
+type dirRevocation struct {
+	dir   *filteredDir
+	errno syscall.Errno
+}
+
+type rootRevocation struct {
+	root  *pinnedRoot
+	errno syscall.Errno
+}
+
+// revocationBatch holds handles detached under slot locks so callers close
+// host descriptors after releasing hub and slot locks.
+type revocationBatch struct {
+	files []fileRevocation
+	dirs  []dirRevocation
+	roots []rootRevocation
+}
+
+func (b *revocationBatch) merge(other revocationBatch) {
+	b.files = append(b.files, other.files...)
+	b.dirs = append(b.dirs, other.dirs...)
+	b.roots = append(b.roots, other.roots...)
+}
+
+func (b *revocationBatch) apply() {
+	for _, item := range b.files {
+		item.file.revoke(item.errno)
+	}
+	for _, item := range b.dirs {
+		item.dir.revoke(item.errno)
+	}
+	for _, item := range b.roots {
+		item.root.Revoke(item.errno)
+	}
+}
+
+// detachPromotedOpenHandles updates VCS and hook flags on open handles matching
+// targets and returns handles that require revocation under the active policy.
+func (s *shareSlot) detachPromotedOpenHandles(targets []movedHandleTarget) revocationBatch {
 	if s == nil || len(targets) == 0 {
-		return
+		return revocationBatch{}
 	}
 	var flagsByID map[[2]uint64]uint8
 	for _, t := range targets {
@@ -652,13 +719,10 @@ func (s *shareSlot) promoteOpenHandles(targets []movedHandleTarget) {
 		flagsByID[[2]uint64{t.dev, t.ino}] |= mask
 	}
 	if len(flagsByID) == 0 {
-		return
+		return revocationBatch{}
 	}
 
-	var toRevokeESTALE []*safeFile
-	var toRevokeEROFS []*safeFile
-	var dirToRevokeESTALE []*filteredDir
-
+	var batch revocationBatch
 	s.filesMu.Lock()
 	pol := s.getVCSPolicy()
 	for sf := range s.files {
@@ -675,10 +739,10 @@ func (s *shareSlot) promoteOpenHandles(targets []movedHandleTarget) {
 			sf.isHook.Store(true)
 		}
 		if dstVCS && pol == config.VCSMask {
-			toRevokeESTALE = append(toRevokeESTALE, sf)
+			batch.files = append(batch.files, fileRevocation{file: sf, errno: syscall.ESTALE})
 			delete(s.files, sf)
 		} else if sf.writable && dstHook && pol == config.VCSAllow {
-			toRevokeEROFS = append(toRevokeEROFS, sf)
+			batch.files = append(batch.files, fileRevocation{file: sf, errno: syscall.EROFS})
 			delete(s.files, sf)
 		}
 	}
@@ -689,26 +753,12 @@ func (s *shareSlot) promoteOpenHandles(targets []movedHandleTarget) {
 		}
 		d.isVCS.Store(true)
 		if pol == config.VCSMask {
-			dirToRevokeESTALE = append(dirToRevokeESTALE, d)
+			batch.dirs = append(batch.dirs, dirRevocation{dir: d, errno: syscall.ESTALE})
 			delete(s.dirs, d)
 		}
 	}
 	s.filesMu.Unlock()
-
-	for _, sf := range toRevokeESTALE {
-		sf.revoke(syscall.ESTALE)
-	}
-	for _, sf := range toRevokeEROFS {
-		sf.revoke(syscall.EROFS)
-	}
-	for _, d := range dirToRevokeESTALE {
-		d.revoke(syscall.ESTALE)
-	}
-}
-
-// promoteOpenHandlesForRename updates VCS and hook flags on open handles matching dev and ino.
-func (s *shareSlot) promoteOpenHandlesForRename(dev, ino uint64, dstRel string) {
-	s.promoteOpenHandles([]movedHandleTarget{{dev: dev, ino: ino, dstRel: dstRel}})
+	return batch
 }
 
 func (s *shareSlot) openWritableCount() int {
@@ -758,102 +808,94 @@ func (s *shareSlot) openWritableHookCount() int {
 	return n
 }
 
-func (s *shareSlot) revokeWritableFiles(errno syscall.Errno) {
+func (s *shareSlot) detachWritableFiles(errno syscall.Errno) revocationBatch {
 	if s == nil {
-		return
+		return revocationBatch{}
 	}
 	s.filesMu.Lock()
-	var targets []*safeFile
+	var batch revocationBatch
 	for sf := range s.files {
 		if sf.writable {
-			targets = append(targets, sf)
+			batch.files = append(batch.files, fileRevocation{file: sf, errno: errno})
 			delete(s.files, sf)
 		}
 	}
 	s.filesMu.Unlock()
-	for _, sf := range targets {
-		sf.revoke(errno)
-	}
+	return batch
 }
 
-// revokeVCSDescriptors revokes all open file and directory handles on VCS paths.
-func (s *shareSlot) revokeVCSDescriptors(errno syscall.Errno) {
+// detachVCSDescriptors removes all open file and directory handles on VCS paths
+// from the slot and returns them for revocation outside slot locks.
+func (s *shareSlot) detachVCSDescriptors(errno syscall.Errno) revocationBatch {
 	if s == nil {
-		return
+		return revocationBatch{}
 	}
 	s.filesMu.Lock()
-	var fileTargets []*safeFile
+	var batch revocationBatch
 	for sf := range s.files {
 		if sf.isVCS.Load() {
-			fileTargets = append(fileTargets, sf)
+			batch.files = append(batch.files, fileRevocation{file: sf, errno: errno})
 			delete(s.files, sf)
 		}
 	}
-	var dirTargets []*filteredDir
 	for d := range s.dirs {
 		if d.isVCS.Load() {
-			dirTargets = append(dirTargets, d)
+			batch.dirs = append(batch.dirs, dirRevocation{dir: d, errno: errno})
 			delete(s.dirs, d)
 		}
 	}
 	s.filesMu.Unlock()
-
-	for _, sf := range fileTargets {
-		sf.revoke(errno)
-	}
-	for _, d := range dirTargets {
-		d.revoke(errno)
-	}
+	return batch
 }
 
-// revokeWritableHookFiles revokes all open writable handles on protected VCS paths.
-func (s *shareSlot) revokeWritableHookFiles(errno syscall.Errno) {
+// detachWritableHookFiles removes all open writable handles on protected VCS paths
+// from the slot and returns them for revocation outside slot locks.
+func (s *shareSlot) detachWritableHookFiles(errno syscall.Errno) revocationBatch {
 	if s == nil {
-		return
+		return revocationBatch{}
 	}
 	s.filesMu.Lock()
-	var targets []*safeFile
+	var batch revocationBatch
 	for sf := range s.files {
 		if sf.writable && sf.isHook.Load() {
-			targets = append(targets, sf)
+			batch.files = append(batch.files, fileRevocation{file: sf, errno: errno})
 			delete(s.files, sf)
 		}
 	}
 	s.filesMu.Unlock()
-
-	for _, sf := range targets {
-		sf.revoke(errno)
-	}
+	return batch
 }
 
-func (s *shareSlot) revokeAll(errno syscall.Errno) {
+func (s *shareSlot) detachAll(errno syscall.Errno) revocationBatch {
 	if s == nil {
-		return
+		return revocationBatch{}
 	}
 	s.revoked.Store(true)
 	s.filesMu.Lock()
-	targets := make([]*safeFile, 0, len(s.files))
+	batch := revocationBatch{
+		files: make([]fileRevocation, 0, len(s.files)),
+		dirs:  make([]dirRevocation, 0, len(s.dirs)),
+	}
 	for sf := range s.files {
-		targets = append(targets, sf)
+		batch.files = append(batch.files, fileRevocation{file: sf, errno: errno})
 	}
 	s.files = make(map[*safeFile]struct{})
 
-	dirTargets := make([]*filteredDir, 0, len(s.dirs))
 	for d := range s.dirs {
-		dirTargets = append(dirTargets, d)
+		batch.dirs = append(batch.dirs, dirRevocation{dir: d, errno: errno})
 	}
 	s.dirs = make(map[*filteredDir]struct{})
 	s.filesMu.Unlock()
 
-	for _, sf := range targets {
-		sf.revoke(errno)
-	}
-	for _, d := range dirTargets {
-		d.revoke(errno)
-	}
 	if s.root != nil {
-		s.root.Revoke(errno)
+		batch.roots = append(batch.roots, rootRevocation{root: s.root, errno: errno})
 	}
+	return batch
+}
+
+func (s *shareSlot) revokeAll(errno syscall.Errno) {
+	batch := s.detachAll(errno)
+	batch.apply()
 }
 
 func (s *shareSlot) maskMode(mode uint32, hookProtected bool) uint32 {
@@ -1359,17 +1401,21 @@ type safeFile struct {
 	osFile     *os.File
 	raw        *fs.LoopbackFile
 	slot       *shareSlot
-	relPath    string
 	dev        uint64
 	ino        uint64
+	active     atomic.Bool
 	isVCS      atomic.Bool
 	isHook     atomic.Bool
 	idMap      guestIDMap
 	writable   bool
 	revokedErr syscall.Errno
+	done       chan struct{}
+	doneClosed bool
 	euid       int
 	egid       int
 }
+
+var _ fs.FileStatxer = (*safeFile)(nil)
 
 func (f *safeFile) activeIDMap() guestIDMap {
 	if f.slot != nil {
@@ -1396,17 +1442,20 @@ func newRegisteredSafeFile(fd int, st *syscall.Stat_t, slot *shareSlot, relPath 
 		osFile:   osf,
 		raw:      fs.NewLoopbackFileFromOS(osf),
 		slot:     slot,
-		relPath:  relPath,
 		dev:      dev,
 		ino:      ino,
 		idMap:    idMap,
 		writable: writable,
+		done:     make(chan struct{}),
 		euid:     euid,
 		egid:     egid,
 	}
+	sf.active.Store(osf != nil)
 	sf.isVCS.Store(isVCSAdminPath(relPath, hidden))
 	sf.isHook.Store(isProtectedVCSHookRelPath(relPath))
 	if errno := slot.registerFile(sf); errno != 0 {
+		sf.active.Store(false)
+		sf.closeDoneLocked()
 		_ = osf.Close()
 		sf.osFile = nil
 		sf.raw = nil
@@ -1416,11 +1465,15 @@ func newRegisteredSafeFile(fd int, st *syscall.Stat_t, slot *shareSlot, relPath 
 	return sf, 0
 }
 
+func (f *safeFile) closeDoneLocked() {
+	if f.done != nil && !f.doneClosed {
+		close(f.done)
+		f.doneClosed = true
+	}
+}
+
 func (f *safeFile) isRevoked() bool {
-	f.mu.RLock()
-	rev := f.osFile == nil || f.revokedErr != 0
-	f.mu.RUnlock()
-	return rev
+	return !f.active.Load()
 }
 
 func (f *safeFile) revoke(errno syscall.Errno) {
@@ -1432,6 +1485,8 @@ func (f *safeFile) revoke(errno syscall.Errno) {
 	if f.revokedErr == 0 {
 		f.revokedErr = errno
 	}
+	f.active.Store(false)
+	f.closeDoneLocked()
 	if f.osFile != nil {
 		_ = f.osFile.Close()
 		f.osFile = nil
@@ -1513,6 +1568,8 @@ func (f *safeFile) Release(ctx context.Context) syscall.Errno {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.active.Store(false)
+	f.closeDoneLocked()
 	if f.raw == nil {
 		return 0
 	}
@@ -1558,13 +1615,46 @@ func (f *safeFile) Setlk(ctx context.Context, owner uint64, lk *fuse.FileLock, f
 	return f.raw.Setlk(ctx, owner, lk, flags)
 }
 
+// Setlkw retries non-blocking Setlk calls so f.mu.RLock never blocks revoke or Release.
 func (f *safeFile) Setlkw(ctx context.Context, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	if errno := f.checkAccessLocked(false); errno != 0 {
-		return errno
+	backoff := 2 * time.Millisecond
+	const maxBackoff = 50 * time.Millisecond
+	for {
+		f.mu.RLock()
+		errno := f.checkAccessLocked(false)
+		if errno == 0 {
+			errno = f.raw.Setlk(ctx, owner, lk, flags)
+		}
+		doneCh := f.done
+		f.mu.RUnlock()
+
+		if errno != syscall.EAGAIN && errno != syscall.EWOULDBLOCK && errno != syscall.EACCES {
+			return errno
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return syscall.EINTR
+		case <-doneCh:
+			timer.Stop()
+			f.mu.RLock()
+			revErr := f.checkAccessLocked(false)
+			f.mu.RUnlock()
+			if revErr != 0 {
+				return revErr
+			}
+			return syscall.EBADF
+		case <-timer.C:
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
 	}
-	return f.raw.Setlkw(ctx, owner, lk, flags)
 }
 
 func (f *safeFile) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
@@ -1582,6 +1672,25 @@ func (f *safeFile) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno
 		f.activeIDMap().applyAttr(&out.Attr)
 	}
 	return errno
+}
+
+func (f *safeFile) Statx(ctx context.Context, flags uint32, mask uint32, out *fuse.StatxOut) syscall.Errno {
+	_ = ctx
+	var sx unix.Statx_t
+	statxFlags := int(flags) | unix.AT_EMPTY_PATH | unix.AT_SYMLINK_NOFOLLOW
+	errno := f.withFDRead(func(fd int) syscall.Errno {
+		return fs.ToErrno(unix.Statx(fd, "", statxFlags, int(mask), &sx))
+	})
+	if errno != 0 {
+		return errno
+	}
+	out.FromStatx(&sx)
+	if f.slot != nil {
+		hookProt := f.isHook.Load() && f.slot.getVCSPolicy() == config.VCSAllow
+		out.Statx.Mode = uint16(f.slot.maskMode(uint32(out.Statx.Mode), hookProt))
+	}
+	f.activeIDMap().applyStatx(out)
+	return 0
 }
 
 func (f *safeFile) Lseek(ctx context.Context, off uint64, whence uint32) (uint64, syscall.Errno) {
@@ -1613,6 +1722,25 @@ func (f *safeFile) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.At
 	}
 	if errno := validateSetAttrInWithIDMap(in, f.euid, f.egid, f.activeIDMap()); errno != 0 {
 		return errno
+	}
+	if f.slot != nil && f.slot.isFile {
+		sc, err := f.osFile.SyscallConn()
+		if err != nil {
+			return syscall.EBADF
+		}
+		var st syscall.Stat_t
+		var statErr syscall.Errno
+		if cErr := sc.Control(func(fd uintptr) {
+			statErr = fs.ToErrno(syscall.Fstat(int(fd), &st))
+		}); cErr != nil {
+			return syscall.EBADF
+		}
+		if statErr != 0 {
+			return statErr
+		}
+		if (st.Mode&syscall.S_IFMT) != syscall.S_IFREG || st.Nlink != 1 {
+			return syscall.EPERM
+		}
 	}
 	cleanIn := *in
 	cleanIn.Valid &^= fuse.FATTR_UID | fuse.FATTR_GID
@@ -1714,9 +1842,7 @@ func (n *filteredNode) Create(ctx context.Context, name string, flags uint32, mo
 
 	cleanMode := sanitizeCreateMode(mode)
 	baseFlags := sanitizeOpenFlags(flags, false)
-	if baseFlags&(syscall.O_WRONLY|syscall.O_RDWR) == 0 {
-		baseFlags |= syscall.O_WRONLY
-	}
+	writable := baseFlags&(syscall.O_WRONLY|syscall.O_RDWR) != 0
 
 	fd := -1
 	var st syscall.Stat_t
@@ -1784,7 +1910,7 @@ func (n *filteredNode) Create(ctx context.Context, name string, flags uint32, mo
 	}
 
 	childRel := joinRelPath(parentRel, name)
-	sf, regErrno := newRegisteredSafeFile(fd, &st, n.slot, childRel, true, n.root.euid, n.root.egid)
+	sf, regErrno := newRegisteredSafeFile(fd, &st, n.slot, childRel, writable, n.root.euid, n.root.egid)
 	if regErrno != 0 {
 		if createdNew {
 			_ = unix.Unlinkat(dirFD, name, 0)
@@ -1935,6 +2061,10 @@ func (n *filteredNode) Link(ctx context.Context, target fs.InodeEmbedder, name s
 		return nil, syscall.EXDEV
 	}
 
+	var revocations revocationBatch
+	defer func() {
+		revocations.apply()
+	}()
 	n.slot.lockRename()
 	defer n.slot.unlockRename()
 
@@ -1972,14 +2102,15 @@ func (n *filteredNode) Link(ctx context.Context, target fs.InodeEmbedder, name s
 	}
 	defer unix.Close(dstDirFD)
 
-	if n.slot != nil {
-		n.slot.promoteOpenHandlesForRename(uint64(srcSt.Dev), srcSt.Ino, dstRel)
-	}
 	if err := unix.Linkat(srcParentFD, srcBase, dstDirFD, name, 0); err != nil {
 		return nil, fs.ToErrno(err)
 	}
 	if n.slot != nil {
-		n.slot.promoteOpenHandlesForRename(uint64(srcSt.Dev), srcSt.Ino, dstRel)
+		revocations.merge(n.slot.detachPromotedOpenHandles([]movedHandleTarget{{
+			dev:    uint64(srcSt.Dev),
+			ino:    srcSt.Ino,
+			dstRel: dstRel,
+		}}))
 	}
 	var st syscall.Stat_t
 	var btime syscall.Timespec
@@ -2012,6 +2143,9 @@ func (n *filteredNode) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 
 func (n *filteredNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	_ = ctx
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	parentRel, errno := n.checkWritableChild(name, true)
 	if errno != 0 {
 		return errno
@@ -2026,6 +2160,9 @@ func (n *filteredNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 
 func (n *filteredNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	_ = ctx
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	parentRel, errno := n.checkWritableChild(name, true)
 	if errno != 0 {
 		return errno
@@ -2176,6 +2313,10 @@ func (n *filteredNode) Rename(ctx context.Context, name string, newParent fs.Ino
 		return syscall.EXDEV
 	}
 
+	var revocations revocationBatch
+	defer func() {
+		revocations.apply()
+	}()
 	n.slot.lockRename()
 	defer n.slot.unlockRename()
 
@@ -2243,21 +2384,14 @@ func (n *filteredNode) Rename(ctx context.Context, name string, newParent fs.Ino
 		}
 	}
 
-	if n.slot != nil {
-		n.slot.promoteOpenHandles(srcTargets)
-		if flags&unix.RENAME_EXCHANGE != 0 && hasDst {
-			n.slot.promoteOpenHandles(dstTargets)
-		}
-	}
-
 	if err := unix.Renameat2(fd1, name, fd2, newName, uint(flags)); err != nil {
 		return fs.ToErrno(err)
 	}
 
 	if n.slot != nil {
-		n.slot.promoteOpenHandles(srcTargets)
+		revocations.merge(n.slot.detachPromotedOpenHandles(srcTargets))
 		if flags&unix.RENAME_EXCHANGE != 0 && hasDst {
-			n.slot.promoteOpenHandles(dstTargets)
+			revocations.merge(n.slot.detachPromotedOpenHandles(dstTargets))
 		}
 	}
 	return 0
@@ -2318,17 +2452,20 @@ func (n *filteredNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.Se
 	if n.root == nil {
 		return syscall.EIO
 	}
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
+	if f != nil {
+		if fsa, ok := f.(fs.FileSetattrer); ok {
+			return fsa.Setattr(ctx, in, out)
+		}
+	}
 	rel, mutErr := n.checkMutationOnSelf()
 	if mutErr != 0 {
 		return mutErr
 	}
 	if errno := validateSetAttrInWithIDMap(in, n.root.euid, n.root.egid, n.activeIDMap()); errno != 0 {
 		return errno
-	}
-	if f != nil {
-		if fsa, ok := f.(fs.FileSetattrer); ok {
-			return fsa.Setattr(ctx, in, out)
-		}
 	}
 
 	fd, _, errno := n.openNodeOPath()
@@ -2429,6 +2566,9 @@ func (n *filteredNode) Listxattr(ctx context.Context, dest []byte) (uint32, sysc
 
 func (n *filteredNode) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
 	_ = ctx
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	if _, mutErr := n.checkMutationOnSelf(); mutErr != 0 {
 		return mutErr
 	}
@@ -2455,6 +2595,9 @@ func (n *filteredNode) Setxattr(ctx context.Context, attr string, data []byte, f
 
 func (n *filteredNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	_ = ctx
+	n.slot.rlockRename()
+	defer n.slot.runlockRename()
+
 	if _, mutErr := n.checkMutationOnSelf(); mutErr != 0 {
 		return mutErr
 	}
@@ -2569,7 +2712,7 @@ func (n *filteredNode) OpendirHandle(ctx context.Context, _ uint32) (fs.FileHand
 		hidden = n.hidden
 	}
 	isVCS := isVCSAdminPath(rel, hidden)
-	fd, regErrno := newRegisteredFilteredDir(ds, rd, n.slot, rel, uint64(dirSt.Dev), dirSt.Ino, isVCS, n.activeHiddenMap())
+	fd, regErrno := newRegisteredFilteredDir(ds, rd, n.slot, uint64(dirSt.Dev), dirSt.Ino, isVCS, n.activeHiddenMap())
 	if regErrno != 0 {
 		if r, ok := ds.(fs.FileReleasedirer); ok {
 			r.Releasedir(ctx, 0)
@@ -2580,9 +2723,8 @@ func (n *filteredNode) OpendirHandle(ctx context.Context, _ uint32) (fs.FileHand
 }
 
 type filteredDir struct {
-	mu         sync.RWMutex
+	mu         sync.Mutex
 	slot       *shareSlot
-	relPath    string
 	dev        uint64
 	ino        uint64
 	isVCS      atomic.Bool
@@ -2592,15 +2734,14 @@ type filteredDir struct {
 	revokedErr syscall.Errno
 }
 
-func newRegisteredFilteredDir(raw fs.FileHandle, inner fs.FileReaddirenter, slot *shareSlot, relPath string, dev, ino uint64, isVCS bool, hidden map[string]struct{}) (*filteredDir, syscall.Errno) {
+func newRegisteredFilteredDir(raw fs.FileHandle, inner fs.FileReaddirenter, slot *shareSlot, dev, ino uint64, isVCS bool, hidden map[string]struct{}) (*filteredDir, syscall.Errno) {
 	fd := &filteredDir{
-		slot:    slot,
-		relPath: relPath,
-		dev:     dev,
-		ino:     ino,
-		inner:   inner,
-		raw:     raw,
-		hidden:  hidden,
+		slot:   slot,
+		dev:    dev,
+		ino:    ino,
+		inner:  inner,
+		raw:    raw,
+		hidden: hidden,
 	}
 	fd.isVCS.Store(isVCS)
 	if slot != nil {
@@ -2645,8 +2786,8 @@ func (d *filteredDir) isEntryHidden(name string) bool {
 }
 
 func (d *filteredDir) Readdirent(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	if d.revokedErr != 0 {
 		return nil, d.revokedErr
@@ -2692,18 +2833,18 @@ func (d *filteredDir) Releasedir(ctx context.Context, releaseFlags uint32) {
 		d.slot.unregisterDir(d)
 	}
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	raw := d.raw
 	d.raw = nil
 	d.inner = nil
-	d.mu.Unlock()
 	if r, ok := raw.(fs.FileReleasedirer); ok {
 		r.Releasedir(ctx, releaseFlags)
 	}
 }
 
 func (d *filteredDir) Seekdir(ctx context.Context, off uint64) syscall.Errno {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.revokedErr != 0 {
 		return d.revokedErr
 	}
@@ -2717,8 +2858,8 @@ func (d *filteredDir) Seekdir(ctx context.Context, off uint64) syscall.Errno {
 }
 
 func (d *filteredDir) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.revokedErr != 0 {
 		return d.revokedErr
 	}
@@ -2782,8 +2923,10 @@ func (s *registeredDirStream) Close() {
 
 func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t, slot *shareSlot) *filteredNode {
 	var idMap guestIDMap
+	var hidden map[string]struct{}
 	if slot != nil {
 		idMap = slot.idMap
+		hidden = slot.hidden
 	}
 	rootData := &fs.LoopbackRoot{
 		Path: resolvedSrc,
@@ -2794,7 +2937,7 @@ func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t
 			LoopbackNode: &fs.LoopbackNode{RootData: rd},
 			root:         pr,
 			slot:         slot,
-			hidden:       slot.hidden,
+			hidden:       hidden,
 			idMap:        idMap,
 		}
 	}
@@ -2802,7 +2945,7 @@ func buildRootFilteredNode(resolvedSrc string, pr *pinnedRoot, st syscall.Stat_t
 		LoopbackNode: &fs.LoopbackNode{RootData: rootData},
 		root:         pr,
 		slot:         slot,
-		hidden:       slot.hidden,
+		hidden:       hidden,
 		idMap:        idMap,
 		isRoot:       true,
 	}
@@ -3031,17 +3174,23 @@ func StartSubprocess(exePath, srcDir, mntDir, pidFile string, dieWithParent bool
 }
 
 type daemonLaunchConfig struct {
-	exePath       string
-	args          []string
-	mntDir        string
-	pidFile       string
-	pipePayload   []byte
-	dieWithParent bool
-	label         string
-	readyCheck    func() bool
+	exePath        string
+	args           []string
+	mntDir         string
+	pidFile        string
+	pipePayload    []byte
+	dieWithParent  bool
+	label          string
+	startupTimeout time.Duration
+	readyCheck     func() bool
 }
 
 func launchFilterDaemon(cfg daemonLaunchConfig) (int, error) {
+	timeout := cfg.startupTimeout
+	if timeout <= 0 {
+		timeout = daemonStartupTimeout
+	}
+
 	errPath := daemonStderrPath(cfg.pidFile)
 	errFile, err := openDaemonStderrFile(errPath)
 	if err != nil {
@@ -3109,11 +3258,28 @@ func launchFilterDaemon(cfg daemonLaunchConfig) (int, error) {
 	}
 
 	if pipeW != nil {
-		_, writeErr := pipeW.Write(cfg.pipePayload)
-		_ = pipeW.Close()
-		if writeErr != nil {
+		_ = pipeW.SetWriteDeadline(time.Now().Add(timeout))
+		writeDone := make(chan error, 1)
+		go func() {
+			_, wErr := pipeW.Write(cfg.pipePayload)
+			cErr := pipeW.Close()
+			if wErr != nil {
+				writeDone <- wErr
+				return
+			}
+			writeDone <- cErr
+		}()
+		select {
+		case writeErr := <-writeDone:
+			if writeErr != nil {
+				stopFailedChild(false)
+				return 0, appendDaemonStderr(fmt.Errorf("write %s bootstrap pipe: %w", cfg.label, writeErr), errPath)
+			}
+		case <-time.After(timeout + 100*time.Millisecond):
 			stopFailedChild(false)
-			return 0, appendDaemonStderr(fmt.Errorf("write %s bootstrap pipe: %w", cfg.label, writeErr), errPath)
+			_ = pipeW.Close()
+			<-writeDone
+			return 0, appendDaemonStderr(fmt.Errorf("timed out writing %s bootstrap pipe", cfg.label), errPath)
 		}
 	}
 
@@ -3122,7 +3288,7 @@ func launchFilterDaemon(cfg daemonLaunchConfig) (int, error) {
 		return 0, fmt.Errorf("write %s pidfile %q: %w", cfg.label, cfg.pidFile, err)
 	}
 
-	deadline := time.Now().Add(daemonStartupTimeout)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cfg.readyCheck() {
 			return pid, nil
@@ -3133,6 +3299,9 @@ func launchFilterDaemon(cfg daemonLaunchConfig) (int, error) {
 			if mounted, mErr := mounttab.IsPathMounted(cfg.mntDir); mErr == nil && mounted {
 				var ctl mounttab.OSController
 				_ = ctl.Unmount(cfg.mntDir, true)
+			}
+			if waitErr == nil {
+				return 0, appendDaemonStderr(fmt.Errorf("%s exited before mounting %q: exit status 0", cfg.label, cfg.mntDir), errPath)
 			}
 			return 0, appendDaemonStderr(fmt.Errorf("%s exited before mounting %q: %w", cfg.label, cfg.mntDir, waitErr), errPath)
 		case <-time.After(50 * time.Millisecond):
@@ -3151,17 +3320,27 @@ func writePIDFileNoFollow(pidFile string, pid int) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	fd, err := unix.Open(pidFile, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	fd, err := unix.Open(pidFile, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0o600)
 	if err != nil {
 		return err
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		_ = unix.Close(fd)
+		return err
+	}
+	if (st.Mode & syscall.S_IFMT) != syscall.S_IFREG {
+		_ = unix.Close(fd)
+		return fmt.Errorf("refusing non-regular pidfile path %q", pidFile)
 	}
 	if err := unix.Fchmod(fd, 0o600); err != nil {
 		_ = unix.Close(fd)
 		return err
 	}
+	f := os.NewFile(uintptr(fd), pidFile)
 	payload := []byte(strconv.Itoa(pid) + "\n")
-	_, wErr := unix.Write(fd, payload)
-	cErr := unix.Close(fd)
+	_, wErr := f.Write(payload)
+	cErr := f.Close()
 	if wErr != nil {
 		_ = os.Remove(pidFile)
 		return wErr
@@ -3191,9 +3370,18 @@ func openDaemonStderrFile(errPath string) (*os.File, error) {
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("inspect daemon stderr log path %q: %w", errPath, err)
 	}
-	fd, err := unix.Open(errPath, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	fd, err := unix.Open(errPath, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open daemon stderr log %q: %w", errPath, err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("stat daemon stderr log %q: %w", errPath, err)
+	}
+	if (st.Mode & syscall.S_IFMT) != syscall.S_IFREG {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("refusing non-regular daemon stderr log path %q", errPath)
 	}
 	if err := unix.Fchmod(fd, 0o600); err != nil {
 		_ = unix.Close(fd)
